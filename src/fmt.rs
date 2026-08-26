@@ -816,6 +816,28 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
             let inner: Vec<String> = branches.iter().map(|b| expr_str(b, 0)).collect();
             (format!("par {{ {} }}", inner.join(", ")), ATOM)
         }
+        ExprKind::Receive { arms } => {
+            let mut s = "receive { ".to_string();
+            for (i, arm) in arms.iter().enumerate() {
+                if i > 0 {
+                    s.push_str(", ");
+                }
+                let guard = match &arm.guard {
+                    Some(g) => format!(" if {}", expr_str(g, 0)),
+                    None => String::new(),
+                };
+                let mut blk = String::new();
+                fmt_block(&mut blk, &arm.body, 0);
+                s.push_str(&format!(
+                    "{}({}){guard} => {}",
+                    arm.port,
+                    pattern_str(&arm.pattern),
+                    reindent_inline(&blk)
+                ));
+            }
+            s.push_str(" }");
+            (s, ATOM)
+        }
     }
 }
 
@@ -1061,6 +1083,28 @@ mod tests {
         assert!(d2.is_empty(), "{d2:?}");
         let formatted2 = super::format_program(&p2);
         assert!(!formatted2.contains(" at "), "an ordinary child with no placement must not gain one: {formatted2:?}");
+    }
+
+    /// Selective receive (`docs/design/ASYNC.md`): `receive { port(pat)
+    /// [if guard] => { .. } }` must round-trip through `kupl fmt`
+    /// losslessly -- checked via BOTH idempotence AND an explicit "the
+    /// formatted output still contains every arm's own port/pattern/
+    /// guard" assertion, matching `fmt_preserves_distributed_placement_
+    /// clause`'s own lesson that idempotence alone doesn't prove nothing
+    /// was silently dropped.
+    #[test]
+    fn fmt_preserves_receive_arms_including_guards() {
+        let src = "concurrent component P {\n    intent \"p\"\n    \
+                    in go: Bool\n    in nack: Str\n    \
+                    on go(v) {\n        let r = receive {\n            go(true) if v => { 1 }\n            nack(msg) => { 2 }\n        }\n        print(\"{r}\")\n    }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(formatted.contains("receive {"), "the `receive` expression itself must survive formatting: {formatted:?}");
+        assert!(formatted.contains("go(true) if v => "), "the first arm's own port/pattern/guard must survive formatting: {formatted:?}");
+        assert!(formatted.contains("nack(msg) => "), "the second arm's own port/pattern must survive formatting: {formatted:?}");
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-

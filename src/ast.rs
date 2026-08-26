@@ -448,6 +448,41 @@ pub enum ExprKind {
     /// Branches are independent (no data flows between them), so they are safe
     /// to run in parallel; execution is deterministic (results in branch order).
     Par(Vec<Expr>),
+    /// `receive { port1(pat1) [if guard1] => { .. }  ... }` — Erlang-style
+    /// selective receive over a `concurrent component`'s own mailbox: waits
+    /// for the next message addressed to one of the named in-ports whose
+    /// payload matches that arm's pattern (and guard, if any), SKIPPING
+    /// OVER (not discarding) any earlier-arrived non-matching message so
+    /// it remains available for a later handler/receive to consume, in its
+    /// original relative order — see `docs/design/ASYNC.md`'s own
+    /// "Selective receive" section. `concurrent`-only (K0312); may only
+    /// appear as the ENTIRE right-hand side of a top-level `let` in an
+    /// `on <port>` handler or exposed-fun body (K0310) — NOT a bare
+    /// top-level statement (unlike the wording a blocking builtin's own
+    /// K0295 restriction might suggest by analogy — `interp.rs::
+    /// exec_stmts_checked`'s own frame-push logic only knows how to
+    /// capture a continuation from a `Stmt::Let`'s own bind name, and not
+    /// `on start`/`on stop`/`on every`/`on after` either, since those run
+    /// via a path that was never built to expect a suspend escaping it).
+    /// Deliberately does NOT extend to nested private funs in this v1
+    /// (unlike K0296's blocking-builtin transitive closure) — a `receive`
+    /// must appear directly in the handler/exposed-fun's own body, not
+    /// several call frames deep.
+    Receive { arms: Vec<ReceiveArm> },
+}
+
+/// One arm of a `receive { .. }` expression — see `ExprKind::Receive`'s own
+/// doc comment.
+#[derive(Debug, Clone)]
+pub struct ReceiveArm {
+    pub port: String,
+    pub pattern: Pattern,
+    /// Optional `if COND` guard, checked with the pattern's own bindings in
+    /// scope — a false guard is treated as "this arm doesn't match" (the
+    /// message is left in the mailbox, not consumed), exactly like `match`.
+    pub guard: Option<Expr>,
+    pub body: Block,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

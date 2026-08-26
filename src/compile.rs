@@ -1792,6 +1792,22 @@ impl<'s> FnCompiler<'s> {
                 self.emit(Op::MakeList { dst, start, len: branches.len() as u8 }, span);
                 dst
             }
+            ExprKind::Receive { .. } => {
+                // `receive` (Erlang-style selective mailbox receive) needs
+                // interp.rs's own pooled-actor mailbox -- a runtime concept
+                // the VM/native engines have no equivalent of (their own
+                // `concurrent` support runs every component sequentially,
+                // with no actor threads or per-actor inbox at all). Mirrors
+                // `Stmt::Forall`'s own K0804 precedent exactly: a compile-
+                // time diagnostic naming the limitation, not a silent
+                // wrong-answer or a runtime-only surprise.
+                self.err(
+                    "K0809",
+                    "`receive` runs only under `kupl run` (interpreter); not compiled to the KVM/native -- see docs/design/ASYNC.md".to_string(),
+                    span,
+                );
+                self.const_reg(Value::Unit, span)
+            }
         }
     }
 

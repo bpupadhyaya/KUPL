@@ -2099,6 +2099,11 @@ fn expr_binds_name(expr: &crate::ast::Expr, name: &str) -> bool {
             expr_binds_name(recv, name) || updates.iter().any(|(_, e)| expr_binds_name(e, name))
         }
         ExprKind::Try(e) | ExprKind::Await(e) => expr_binds_name(e, name),
+        ExprKind::Receive { arms } => arms.iter().any(|arm| {
+            pattern_binds_name(&arm.pattern, name)
+                || arm.guard.as_ref().is_some_and(|g| expr_binds_name(g, name))
+                || block_binds_name(&arm.body, name)
+        }),
     }
 }
 

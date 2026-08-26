@@ -2130,6 +2130,36 @@ impl Checker {
         // level of continuation (see `interp.rs`'s own `SuspendChain`).
         let suspend_capable = Self::suspend_capable_funs(c);
         for h in &c.handlers {
+            // `receive` additionally requires an `on <port>` handler
+            // specifically -- NOT `on start`/`on stop`/`on every`/`on
+            // after`. Those three run via `start_all`/`run_timers`
+            // (`interp.rs`), whose own `Flow::Suspend` handling was never
+            // built to expect a suspend escaping THEM (only a `Deliver`/
+            // `Call`-triggered body's own dispatch loop resumes a
+            // suspended chain) -- allowing it there would risk silently
+            // discarding the actor's own in-flight computation rather
+            // than a clean, loud diagnostic. `check_no_nested_
+            // blocking_calls` below already rejects anything past the
+            // TOP level regardless of handler kind (K0310); this loop
+            // additionally rejects a well-formed TOP-level `receive`
+            // specifically when the enclosing handler is one of the three
+            // kinds that can't safely host it.
+            if !matches!(h.trigger, Trigger::Port(_)) {
+                for stmt in &h.body.stmts {
+                    let receive_expr = match stmt {
+                        Stmt::Let { init, .. } if Self::is_receive_expr(init) => Some(init),
+                        Stmt::Expr(e) if Self::is_receive_expr(e) => Some(e),
+                        _ => None,
+                    };
+                    if let Some(e) = receive_expr {
+                        self.err(
+                            "K0310",
+                            "`receive { .. }` may only appear inside a `concurrent component`'s own `on <port>` handler or exposed-fun body -- not `on start`/`on stop`/`on every`/`on after`, and not nested inside a private `fun` -- see docs/design/ASYNC.md".to_string(),
+                            e.span,
+                        );
+                    }
+                }
+            }
             self.check_no_nested_blocking_calls(&h.body, &suspend_capable);
         }
         for expose in &c.exposes {
@@ -2137,6 +2167,66 @@ impl Checker {
         }
         for f in &c.funs {
             self.check_no_nested_blocking_calls(&f.body, &suspend_capable);
+        }
+        // K0311: a port named by ANY `receive` arm anywhere in this
+        // component must not ALSO have a top-level `on <port>` handler --
+        // interp.rs's own runtime (`deliver_to_actor`) routes EVERY
+        // `Deliver` for a receive-referenced port straight into the
+        // actor's own mailbox unconditionally (not just while suspended
+        // on I/O), specifically so a message sent BEFORE the first
+        // `receive` call ever runs still waits there instead of being
+        // silently dispatched-and-dropped by a `send()` call that finds
+        // no handler -- see `interp.rs`'s own `receive_ports` doc
+        // comment for the full "why". Two consumers racing for the SAME
+        // port (an `on <port>` handler that would never fire once this
+        // routing kicks in, silently) is exactly the kind of ambiguous,
+        // surprising configuration this checker should catch instead of
+        // silently favoring one side.
+        let mut receive_ports: HashMap<&str, Span> = HashMap::new();
+        for h in &c.handlers {
+            Self::collect_receive_ports(&h.body, &mut receive_ports);
+        }
+        for expose in &c.exposes {
+            Self::collect_receive_ports(&expose.body, &mut receive_ports);
+        }
+        for h in &c.handlers {
+            if let Trigger::Port(p) = &h.trigger {
+                if let Some(rspan) = receive_ports.get(p.as_str()) {
+                    self.err(
+                        "K0311",
+                        format!(
+                            "port `{p}` is named by both a `receive` arm and a top-level `on {p}` handler -- pick one consumer; the `on {p}` handler would never fire once any `receive` arm claims this port"
+                        ),
+                        *rspan,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Collects every port name named by a top-level `receive` arm inside
+    /// `body` (a handler or exposed-fun body) into `out`, keyed by the
+    /// SPAN of the `receive` arm itself (for K0311's own diagnostic) --
+    /// deliberately only scans `body`'s own top-level `let`-bound
+    /// statements (mirrors `check_no_nested_blocking_calls`'s "allowed
+    /// top level" shape). Unlike a blocking builtin call, `receive` may
+    /// NOT appear as a bare top-level statement (`Stmt::Expr`) -- ONLY as
+    /// the entire right-hand side of a top-level `let`, exactly matching
+    /// K0295's own actual restriction (never "or a bare statement" --
+    /// `interp.rs::exec_stmts_checked`'s own frame-push logic only knows
+    /// how to capture a continuation from a `Stmt::Let`, live-confirmed
+    /// by an internal-compiler-error panic before this restriction was
+    /// tightened to match).
+    fn collect_receive_ports<'a>(body: &'a Block, out: &mut HashMap<&'a str, Span>) {
+        for stmt in &body.stmts {
+            let Stmt::Let { init, .. } = stmt else { continue };
+            if !Self::is_receive_expr(init) {
+                continue;
+            }
+            let ExprKind::Receive { arms } = &init.kind else { unreachable!() };
+            for arm in arms {
+                out.entry(arm.port.as_str()).or_insert(arm.span);
+            }
         }
     }
 
@@ -2224,8 +2314,48 @@ impl Checker {
                         self.scan_expr_for_blocking_calls(&a.value, suspend_capable);
                     }
                 }
+                // `receive { .. }` (selective mailbox receive) gets the
+                // SAME top-level-only allowance a blocking builtin call
+                // does, for the same reason (K0310 mirrors K0295) -- its
+                // own arm bodies are still scanned (below), just not the
+                // `receive` itself. UNLIKE a blocking builtin call,
+                // deliberately NOT also allowed as a bare `Stmt::Expr`
+                // (no `let`) -- `interp.rs::exec_stmts_checked`'s own
+                // frame-push logic only knows how to capture a
+                // continuation from a `Stmt::Let`'s own bind name; a bare
+                // `receive` statement would suspend with an EMPTY
+                // `SuspendChain.frames`, live-confirmed to reach an
+                // internal-compiler-error panic in `worker_loop`'s own
+                // `start_or_satisfy_suspend` before this restriction was
+                // narrowed to match. A bare `Stmt::Expr(receive)` falls
+                // through to `scan_stmt_for_blocking_calls` below, which
+                // correctly flags it K0310 via the generic recursive scan.
+                Stmt::Let { init, .. } if Self::is_receive_expr(init) => {
+                    let ExprKind::Receive { arms } = &init.kind else { unreachable!() };
+                    self.scan_receive_arms(arms, suspend_capable);
+                }
                 _ => self.scan_stmt_for_blocking_calls(stmt, suspend_capable),
             }
+        }
+    }
+
+    /// `true` if `e` is a `receive { .. }` expression -- see
+    /// `ExprKind::Receive`'s own doc comment.
+    fn is_receive_expr(e: &Expr) -> bool {
+        matches!(e.kind, ExprKind::Receive { .. })
+    }
+
+    /// Scans every `receive` arm's own guard + body for a nested blocking
+    /// call/`receive` (neither is permitted inside an arm body -- it isn't
+    /// the containing handler/exposed-fun's own top level) -- shared by
+    /// BOTH the "allowed top level" case above and the generic recursive
+    /// scan below, so the two can never drift out of sync.
+    fn scan_receive_arms(&mut self, arms: &[ReceiveArm], suspend_capable: &std::collections::HashSet<String>) {
+        for arm in arms {
+            if let Some(g) = &arm.guard {
+                self.scan_expr_for_blocking_calls(g, suspend_capable);
+            }
+            self.scan_block_for_blocking_calls(&arm.body, suspend_capable);
         }
     }
 
@@ -2304,6 +2434,25 @@ impl Checker {
                 ),
                 e.span,
             );
+        } else if Self::is_receive_expr(e) {
+            // K0310 mirrors K0295 exactly, for the same underlying reason:
+            // `receive`'s own suspend/resume mechanism (interp.rs) can
+            // only capture a continuation at this one shape. Reaching
+            // here means a `receive` was found somewhere OTHER than the
+            // "allowed top level" case `check_no_nested_blocking_calls`
+            // special-cases -- e.g. nested inside an `if`/loop/another
+            // call's argument list, or not the entire top-level `let`
+            // rhs. Deliberately does NOT extend to a `receive` reachable
+            // through a nested private `fun` call (unlike K0296's own
+            // transitive closure over blocking builtins) -- a `receive`
+            // must appear directly in the handler/exposed-fun's own body,
+            // not several call frames deep; see `ExprKind::Receive`'s own
+            // doc comment for why this v1 scope boundary was chosen.
+            self.err(
+                "K0310",
+                "`receive { .. }` may only appear as the ENTIRE right-hand side of a top-level `let` in a `concurrent component`'s own `on <port>` handler or exposed-fun body -- see docs/design/ASYNC.md".to_string(),
+                e.span,
+            );
         }
         match &e.kind {
             ExprKind::Int(_)
@@ -2373,6 +2522,7 @@ impl Checker {
                 }
             }
             ExprKind::Try(inner) | ExprKind::Await(inner) => self.scan_expr_for_blocking_calls(inner, suspend_capable),
+            ExprKind::Receive { arms } => self.scan_receive_arms(arms, suspend_capable),
         }
     }
 
@@ -3897,6 +4047,74 @@ impl Checker {
                     self.unify(&elem, &t, b.span, "`par` branch");
                 }
                 Ty::List(Box::new(self.uni.apply(&elem)))
+            }
+            ExprKind::Receive { arms } => {
+                // K0312: `receive` is a `concurrent component`-only
+                // construct -- its whole mechanism is interp.rs's own
+                // pooled-actor mailbox, which only exists for `concurrent`
+                // components (K0313 additionally rejects it at the
+                // VM/native compiler even when this DOES pass -- the two
+                // checks are independent, this one is about the SOURCE
+                // component's own declaration, not the target engine).
+                match ctx.component {
+                    Some(c) if c.concurrent => {}
+                    _ => self.err(
+                        "K0312",
+                        "`receive` is only valid inside a `concurrent component`'s own handler or exposed-fun body -- see docs/design/ASYNC.md".to_string(),
+                        expr.span,
+                    ),
+                }
+                let sig = ctx
+                    .component
+                    .and_then(|c| self.checked.components.get(&c.name))
+                    .cloned()
+                    .unwrap_or_default();
+                let mut result: Option<Ty> = None;
+                for arm in arms {
+                    ctx.scopes.push();
+                    let port_ty = match sig.in_ports.get(&arm.port) {
+                        Some(ty) => ty.clone(),
+                        None => {
+                            let hint = if sig.out_ports.contains_key(&arm.port) {
+                                " (it is an `out` port — `receive` reacts to `in` ports)".to_string()
+                            } else if let Some(s) = suggest(&arm.port, sig.in_ports.keys().map(String::as_str)) {
+                                format!(" — did you mean `{s}`?")
+                            } else {
+                                String::new()
+                            };
+                            self.err(
+                                "K0211",
+                                format!(
+                                    "`receive`: component `{}` has no `in` port named `{}`{hint}",
+                                    ctx.component.map(|c| c.name.as_str()).unwrap_or("?"),
+                                    arm.port
+                                ),
+                                arm.span,
+                            );
+                            self.uni.fresh()
+                        }
+                    };
+                    self.check_pattern(&arm.pattern, &port_ty, ctx);
+                    if let Some(guard) = &arm.guard {
+                        let gt = self.infer_expr(guard, ctx);
+                        self.unify(&Ty::Bool, &gt, guard.span, "receive guard (must be Bool)");
+                    }
+                    let at = self.check_block(&arm.body, ctx);
+                    result = Some(match result {
+                        None => {
+                            let fresh = self.uni.fresh();
+                            self.check_merge(&fresh, &at, arm.span, "receive arms (all arms must have the same type)")
+                        }
+                        Some(r) => self.check_merge(&r, &at, arm.span, "receive arms (all arms must have the same type)"),
+                    });
+                    ctx.scopes.pop();
+                }
+                match result {
+                    Some(r) => self.uni.apply(&r),
+                    // no arms at all: unreachable in practice (the parser
+                    // requires at least one arm), but Unit is a safe fallback.
+                    None => Ty::Unit,
+                }
             }
         }
     }
@@ -6233,6 +6451,73 @@ mod generic_tests {
                              app Main {\n    intent \"m\"\n    let w = W()\n}\n";
         let errs2 = errors(no_placement);
         assert!(!errs2.iter().any(|d| d.code == "K0309"), "an ordinary child with no placement must not be K0309: {errs2:?}");
+    }
+
+    /// Selective receive (`docs/design/ASYNC.md`): a well-formed
+    /// `receive { port(pattern) => body }`, the entire top-level `let`
+    /// rhs of a `concurrent component`'s own `on <port>` handler (a
+    /// DIFFERENT port than the one it matches on, so K0311 can't fire),
+    /// must check completely clean.
+    #[test]
+    fn well_formed_receive_checks_clean() {
+        let src = "concurrent component Pinger {\n    intent \"p\"\n    \
+                    in trigger: Int\n    in go: Bool\n    \
+                    on trigger(n) {\n        let r = receive {\n            go(true) => { n }\n        }\n        print(\"{r}\")\n    }\n\
+                    }\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.is_empty(), "a well-formed receive must check clean: {errs:?}");
+    }
+
+    /// K0310: `receive` may only appear as the entire top-level `let` rhs
+    /// of an `on <port>` handler or exposed-fun body -- neither a bare
+    /// top-level statement (no `let`), NOR nested inside `if`/a private
+    /// `fun`, NOR inside `on start`/`on stop`/`on every`/`on after`.
+    #[test]
+    fn receive_placement_restriction_is_k0310() {
+        let bare_stmt = "concurrent component P {\n    intent \"p\"\n    in go: Bool\n    \
+                          on go(v) {\n        receive {\n            go(true) => { 1 }\n        }\n    }\n}\n\
+                          app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(bare_stmt);
+        assert!(errs.iter().any(|d| d.code == "K0310"), "a bare (non-let) top-level receive must be K0310: {errs:?}");
+
+        let nested_in_if = "concurrent component P {\n    intent \"p\"\n    in go: Bool\n    \
+                             on go(v) {\n        if v {\n            let r = receive {\n                go(true) => { 1 }\n            }\n        }\n    }\n}\n\
+                             app Main {\n    intent \"m\"\n}\n";
+        let errs2 = errors(nested_in_if);
+        assert!(errs2.iter().any(|d| d.code == "K0310"), "a receive nested inside `if` must be K0310: {errs2:?}");
+
+        let in_on_start = "concurrent component P {\n    intent \"p\"\n    in go: Bool\n    \
+                            on start {\n        let r = receive {\n            go(true) => { 1 }\n        }\n    }\n}\n\
+                            app Main {\n    intent \"m\"\n}\n";
+        let errs3 = errors(in_on_start);
+        assert!(errs3.iter().any(|d| d.code == "K0310"), "a receive inside `on start` must be K0310: {errs3:?}");
+    }
+
+    /// K0311: a port named by a `receive` arm must not ALSO have a
+    /// top-level `on <port>` handler on the same component -- the two
+    /// would race for the same messages, and interp.rs's own runtime
+    /// (`deliver_to_actor`) routes EVERY `Deliver` for a receive-claimed
+    /// port straight into the mailbox, so the `on` handler would simply
+    /// never fire, silently, without this check.
+    #[test]
+    fn receive_port_colliding_with_an_on_handler_is_k0311() {
+        let src = "concurrent component P {\n    intent \"p\"\n    in go: Bool\n    \
+                    on go(v) { print(\"{v}\") }\n    \
+                    expose fun wait() -> Bool {\n        let r = receive {\n            go(true) => { true }\n        }\n        r\n    }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K0311"), "a receive port colliding with an `on` handler must be K0311: {errs:?}");
+    }
+
+    /// K0312: `receive` is a `concurrent component`-only construct.
+    #[test]
+    fn receive_outside_concurrent_component_is_k0312() {
+        let src = "component P {\n    intent \"p\"\n    in go: Bool\n    \
+                    on go(v) {\n        let r = receive {\n            go(true) => { true }\n        }\n    }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K0312"), "`receive` outside a concurrent component must be K0312: {errs:?}");
     }
 
     /// Production-hardening 1214: a REAL, live-confirmed bug found+fixed --

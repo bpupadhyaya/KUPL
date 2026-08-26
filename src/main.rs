@@ -3667,6 +3667,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Selective receive (`docs/design/ASYNC.md`): `receive { port(pat)
+    /// => body }` genuinely SKIPS a non-matching message already sitting
+    /// in the actor's own mailbox and correctly picks up a LATER message
+    /// on the SAME port that DOES match -- Erlang's own core selective-
+    /// receive guarantee, not just "receive the next message." `Sender`
+    /// emits `go_out(false)` (arrives first, on the SAME port `receive`
+    /// is watching, but doesn't match the `true` pattern) THEN
+    /// `go_out(true)` (the real match) -- both BEFORE `Caller`'s own
+    /// blocking call even reaches `Pinger` (`start_all`'s own instance-
+    /// index-ordered loop runs `Main`'s children in construction order,
+    /// so `Sender`, id 1, finishes its own `on start` before `Caller`, id
+    /// 3, begins its own -- `Caller` exists specifically so the BLOCKING
+    /// call isn't made from the app's OWN `on start`, id 0, which would
+    /// otherwise deadlock the whole startup sequence before `Sender` ever
+    /// got a turn). If `receive` incorrectly consumed the FIRST (non-
+    /// matching) message instead of leaving it in the mailbox, this
+    /// would hang forever waiting for a second `go_out` that never comes
+    /// -- this test's own `--vm`/native legs additionally confirm K0809
+    /// (not compiled to those engines) fires identically on both.
+    #[test]
+    fn concurrent_component_receive_skips_a_same_port_non_match_and_finds_the_later_match() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-receive-skip-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("receive_skip.kupl");
+        std::fs::write(
+            &file,
+            "component Sender {\n    intent \"sends a non-matching value on the SAME port, then the matching one\"\n    \
+                 out go_out: Bool\n    on start {\n        emit go_out(false)\n        emit go_out(true)\n    }\n}\n\
+             concurrent component Pinger {\n    intent \"receives selectively, skipping a same-port non-match\"\n    \
+                 in go_in: Bool\n    expose fun wait_for_go() -> Str {\n        \
+                 let result = receive {\n            go_in(true) => { \"got-true\" }\n        }\n        result\n    }\n}\n\
+             component Caller {\n    intent \"calls wait_for_go after sender+pinger have both been constructed and started\"\n    \
+                 prop p: Pinger\n    on start {\n        print(p.wait_for_go())\n    }\n}\n\
+             app Main {\n    intent \"selective receive skip-same-port-non-match test\"\n    \
+                 let s = Sender()\n    let p = Pinger()\n    wire s.go_out -> p.go_in\n    let caller = Caller(p: p)\n}\n",
+        )
+        .unwrap();
+        let expected = "got-true\n";
+
+        for _ in 0..15 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{out:?}");
+        }
+
+        // VM and native: `receive` has no equivalent mailbox mechanism on
+        // either engine -- a clean, dedicated K0809 diagnostic, not a
+        // silent hang or a wrong answer.
+        let vm_out =
+            std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+        assert_ne!(vm_out.status.code(), Some(0), "{vm_out:?}");
+        assert!(
+            String::from_utf8_lossy(&vm_out.stderr).contains("K0809"),
+            "the VM must reject `receive` with K0809, not silently misbehave: {vm_out:?}"
+        );
+        let native_bin = dir.join("receive_skip_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_ne!(build.status.code(), Some(0), "{build:?}");
+        assert!(
+            String::from_utf8_lossy(&build.stderr).contains("K0809"),
+            "native must reject `receive` with K0809, not silently misbehave: {build:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-3 (`docs/design/CONCURRENCY_V2.md` §4.3): a
     /// fixed `ActorPool` now multiplexes MANY top-level `concurrent
     /// component` actors onto a small pool of worker threads instead of

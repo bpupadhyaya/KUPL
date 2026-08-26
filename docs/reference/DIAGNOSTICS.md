@@ -164,6 +164,9 @@ Severity: **E** = error, **W** = warning.
 | K0307 | E | a `concurrent` component cannot have `example` blocks — see `docs/design/ASYNC.md` §8.7 |
 | K0308 | E | a `concurrent` component instance is referenced by a `law`/`forall` — either fulfilling a contract that declares `law`s, or bound in scope when a top-level `forall` runs; `kupl test`'s law-running machinery does not support a concurrent instance yet |
 | K0309 | E | a child's `at <placement>` clause (distributed component placement, `docs/design/DISTRIBUTION.md`) — the syntax parses but no KUPL runtime supports it yet |
+| K0310 | E | `receive { .. }` (selective mailbox receive, `docs/design/ASYNC.md`) appears somewhere other than the entire top-level `let` rhs, or a bare top-level statement, of a `concurrent component`'s own `on <port>` handler or exposed-fun body |
+| K0311 | E | a port is named by both a `receive` arm and a top-level `on <port>` handler on the same component — pick one consumer |
+| K0312 | E | `receive { .. }` used outside a `concurrent component`'s own handler/exposed-fun body |
 
 ## K04xx — Loader (multi-file)
 
@@ -185,6 +188,7 @@ Severity: **E** = error, **W** = warning.
 | K0806 | E | chunk has too many distinct constants for KVM v0 (more than 65536) |
 | K0807 | E | module has too many functions/closures/component methods for KVM v0 (more than 65536 chunks) |
 | K0808 | E | `supervise ... max N in ...` restart count too large for KVM v0 (more than 65535) |
+| K0809 | E | `receive { .. }` (selective mailbox receive, `docs/design/ASYNC.md`) runs only under `kupl run` (interpreter); not compiled to the KVM/native — its own mailbox mechanism has no VM/native equivalent |
 
 ## K09xx — Runtime
 

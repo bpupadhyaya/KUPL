@@ -120,6 +120,21 @@ pub struct SuspendChain {
     /// on the CHAIN as a whole (not per-frame) — it's consumed exactly
     /// once, when the LAST frame finishes.
     pub reply: Option<std::sync::mpsc::Sender<Result<crate::parallel::PortableValue, (String, Span)>>>,
+    /// Selective receive (`receive { .. }`, `ExprKind::Receive`): `Some`
+    /// iff THIS suspend is a `receive`, not one of the 4 blocking
+    /// builtins -- `builtin`/`args` above are meaningless in that case
+    /// (`receive` has no external I/O to hand off; `worker_loop`'s own
+    /// suspend-dispatch checks this field FIRST and never spawns a
+    /// thread for it). `Rc`, not a plain `Vec` clone, since it may be
+    /// read from `worker_loop` repeatedly (once per candidate mailbox
+    /// message scanned) without re-cloning the whole arm list each time.
+    /// `K0310` guarantees `frames` always has EXACTLY one entry by the
+    /// time a `receive` chain reaches `worker_loop` (a `receive` can
+    /// only appear directly at a handler/exposed-fun's own top level,
+    /// never several call frames deep like a blocking builtin can) --
+    /// that one frame's own `env` is what `receive`'s own patterns are
+    /// matched in.
+    pub receive_arms: Option<std::rc::Rc<Vec<ReceiveArm>>>,
 }
 
 pub type EvalResult = Result<Value, Flow>;
@@ -466,6 +481,49 @@ struct PooledActor {
     /// re-suspended, pending queue drained) and performs the real
     /// teardown + ack at that point instead.
     pending_stop: Option<std::sync::mpsc::Sender<()>>,
+    /// Selective receive: every port named by ANY `receive` arm anywhere
+    /// in this actor's own component (computed once at spawn time from
+    /// the component's own AST -- see `collect_receive_ports`). K0311
+    /// guarantees no port in this set also has a top-level `on <port>`
+    /// handler, so `deliver_to_actor` can safely route EVERY `Deliver`
+    /// for one of these ports straight into `pending` UNCONDITIONALLY --
+    /// not just while `suspended.is_some()` like every other port -- so a
+    /// message sent before the actor's very FIRST `receive` call still
+    /// waits in the mailbox for it, matching real Erlang mailbox
+    /// semantics instead of being silently dispatched-and-dropped by a
+    /// `send()` call that finds no handler for a receive-only port.
+    receive_ports: std::rc::Rc<std::collections::HashSet<String>>,
+}
+
+/// Selective receive: collects every port name any `receive` arm inside
+/// `comp`'s own handlers/exposed-funs mentions -- see `PooledActor::
+/// receive_ports`'s own doc comment for why this is computed once, up
+/// front, rather than inspected per-message. Deliberately only scans
+/// TOP-LEVEL statements (mirrors `check.rs::check_no_nested_blocking_
+/// calls`'s "allowed top level" shape) -- K0310 guarantees a well-formed
+/// `receive` never appears any deeper than that.
+fn collect_receive_ports(comp: &ComponentDecl) -> std::collections::HashSet<String> {
+    let mut ports = std::collections::HashSet::new();
+    let mut scan = |body: &Block| {
+        for stmt in &body.stmts {
+            let receive_expr = match stmt {
+                Stmt::Let { init, .. } => Some(init),
+                Stmt::Expr(e) => Some(e),
+                _ => None,
+            };
+            let Some(ExprKind::Receive { arms }) = receive_expr.map(|e| &e.kind) else { continue };
+            for arm in arms {
+                ports.insert(arm.port.clone());
+            }
+        }
+    };
+    for h in &comp.handlers {
+        scan(&h.body);
+    }
+    for expose in &comp.exposes {
+        scan(&expose.body);
+    }
+    ports
 }
 
 /// The body every `ActorPool` worker thread runs for its whole life —
@@ -559,6 +617,7 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                     .get(&comp_name)
                     .cloned()
                     .expect("actor_db mirrors the coordinator's own component table, so this name must resolve");
+                let receive_ports = std::rc::Rc::new(collect_receive_ports(&comp));
                 let args: Vec<(Option<String>, Value)> = portable_args
                     .into_iter()
                     .map(|(name, pv)| (name, crate::parallel::from_portable(&pv)))
@@ -582,6 +641,7 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                         suspended: None,
                         pending: std::collections::VecDeque::new(),
                         pending_stop: None,
+                        receive_ports,
                     })
                 } else {
                     None
@@ -609,11 +669,60 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                     // Drained by `WorkerCmd::IoComplete`'s own handling
                     // once the suspend resolves.
                     Some(true) => {
-                        if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
-                            slot.pending.push_back(msg);
+                        // Selective receive: if this actor is suspended
+                        // specifically on a `receive` (not ordinary I/O),
+                        // a FRESH `Deliver` might be exactly what it's
+                        // waiting for -- check before falling back to the
+                        // ordinary "queue it, drained once the suspend
+                        // resolves" behavior every OTHER suspend reason
+                        // still uses unchanged. Two separate `actors`
+                        // look-ups (immutable then mutable), not one
+                        // borrow held across `match_receive_arms`'s own
+                        // `&mut Interp` need -- `chain`/`pv` are cloned
+                        // into owned values first so the immutable borrow
+                        // ends before the mutable one begins.
+                        let candidate = actors.get(local_id).and_then(|s| s.as_ref()).and_then(|slot| {
+                            let chain = slot.suspended.as_ref()?;
+                            let arms = chain.receive_arms.clone()?;
+                            let ActorMsg::Deliver(port, pv) = &msg else { return None };
+                            let base_env = chain.frames.last()?.env.clone();
+                            Some((arms, base_env, port.clone(), crate::parallel::from_portable(pv)))
+                        });
+                        let resolved = candidate.and_then(|(arms, base_env, port, value)| {
+                            actors
+                                .get_mut(local_id)
+                                .and_then(|s| s.as_mut())
+                                .and_then(|slot| match_receive_arms(&mut slot.interp, &arms, &port, &value, &base_env))
+                        });
+                        match resolved {
+                            Some(result) => {
+                                let _ = tx.send(WorkerCmd::IoComplete { local_id, result: receive_result_to_io(result) });
+                            }
+                            None => {
+                                if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                                    slot.pending.push_back(msg);
+                                }
+                            }
                         }
                     }
                     Some(false) => match msg {
+                        // Selective receive: an IDLE actor still must not
+                        // dispatch a receive-port `Deliver` the ordinary
+                        // way (there's no handler for it -- `send()` would
+                        // just silently no-op it) -- queue it instead, so
+                        // it's still there waiting whenever this actor's
+                        // own FIRST `receive` call eventually runs. See
+                        // `PooledActor::receive_ports`'s own doc comment.
+                        ActorMsg::Deliver(port, pv)
+                            if actors
+                                .get(local_id)
+                                .and_then(|s| s.as_ref())
+                                .is_some_and(|slot| slot.receive_ports.contains(&port)) =>
+                        {
+                            if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                                slot.pending.push_back(ActorMsg::Deliver(port, pv));
+                            }
+                        }
                         ActorMsg::Deliver(port, pv) => deliver_to_actor(&mut actors, &tx, local_id, port, pv),
                         ActorMsg::Call { fn_name, args, reply, .. } => {
                             call_actor(&mut actors, &tx, local_id, fn_name, args, reply)
@@ -758,7 +867,27 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                             Ok(()) => {
                                 loop {
                                     let next = match actors.get_mut(local_id).and_then(|s| s.as_mut()) {
-                                        Some(slot) if slot.suspended.is_none() => slot.pending.pop_front(),
+                                        // Selective receive: a receive-port
+                                        // `Deliver` has no handler and must
+                                        // stay queued indefinitely, waiting
+                                        // for some (current or future)
+                                        // `receive` call to consume it --
+                                        // skip over it (leaving it and
+                                        // everything else in place) rather
+                                        // than draining it via the ordinary
+                                        // dispatch path below. Finds the
+                                        // FIRST entry that ISN'T one, exactly
+                                        // like `try_satisfy_receive_now`'s
+                                        // own scan, and removes ONLY that
+                                        // one (`VecDeque::remove` preserves
+                                        // everything else's relative order).
+                                        Some(slot) if slot.suspended.is_none() => {
+                                            let idx = slot.pending.iter().position(|m| match m {
+                                                ActorMsg::Deliver(port, _) => !slot.receive_ports.contains(port),
+                                                ActorMsg::Call { .. } => true,
+                                            });
+                                            idx.and_then(|i| slot.pending.remove(i))
+                                        }
                                         _ => None,
                                     };
                                     let Some(next) = next else { break };
@@ -817,12 +946,7 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                         }
                     }
                     Err(Flow::Suspend(s)) => {
-                        let builtin = s.builtin;
-                        let args = s.args.clone();
-                        if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
-                            slot.suspended = Some(s);
-                        }
-                        spawn_blocking_io(tx.clone(), local_id, builtin, args);
+                        start_or_satisfy_suspend(&mut actors, &tx, local_id, s);
                     }
                     Err(Flow::Panic { msg, span, .. }) => {
                         // The reply (if any) was already sent above --
@@ -908,6 +1032,130 @@ fn stop_actor_now(actors: &mut [Option<PooledActor>], local_id: usize) {
     }
 }
 
+/// Selective receive: tries every arm in `arms` whose own port equals
+/// `port`, in source order, against `value` -- pattern AND guard (if any)
+/// must both hold. `None` means nothing matched (the caller must leave
+/// the candidate message queued/undelivered and keep looking elsewhere);
+/// `Some(exec_block outcome)` means an arm matched and its body already
+/// ran -- this may itself be `Err(Flow::Panic(..))`, folding a panicking
+/// GUARD and a panicking ARM BODY into the same "this is the outcome,
+/// stop scanning" shape rather than two separate cases, since both mean
+/// the same thing to every caller: don't try any other arm or message.
+fn match_receive_arms(interp: &mut Interp, arms: &[ReceiveArm], port: &str, value: &Value, base_env: &Env) -> Option<EvalResult> {
+    for arm in arms.iter().filter(|a| a.port == port) {
+        let scope = base_env.child();
+        if !match_pattern(&arm.pattern, value, &scope) {
+            continue;
+        }
+        if let Some(guard) = &arm.guard {
+            match interp.eval(guard, &scope) {
+                Ok(Value::Bool(true)) => {}
+                Ok(_) => continue,
+                Err(flow) => return Some(Err(flow)),
+            }
+        }
+        return Some(interp.exec_block(&arm.body, &scope));
+    }
+    None
+}
+
+/// Selective receive: scans `pending` in arrival order for the first
+/// `Deliver` entry `match_receive_arms` accepts, removing ONLY that one
+/// entry (`VecDeque::remove` preserves the relative order of everything
+/// else, exactly Erlang's own "skip, don't discard" mailbox semantics)
+/// and returning its outcome. `ActorMsg::Call` entries are never
+/// candidates (v1 scope: `receive` only ever consumes `Deliver`s -- see
+/// `ExprKind::Receive`'s own doc comment) and are skipped over, left in
+/// place, exactly like a non-matching `Deliver`.
+fn try_satisfy_receive_now(
+    interp: &mut Interp,
+    pending: &mut std::collections::VecDeque<ActorMsg>,
+    arms: &[ReceiveArm],
+    base_env: &Env,
+) -> Option<EvalResult> {
+    let mut idx = 0;
+    while idx < pending.len() {
+        let ActorMsg::Deliver(port, pv) = &pending[idx] else {
+            idx += 1;
+            continue;
+        };
+        if !arms.iter().any(|a| &a.port == port) {
+            idx += 1;
+            continue;
+        }
+        let port = port.clone();
+        let value = crate::parallel::from_portable(pv);
+        if let Some(result) = match_receive_arms(interp, arms, &port, &value, base_env) {
+            pending.remove(idx);
+            return Some(result);
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Selective receive: converts a matched arm's own `exec_block` outcome
+/// into the SAME `Result<PortableValue, String>` shape `WorkerCmd::
+/// IoComplete` already expects from a real blocking builtin's own
+/// off-thread result -- letting a `receive`'s own completion drive that
+/// EXISTING, already-verified resume/reply/drain machinery unchanged,
+/// instead of a second, parallel (and easy to drift out of sync with the
+/// original) implementation of the same frame/reply logic.
+fn receive_result_to_io(result: EvalResult) -> Result<crate::parallel::PortableValue, String> {
+    match result {
+        Ok(v) | Err(Flow::Return(v)) => crate::parallel::to_portable(&v).ok_or_else(|| {
+            "internal error: a `receive` arm's own value is not portable -- K0306 should have rejected this at check time".to_string()
+        }),
+        Err(Flow::Panic { msg, .. }) => Err(msg),
+        Err(_) => Err("internal error: unexpected control flow escaped a `receive` arm".to_string()),
+    }
+}
+
+/// Selective receive: the shared "a `SuspendChain` was just produced (a
+/// fresh `receive`, or a resume that immediately hit ANOTHER `receive`)
+/// and needs to either start waiting or run right away" decision, used
+/// everywhere a chain is about to be parked as `slot.suspended` --
+/// `deliver_to_actor`, `call_actor`, and `WorkerCmd::IoComplete`'s own
+/// re-suspend handling. Ordinary I/O suspends (`receive_arms.is_none()`)
+/// are UNCHANGED: parked, then handed to `spawn_blocking_io` exactly as
+/// before this existed. A `receive` chain instead tries `pending`
+/// immediately; if satisfied, the match is removed from `pending`, its
+/// arm body already ran, and a `WorkerCmd::IoComplete` is sent to drive
+/// the rest through the SAME unchanged resume path a real I/O completion
+/// uses (see `receive_result_to_io`'s own doc comment for why); if not,
+/// it's parked exactly like an ordinary suspend, MINUS spawning any
+/// thread (a `receive` has nothing external to wait on -- a future
+/// `Deliver` for this actor, handled by `WorkerCmd::Msg`'s own
+/// receive-aware branch, is what resolves it instead).
+fn start_or_satisfy_suspend(actors: &mut [Option<PooledActor>], tx: &std::sync::mpsc::Sender<WorkerCmd>, local_id: usize, chain: Box<SuspendChain>) {
+    let Some(arms) = chain.receive_arms.clone() else {
+        let builtin = chain.builtin;
+        let args = chain.args.clone();
+        if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+            slot.suspended = Some(chain);
+        }
+        spawn_blocking_io(tx.clone(), local_id, builtin, args);
+        return;
+    };
+    let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) else { return };
+    let base_env = chain
+        .frames
+        .last()
+        .expect("a `receive` chain always has exactly one frame by construction -- K0310 guarantees direct top-level placement")
+        .env
+        .clone();
+    let outcome = try_satisfy_receive_now(&mut slot.interp, &mut slot.pending, &arms, &base_env);
+    // Park FIRST in both cases -- `IoComplete`'s own handling (below,
+    // whether triggered by the `tx.send` right after or by a later real
+    // completion) always expects `slot.suspended.take()` to find `Some`.
+    if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+        slot.suspended = Some(chain);
+    }
+    if let Some(result) = outcome {
+        let _ = tx.send(WorkerCmd::IoComplete { local_id, result: receive_result_to_io(result) });
+    }
+}
+
 /// Concurrency-v2 PR-cv2-10: runs ONE `Deliver` against an actor already
 /// confirmed to exist and NOT currently suspended — shared by
 /// `WorkerCmd::Msg`'s own fresh-message handling and
@@ -929,10 +1177,7 @@ fn deliver_to_actor(
     match result {
         Ok(()) => {}
         Err(Flow::Suspend(suspended)) => {
-            let builtin = suspended.builtin;
-            let args = suspended.args.clone();
-            slot.suspended = Some(suspended);
-            spawn_blocking_io(tx.clone(), local_id, builtin, args);
+            start_or_satisfy_suspend(actors, tx, local_id, suspended);
         }
         Err(Flow::Panic { msg, span, .. }) => {
             let mut guard = slot.shutdown_panic.lock().unwrap();
@@ -984,10 +1229,7 @@ fn call_actor(
     let result = slot.interp.eval_method(Value::Component(0), &fn_name, args, Span::default());
     slot.interp.allow_suspend = false;
     if let Err(Flow::Suspend(s)) = result {
-        let builtin = s.builtin;
-        let args = s.args.clone();
-        slot.suspended = Some(s);
-        spawn_blocking_io(tx.clone(), local_id, builtin, args);
+        start_or_satisfy_suspend(actors, tx, local_id, s);
         return;
     }
     // Not suspended (or the slot may even be gone if `eval_method` itself
@@ -2688,9 +2930,37 @@ impl Interp {
                 args,
                 frames: Vec::new(),
                 reply: self.pending_call_reply.take(),
+                receive_arms: None,
             })));
         }
         None
+    }
+
+    /// Selective receive's own suspend-entry point, the `receive`-flavored
+    /// sibling of `try_suspend` above -- `receive` isn't a builtin CALL
+    /// (`eval_call` never sees it), so it gets its own dedicated dispatch
+    /// straight from `eval`'s own `ExprKind::Receive` arm instead of
+    /// routing through `try_suspend`'s builtin-arity-specific signature.
+    /// Same eligibility gate as `try_suspend` (only a `Deliver`/`Call`-
+    /// triggered body running on an `ActorPool` worker thread may
+    /// suspend at all) -- ANYTHING else (a dedicated/non-pooled actor
+    /// thread, in particular) is a v1 scope boundary: a loud panic, not
+    /// silent wrong behavior. See `SuspendChain::receive_arms`'s own doc
+    /// comment for the full resume story.
+    fn try_suspend_receive(&mut self, arms: &[ReceiveArm], span: Span) -> Flow {
+        if self.allow_suspend && POOL_WORKER_ID.with(|c| c.get()).is_some() {
+            return Flow::Suspend(Box::new(SuspendChain {
+                builtin: "receive",
+                args: Vec::new(),
+                frames: Vec::new(),
+                reply: self.pending_call_reply.take(),
+                receive_arms: Some(std::rc::Rc::new(arms.to_vec())),
+            }));
+        }
+        Self::panic_flow(
+            "`receive` is not yet supported outside a pooled concurrent actor (e.g. a dedicated/non-pooled actor thread reached via a nested `concurrent component` spawn) -- see docs/design/ASYNC.md".to_string(),
+            span,
+        )
     }
 
     fn exec_stmt(&mut self, stmt: &Stmt, env: &Env) -> EvalResult {
@@ -3740,6 +4010,7 @@ impl Interp {
                 }
                 Ok(Value::List(Rc::new(results)))
             }
+            ExprKind::Receive { arms } => Err(self.try_suspend_receive(arms, expr.span)),
         }
     }
 

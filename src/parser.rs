@@ -2029,6 +2029,41 @@ impl Parser {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Char(c), span })
             }
+            // `receive { .. }` -- a soft keyword (like `at`/`concurrent`/
+            // `ai`/`law`), only special when immediately followed by `{`,
+            // so an ordinary variable literally named `receive` elsewhere
+            // is never affected by this.
+            Tok::Ident(ref name) if name == "receive" && matches!(self.peek_at(1), Tok::LBrace) => {
+                self.bump();
+                self.expect(Tok::LBrace)?;
+                let mut arms = Vec::new();
+                loop {
+                    self.skip_newlines();
+                    if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                        break;
+                    }
+                    let (port, pspan) = self.expect_ident()?;
+                    self.expect(Tok::LParen)?;
+                    let pattern = self.parse_pattern()?;
+                    self.expect(Tok::RParen)?;
+                    let guard = if self.eat(&Tok::KwIf) { Some(self.parse_expr()?) } else { None };
+                    self.expect(Tok::FatArrow)?;
+                    let body = self.parse_block()?;
+                    let aspan = pspan.merge(body.span);
+                    arms.push(ReceiveArm { port, pattern, guard, body, span: aspan });
+                    if !self.eat(&Tok::Comma) {
+                        if !matches!(self.peek(), Tok::Newline | Tok::RBrace) {
+                            return Err(Diag::error(
+                                "K0109",
+                                format!("receive arms are separated by a newline or `,` — put each arm on its own line (found {} after an arm body)", self.peek().describe()),
+                                self.span(),
+                            ));
+                        }
+                    }
+                }
+                let end = self.expect(Tok::RBrace)?;
+                Ok(Expr { kind: ExprKind::Receive { arms }, span: span.merge(end) })
+            }
             Tok::Ident(name) => {
                 self.bump();
                 Ok(Expr { kind: ExprKind::Ident(name), span })

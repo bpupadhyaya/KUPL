@@ -758,6 +758,21 @@ impl Rewriter<'_> {
                 }
             }
             ExprKind::Try(inner) | ExprKind::Await(inner) => self.expr(inner),
+            // Mirrors `ExprKind::Match`'s own arm handling exactly
+            // (pattern bindings pushed into scope before the guard/body,
+            // per the PR-it841 lesson recorded on that arm above -- a
+            // guard is scanned too, not just the body).
+            ExprKind::Receive { arms } => {
+                for arm in arms {
+                    self.push();
+                    self.pattern(&mut arm.pattern);
+                    if let Some(g) = &mut arm.guard {
+                        self.expr(g);
+                    }
+                    self.block(&mut arm.body);
+                    self.pop();
+                }
+            }
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Bool(_)
