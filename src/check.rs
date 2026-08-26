@@ -2551,6 +2551,32 @@ impl Checker {
             };
             child_types.insert(child.name.clone(), child.component.clone());
             self.check_ctor_args(&child.component, &sig, &child.args, child.span, &mut cctx);
+            // `docs/design/DISTRIBUTION.md`'s own placement syntax
+            // (`at node(...)`) parses (`parser.rs`'s own `at` soft
+            // keyword) but has NO runtime support on any of the three
+            // execution engines yet -- per that doc's own "Sequencing"
+            // section ("Spec v1.0 (now): ... placement syntax reserved
+            // (`at node(...)` parses; single-node runtime rejects it
+            // with a clear diagnostic)"). Deliberately does NOT run the
+            // placement expression through `infer_expr` -- `node(...)`
+            // is a SPECIAL FORM this checker doesn't understand yet
+            // (`node` isn't a real function), not an ordinary
+            // expression to type-check; doing so produces a confusing,
+            // spurious "unknown name `node`" (K0240) alongside this
+            // diagnostic, live-confirmed before removing that call. A
+            // future implementation slice that actually specs
+            // `node(...)`'s own grammar should validate it properly at
+            // that point, not here. This is a checker-only first slice,
+            // deliberately mirroring K0295's own PR-cv2-9 precedent
+            // (land the restriction/diagnostic first, independently of
+            // the runtime work).
+            if let Some(placement) = &child.placement {
+                self.err(
+                    "K0309",
+                    "`at <placement>` (distributed component placement) is not yet supported by any KUPL runtime -- see docs/design/DISTRIBUTION.md for the design and current status".to_string(),
+                    placement.span,
+                );
+            }
             // Make THIS child visible to any LATER sibling's own ctor args
             // -- mirrors `bind_component_env`'s own insert line exactly.
             if self.checked.components.contains_key(&child.component) {
@@ -6184,6 +6210,29 @@ mod generic_tests {
             errs4.iter().any(|d| d.code == "K0296"),
             "the MIDDLE level's own nested call to a suspend-capable fun must still be caught: {errs4:?}"
         );
+    }
+
+    /// `docs/design/DISTRIBUTION.md`'s own "Sequencing" section: `at
+    /// node(...)` placement syntax parses (`parser.rs`'s own `at` soft
+    /// keyword) but is a checker-only first slice — no runtime supports
+    /// it yet, so `kupl check` must reject it with a clear, dedicated
+    /// diagnostic (K0309) rather than a syntax error or silent
+    /// acceptance. An ordinary child with no `at` clause at all must be
+    /// completely unaffected.
+    #[test]
+    fn distributed_placement_syntax_parses_but_is_k0309() {
+        let with_placement = "component W {\n    intent \"w\"\n}\n\
+                               app Main {\n    intent \"m\"\n    let w = W() at node(\"gpu-pool\")\n}\n";
+        let errs = errors(with_placement);
+        assert!(
+            errs.iter().any(|d| d.code == "K0309"),
+            "`at node(...)` must be K0309, not a syntax error or silent acceptance: {errs:?}"
+        );
+
+        let no_placement = "component W {\n    intent \"w\"\n}\n\
+                             app Main {\n    intent \"m\"\n    let w = W()\n}\n";
+        let errs2 = errors(no_placement);
+        assert!(!errs2.iter().any(|d| d.code == "K0309"), "an ordinary child with no placement must not be K0309: {errs2:?}");
     }
 
     /// Production-hardening 1214: a REAL, live-confirmed bug found+fixed --

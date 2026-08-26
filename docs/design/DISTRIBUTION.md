@@ -1,9 +1,13 @@
 # KUPL Distributed Components
 
 Proposal v0.1 — 2026-07-03.
-Status: PROPOSAL — **design now, implement later** (toolchain Phase 6+). The wire
-format and "what may cross a network port" rules must be fixed in spec v1.0, because
-they constrain the type system and cannot be retrofitted.
+Status: Spec v1.0's placement-syntax slice is **implemented** (`at node(...)`
+parses; the checker rejects it with K0309 on every runtime — see
+`docs/reference/DIAGNOSTICS.md`). Everything past that — the wire format,
+`cap.Cluster`, real remote wiring — remains **design now, implement later**
+(toolchain Phase 6+). The wire format and "what may cross a network port" rules
+must be fixed in spec v1.0, because they constrain the type system and cannot be
+retrofitted.
 
 **Why this doc exists:** "any software application" includes the most common shape
 of all — client + server + database across a network. KUPL's component model
@@ -99,9 +103,16 @@ Explicitly **not portable**:
 
 ## Sequencing
 
-- **Spec v1.0 (now):** portability rules, kser format, port-reference concept,
-  placement syntax reserved (`at node(...)` parses; single-node runtime rejects it
-  with a clear diagnostic).
+- **Spec v1.0 (now):** portability rules, kser format, port-reference concept —
+  designed, not yet implemented. Placement syntax IS implemented: a child's
+  `at <expr>` clause (`let w = Worker() at node("gpu-pool")`) parses via a soft
+  `at` keyword (mirroring `concurrent`/`ai`/`law`); the checker rejects every
+  use with K0309 since no runtime executes it yet, and `kupl fmt` round-trips
+  it losslessly. This is deliberately a syntax-and-diagnostic-only slice —
+  hand-rolling the network transport (mTLS, cluster membership security) under
+  time pressure and without expert review would be a more serious class of
+  risk than anything else in this codebase, so it is intentionally deferred to
+  Phase 6+ rather than rushed.
 - **Phase 6+:** `cap.Cluster` reference provider (static member list first; dynamic
   membership later), remote wiring in KVM/native runtimes, deployment manifests.
 - Visual tools benefit immediately at spec level: an architecture canvas can show

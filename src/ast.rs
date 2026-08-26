@@ -180,6 +180,25 @@ pub struct ChildDecl {
     pub name: String,
     pub component: String,
     pub args: Vec<Arg>,
+    /// `at <expr>` (e.g. `at node("api.shop.internal")`, `at node(local)`) —
+    /// `docs/design/DISTRIBUTION.md`'s own placement syntax, reusing the
+    /// SAME `at` prefix `docs/design/LANGUAGE.md`/`VISION.md` already
+    /// document (aspirationally, never implemented before now) for
+    /// hardware placement (`at(gpu) f(x)`). Kept as a general `Expr`
+    /// here, not a dedicated `Placement` enum — the CHECKER is what
+    /// currently understands (and rejects, K0309) the one recognized
+    /// shape, `node(...)`; keeping the AST general avoids over-
+    /// committing this field's own shape before runtime distribution
+    /// semantics are actually implemented. `None` for every child that
+    /// doesn't use it — the overwhelming majority, and the only shape
+    /// any runtime engine currently executes. Boxed (not a bare
+    /// `Option<Expr>`) so the common `None` case only costs one pointer
+    /// (8 bytes) on `ChildDecl` instead of `size_of::<Expr>()` (80 bytes,
+    /// since `Expr` has no niche for `Option` to reuse) -- found via a
+    /// live `perf_guard_100000_concurrent_actors_stay_under_a_memory_bound_between_shared_and_cloned_db`
+    /// regression: 100,000 sibling `ChildDecl`s x 80 extra bytes tipped a
+    /// tightly-calibrated 650MB `--max-memory` guard test over its bound.
+    pub placement: Option<Box<Expr>>,
     pub span: Span,
 }
 

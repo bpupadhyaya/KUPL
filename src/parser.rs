@@ -1003,8 +1003,21 @@ impl Parser {
                     args = self.parse_args()?;
                     self.expect(Tok::RParen)?;
                 }
+                // `docs/design/DISTRIBUTION.md`'s own placement syntax:
+                // `at <expr>` (e.g. `at node("host")`, `at node(local)`) --
+                // `at` is a soft keyword (a plain `Tok::Ident("at")`, like
+                // `concurrent`/`ai`/`law`), only special directly after a
+                // child's own constructor call, so an ordinary statement
+                // that happens to start with a variable literally named
+                // `at` elsewhere is never affected by this.
+                let placement = if matches!(self.peek(), Tok::Ident(s) if s == "at") {
+                    self.bump();
+                    Some(Box::new(self.parse_expr()?))
+                } else {
+                    None
+                };
                 let span = nspan.merge(self.prev_span());
-                c.children.push(ChildDecl { name, component, args, span });
+                c.children.push(ChildDecl { name, component, args, placement, span });
                 self.expect_terminator()
             }
             Tok::KwWire => {

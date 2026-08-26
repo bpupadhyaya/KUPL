@@ -411,7 +411,11 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
             }
             out.push_str(&expr_str(&a.value, 0));
         }
-        out.push_str(")\n");
+        out.push(')');
+        if let Some(p) = &child.placement {
+            out.push_str(&format!(" at {}", expr_str(p, 0)));
+        }
+        out.push('\n');
     }
     sep(out, !c.wires.is_empty());
     for w in &c.wires {
@@ -1026,6 +1030,37 @@ mod tests {
             "component W {\n    intent \"w\"\n}\n\
              app Main {\n    intent \"m\"\n    let w = W()\n    supervise w restart on_failure\n}\n",
         );
+    }
+
+    /// `docs/design/DISTRIBUTION.md`'s own placement syntax (`at
+    /// node(...)`, `parser.rs`'s own `at` soft keyword) must round-trip
+    /// through `kupl fmt` -- checked BOTH via `roundtrip`'s own
+    /// idempotence pass AND an explicit "the formatted output still
+    /// CONTAINS the placement clause" assertion, matching the lesson
+    /// from `fmt_preserves_use_declarations`'s own doc comment: silently
+    /// dropping something on EVERY format pass still looks "idempotent"
+    /// to a bare fixpoint check, so idempotence alone is not sufficient
+    /// evidence nothing was lost.
+    #[test]
+    fn fmt_preserves_distributed_placement_clause() {
+        let src = "component W {\n    intent \"w\"\n}\n\
+                    app Main {\n    intent \"m\"\n    let w = W() at node(\"gpu-pool\")\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(
+            formatted.contains("at node(\"gpu-pool\")"),
+            "the `at node(...)` placement clause must survive formatting, not be silently dropped: {formatted:?}"
+        );
+        // A child with NO placement must be completely unaffected.
+        let no_placement = "component W {\n    intent \"w\"\n}\n\
+                             app Main {\n    intent \"m\"\n    let w = W()\n}\n";
+        roundtrip(no_placement);
+        let (p2, d2) = parser::parse(no_placement);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains(" at "), "an ordinary child with no placement must not gain one: {formatted2:?}");
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-
