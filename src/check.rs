@@ -2115,15 +2115,70 @@ impl Checker {
         // today (no real KUPL program exists yet that could be broken by
         // it), and narrows what the LATER scheduling implementation has
         // to handle.
+        // Concurrency-v3 (the "chained continuation" generalization of
+        // ASYNC_IO.md's own suspend/resume mechanism, safe/zero-`unsafe`
+        // alternative to full stack-switching): a private `fun` is
+        // "suspend-capable" if it directly contains a blocking-builtin
+        // call as its OWN top-level statement, OR calls ANOTHER
+        // suspend-capable `fun` as ITS OWN top-level statement (a
+        // fixed-point over `c.funs`). `check_no_nested_blocking_calls`
+        // below now ALSO requires every CALL to a suspend-capable fun
+        // (from anywhere in this component's own handler/expose/fun
+        // bodies) to be the entire top-level `let` rhs, the SAME shape a
+        // direct blocking call already needs — this is what lets the
+        // runtime's chain-based suspend mechanism safely capture EVERY
+        // level of continuation (see `interp.rs`'s own `SuspendChain`).
+        let suspend_capable = Self::suspend_capable_funs(c);
         for h in &c.handlers {
-            self.check_no_nested_blocking_calls(&h.body);
+            self.check_no_nested_blocking_calls(&h.body, &suspend_capable);
         }
         for expose in &c.exposes {
-            self.check_no_nested_blocking_calls(&expose.body);
+            self.check_no_nested_blocking_calls(&expose.body, &suspend_capable);
         }
         for f in &c.funs {
-            self.check_no_nested_blocking_calls(&f.body);
+            self.check_no_nested_blocking_calls(&f.body, &suspend_capable);
         }
+    }
+
+    /// Fixed-point reachability: which of `c`'s own private `fun`s
+    /// (never `expose fun`s — an expose fun is a Call-entry point, not
+    /// something ANOTHER fun calls by name in this restricted sense) are
+    /// "suspend-capable." See `check_concurrent_component`'s own call
+    /// site doc comment for the full "why."
+    fn suspend_capable_funs(c: &ComponentDecl) -> std::collections::HashSet<String> {
+        let mut capable: std::collections::HashSet<String> = std::collections::HashSet::new();
+        loop {
+            let mut changed = false;
+            for f in &c.funs {
+                if capable.contains(&f.name) {
+                    continue;
+                }
+                let is_capable = f.body.stmts.iter().any(|stmt| match stmt {
+                    Stmt::Let { init, .. } => {
+                        Self::is_blocking_builtin_call(init) || Self::is_call_to_named(init, &capable)
+                    }
+                    _ => false,
+                });
+                if is_capable {
+                    capable.insert(f.name.clone());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        capable
+    }
+
+    /// `true` if `e` is a direct call to a function whose name is in
+    /// `names` (arity-agnostic, unlike `is_blocking_builtin_call` --
+    /// user-defined funs aren't overloaded by arity the way the 4
+    /// blocking builtins conceptually are here).
+    fn is_call_to_named(e: &Expr, names: &std::collections::HashSet<String>) -> bool {
+        let ExprKind::Call { callee, .. } = &e.kind else { return false };
+        let ExprKind::Ident(name) = &callee.kind else { return false };
+        names.contains(name.as_str())
     }
 
     /// The set of blocking builtins `docs/design/ASYNC_IO.md` restricts
@@ -2148,66 +2203,72 @@ impl Checker {
     }
 
     /// Top-level pass over a handler/exposed-fun body: each DIRECT
-    /// `Stmt::Let` whose `init` is itself a blocking-builtin call is
-    /// allowed (its own arguments are still scanned recursively -- an
-    /// argument expression is never the "top level" itself); every OTHER
-    /// statement is scanned recursively via `scan_block_for_blocking_calls`,
-    /// which rejects a blocking call found ANYWHERE, including inside a
-    /// NESTED block's own top-level statements (a `let` inside a loop/`if`
-    /// body is not this function's OWN top level).
-    fn check_no_nested_blocking_calls(&mut self, block: &Block) {
+    /// `Stmt::Let` whose `init` is itself a blocking-builtin call, OR a
+    /// call to a `suspend_capable` fun (Concurrency-v3's own chained-
+    /// continuation generalization -- see `check_concurrent_component`'s
+    /// own doc comment), is allowed (its own arguments are still scanned
+    /// recursively -- an argument expression is never the "top level"
+    /// itself); every OTHER statement is scanned recursively via
+    /// `scan_block_for_blocking_calls`, which rejects either shape found
+    /// ANYWHERE, including inside a NESTED block's own top-level
+    /// statements (a `let` inside a loop/`if` body is not this
+    /// function's OWN top level).
+    fn check_no_nested_blocking_calls(&mut self, block: &Block, suspend_capable: &std::collections::HashSet<String>) {
         for stmt in &block.stmts {
             match stmt {
-                Stmt::Let { init, .. } if Self::is_blocking_builtin_call(init) => {
+                Stmt::Let { init, .. }
+                    if Self::is_blocking_builtin_call(init) || Self::is_call_to_named(init, suspend_capable) =>
+                {
                     let ExprKind::Call { args, .. } = &init.kind else { unreachable!() };
                     for a in args {
-                        self.scan_expr_for_blocking_calls(&a.value);
+                        self.scan_expr_for_blocking_calls(&a.value, suspend_capable);
                     }
                 }
-                _ => self.scan_stmt_for_blocking_calls(stmt),
+                _ => self.scan_stmt_for_blocking_calls(stmt, suspend_capable),
             }
         }
     }
 
-    /// Scans every statement in `block` for a blocking-builtin call
-    /// ANYWHERE, with NO top-level allowance (used for nested blocks --
-    /// loop bodies, `if`/`match` arms, lambda bodies -- where even a
-    /// `let`-bound blocking call is still not permitted, since it isn't
-    /// at the containing HANDLER's own top level).
-    fn scan_block_for_blocking_calls(&mut self, block: &Block) {
+    /// Scans every statement in `block` for a blocking-builtin call (or a
+    /// call to a `suspend_capable` fun) ANYWHERE, with NO top-level
+    /// allowance (used for nested blocks -- loop bodies, `if`/`match`
+    /// arms, lambda bodies -- where even a `let`-bound one is still not
+    /// permitted, since it isn't at the containing HANDLER's own top
+    /// level).
+    fn scan_block_for_blocking_calls(&mut self, block: &Block, suspend_capable: &std::collections::HashSet<String>) {
         for stmt in &block.stmts {
-            self.scan_stmt_for_blocking_calls(stmt);
+            self.scan_stmt_for_blocking_calls(stmt, suspend_capable);
         }
     }
 
-    fn scan_stmt_for_blocking_calls(&mut self, stmt: &Stmt) {
+    fn scan_stmt_for_blocking_calls(&mut self, stmt: &Stmt, suspend_capable: &std::collections::HashSet<String>) {
         match stmt {
-            Stmt::Let { init, .. } => self.scan_expr_for_blocking_calls(init),
+            Stmt::Let { init, .. } => self.scan_expr_for_blocking_calls(init, suspend_capable),
             Stmt::Assign { target, value, .. } => {
-                self.scan_expr_for_blocking_calls(target);
-                self.scan_expr_for_blocking_calls(value);
+                self.scan_expr_for_blocking_calls(target, suspend_capable);
+                self.scan_expr_for_blocking_calls(value, suspend_capable);
             }
-            Stmt::Expr(e) => self.scan_expr_for_blocking_calls(e),
+            Stmt::Expr(e) => self.scan_expr_for_blocking_calls(e, suspend_capable),
             Stmt::Return(e, _) => {
                 if let Some(e) = e {
-                    self.scan_expr_for_blocking_calls(e);
+                    self.scan_expr_for_blocking_calls(e, suspend_capable);
                 }
             }
             Stmt::While { cond, body, .. } => {
-                self.scan_expr_for_blocking_calls(cond);
-                self.scan_block_for_blocking_calls(body);
+                self.scan_expr_for_blocking_calls(cond, suspend_capable);
+                self.scan_block_for_blocking_calls(body, suspend_capable);
             }
             Stmt::For { iter, body, .. } => {
-                self.scan_expr_for_blocking_calls(iter);
-                self.scan_block_for_blocking_calls(body);
+                self.scan_expr_for_blocking_calls(iter, suspend_capable);
+                self.scan_block_for_blocking_calls(body, suspend_capable);
             }
             Stmt::Emit { arg, .. } => {
                 if let Some(a) = arg {
-                    self.scan_expr_for_blocking_calls(a);
+                    self.scan_expr_for_blocking_calls(a, suspend_capable);
                 }
             }
-            Stmt::Expect(e, _) => self.scan_expr_for_blocking_calls(e),
-            Stmt::Forall { body, .. } => self.scan_block_for_blocking_calls(body),
+            Stmt::Expect(e, _) => self.scan_expr_for_blocking_calls(e, suspend_capable),
+            Stmt::Forall { body, .. } => self.scan_block_for_blocking_calls(body, suspend_capable),
             Stmt::Break(_) | Stmt::Continue(_) => {}
         }
     }
@@ -2216,7 +2277,7 @@ impl Checker {
     /// future new expression variant must be triaged here explicitly,
     /// matching this codebase's own established discipline for this
     /// class of AST-wide check).
-    fn scan_expr_for_blocking_calls(&mut self, e: &Expr) {
+    fn scan_expr_for_blocking_calls(&mut self, e: &Expr, suspend_capable: &std::collections::HashSet<String>) {
         if Self::is_blocking_builtin_call(e) {
             self.err(
                 "K0295",
@@ -2228,6 +2289,21 @@ impl Checker {
             // ALLOWED call sites) callee/args below for completeness --
             // falls through rather than `return`, matching this
             // function's own "always fully exhaustive" discipline.
+        } else if Self::is_call_to_named(e, suspend_capable) {
+            // Concurrency-v3: the SAME restriction, extended to a call
+            // reaching a `fun` that itself (directly or transitively)
+            // performs a blocking builtin call as ITS OWN top-level
+            // statement -- see `check_concurrent_component`'s own doc
+            // comment for the full "why."
+            let ExprKind::Call { callee, .. } = &e.kind else { unreachable!() };
+            let ExprKind::Ident(name) = &callee.kind else { unreachable!() };
+            self.err(
+                "K0296",
+                format!(
+                    "a call to `{name}` (which itself performs a blocking builtin call as its own top-level statement) may only appear as the ENTIRE right-hand side of a top-level `let` in a handler or exposed-fun body -- see docs/design/ASYNC_IO.md"
+                ),
+                e.span,
+            );
         }
         match &e.kind {
             ExprKind::Int(_)
@@ -2241,62 +2317,62 @@ impl Checker {
             ExprKind::Str(pieces) => {
                 for p in pieces {
                     if let StrPiece::Expr(inner) = p {
-                        self.scan_expr_for_blocking_calls(inner);
+                        self.scan_expr_for_blocking_calls(inner, suspend_capable);
                     }
                 }
             }
             ExprKind::List(items) | ExprKind::Par(items) => {
                 for i in items {
-                    self.scan_expr_for_blocking_calls(i);
+                    self.scan_expr_for_blocking_calls(i, suspend_capable);
                 }
             }
             ExprKind::Call { callee, args } => {
-                self.scan_expr_for_blocking_calls(callee);
+                self.scan_expr_for_blocking_calls(callee, suspend_capable);
                 for a in args {
-                    self.scan_expr_for_blocking_calls(&a.value);
+                    self.scan_expr_for_blocking_calls(&a.value, suspend_capable);
                 }
             }
             ExprKind::MethodCall { recv, args, .. } => {
-                self.scan_expr_for_blocking_calls(recv);
+                self.scan_expr_for_blocking_calls(recv, suspend_capable);
                 for a in args {
-                    self.scan_expr_for_blocking_calls(&a.value);
+                    self.scan_expr_for_blocking_calls(&a.value, suspend_capable);
                 }
             }
-            ExprKind::Field { recv, .. } => self.scan_expr_for_blocking_calls(recv),
+            ExprKind::Field { recv, .. } => self.scan_expr_for_blocking_calls(recv, suspend_capable),
             ExprKind::Binary { lhs, rhs, .. } => {
-                self.scan_expr_for_blocking_calls(lhs);
-                self.scan_expr_for_blocking_calls(rhs);
+                self.scan_expr_for_blocking_calls(lhs, suspend_capable);
+                self.scan_expr_for_blocking_calls(rhs, suspend_capable);
             }
-            ExprKind::Unary { operand, .. } => self.scan_expr_for_blocking_calls(operand),
+            ExprKind::Unary { operand, .. } => self.scan_expr_for_blocking_calls(operand, suspend_capable),
             ExprKind::If { cond, then_block, else_block } => {
-                self.scan_expr_for_blocking_calls(cond);
-                self.scan_block_for_blocking_calls(then_block);
+                self.scan_expr_for_blocking_calls(cond, suspend_capable);
+                self.scan_block_for_blocking_calls(then_block, suspend_capable);
                 if let Some(e) = else_block {
-                    self.scan_expr_for_blocking_calls(e);
+                    self.scan_expr_for_blocking_calls(e, suspend_capable);
                 }
             }
-            ExprKind::BlockExpr(b) => self.scan_block_for_blocking_calls(b),
+            ExprKind::BlockExpr(b) => self.scan_block_for_blocking_calls(b, suspend_capable),
             ExprKind::Match { scrutinee, arms } => {
-                self.scan_expr_for_blocking_calls(scrutinee);
+                self.scan_expr_for_blocking_calls(scrutinee, suspend_capable);
                 for arm in arms {
                     if let Some(g) = &arm.guard {
-                        self.scan_expr_for_blocking_calls(g);
+                        self.scan_expr_for_blocking_calls(g, suspend_capable);
                     }
-                    self.scan_expr_for_blocking_calls(&arm.body);
+                    self.scan_expr_for_blocking_calls(&arm.body, suspend_capable);
                 }
             }
-            ExprKind::Lambda { body, .. } => self.scan_block_for_blocking_calls(body),
+            ExprKind::Lambda { body, .. } => self.scan_block_for_blocking_calls(body, suspend_capable),
             ExprKind::Range { lo, hi, .. } => {
-                self.scan_expr_for_blocking_calls(lo);
-                self.scan_expr_for_blocking_calls(hi);
+                self.scan_expr_for_blocking_calls(lo, suspend_capable);
+                self.scan_expr_for_blocking_calls(hi, suspend_capable);
             }
             ExprKind::With { recv, updates } => {
-                self.scan_expr_for_blocking_calls(recv);
+                self.scan_expr_for_blocking_calls(recv, suspend_capable);
                 for (_, v) in updates {
-                    self.scan_expr_for_blocking_calls(v);
+                    self.scan_expr_for_blocking_calls(v, suspend_capable);
                 }
             }
-            ExprKind::Try(inner) | ExprKind::Await(inner) => self.scan_expr_for_blocking_calls(inner),
+            ExprKind::Try(inner) | ExprKind::Await(inner) => self.scan_expr_for_blocking_calls(inner, suspend_capable),
         }
     }
 
@@ -6028,6 +6104,65 @@ mod generic_tests {
         assert!(
             !errs.iter().any(|d| d.code == "K0306"),
             "a CapNet/CapFs prop on a concurrent component must NOT be K0306: {errs:?}"
+        );
+    }
+
+    /// Concurrency-v3 (the safe, chained-continuation generalization of
+    /// ASYNC_IO.md's own suspend mechanism -- see `check_concurrent_
+    /// component`'s own doc comment in `check.rs`): a call to a private
+    /// `fun` that itself contains a top-level blocking call is allowed
+    /// as a top-level `let`'s own rhs (the SAME shape a direct blocking
+    /// call already needs) -- no K0296 -- but the SAME call nested
+    /// inside an `if`/`for`/anywhere else IS K0296. Also covers a
+    /// 3-level TRANSITIVE chain (fun A calls fun B calls http_get) to
+    /// confirm the fixed-point reachability analysis propagates
+    /// correctly, not just one hop.
+    #[test]
+    fn concurrent_component_suspend_capable_fun_calls_must_also_be_top_level() {
+        let ok_top_level = "concurrent component Fetcher {\n    intent \"f\"\n    \
+             fun helper(url: Str) -> Str {\n        let result = http_get(url)\n        \
+             match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    }\n    \
+             in trigger: Str\n    on trigger(url) {\n        let x = helper(url)\n        print(\"{x}\")\n    }\n}\n\
+             app Root {\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs = errors(ok_top_level);
+        assert!(
+            !errs.iter().any(|d| d.code == "K0296"),
+            "a top-level let calling a suspend-capable fun must NOT be K0296: {errs:?}"
+        );
+
+        let nested_in_if = "concurrent component Fetcher {\n    intent \"f\"\n    \
+             fun helper(url: Str) -> Str {\n        let result = http_get(url)\n        \
+             match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    }\n    \
+             in trigger: Str\n    on trigger(url) {\n        if true {\n            let x = helper(url)\n            print(\"{x}\")\n        }\n    }\n}\n\
+             app Root {\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs2 = errors(nested_in_if);
+        assert!(
+            errs2.iter().any(|d| d.code == "K0296"),
+            "a call to a suspend-capable fun nested inside an `if` must be K0296: {errs2:?}"
+        );
+
+        let transitive_ok = "concurrent component Fetcher {\n    intent \"f\"\n    \
+             fun inner(url: Str) -> Str {\n        let result = http_get(url)\n        \
+             match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    }\n    \
+             fun middle(url: Str) -> Str {\n        let x = inner(url)\n        x\n    }\n    \
+             in trigger: Str\n    on trigger(url) {\n        let y = middle(url)\n        print(\"{y}\")\n    }\n}\n\
+             app Root {\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs3 = errors(transitive_ok);
+        assert!(
+            !errs3.iter().any(|d| d.code == "K0296" || d.code == "K0295"),
+            "a 3-level chain, entirely top-level, must be clean: {errs3:?}"
+        );
+
+        let transitive_nested = "concurrent component Fetcher {\n    intent \"f\"\n    \
+             fun inner(url: Str) -> Str {\n        let result = http_get(url)\n        \
+             match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    }\n    \
+             fun middle(url: Str) -> Str {\n        for i in 0..1 {\n            let x = inner(url)\n            return x\n        }\n        \"\"\n    }\n    \
+             in trigger: Str\n    on trigger(url) {\n        let y = middle(url)\n        print(\"{y}\")\n    }\n}\n\
+             app Root {\n}\nfun main() uses io { print(\"ok\") }\n";
+        let errs4 = errors(transitive_nested);
+        assert!(
+            errs4.iter().any(|d| d.code == "K0296"),
+            "the MIDDLE level's own nested call to a suspend-capable fun must still be caught: {errs4:?}"
         );
     }
 

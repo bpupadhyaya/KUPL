@@ -4175,35 +4175,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Concurrency-v2 PR-cv2-12 (`docs/design/ASYNC_IO.md` §7's own item
-    /// (a), left open by PR-cv2-10/11): a REAL bug found+fixed while
-    /// writing THIS test. K0295 already covers `c.funs` (confirmed in
-    /// `check.rs`), so a top-level blocking call inside a PRIVATE
-    /// (non-`expose`) `fun` passes the checker -- and it was initially
-    /// assumed (per this doc's own earlier §7 wording, WRONGLY -- since
-    /// corrected) that it would also suspend/resume correctly at runtime, on the
-    /// reasoning that `Interp.allow_suspend` stays set across a nested
-    /// `call_fun` and `exec_stmts_checked` only checks that flag. Running
-    /// this exact test FIRST (before assuming the reasoning was correct)
-    /// showed empty output, exit 0 -- no crash, but the handler's own
-    /// `print` after the `helper(url)` call never ran. Root cause:
-    /// `SuspendedHandler` captures only ONE stack frame's continuation
-    /// (the current block's own remaining statements + bind name + env)
-    /// -- when the blocking call is nested inside a called private `fun`,
-    /// resuming replays only THAT fun's own remaining statements; its
-    /// return value never makes it back to the handler's own `let x =
-    /// helper(...)` binding, and the handler's own remaining statements
-    /// silently never run. Fixed in `exec_stmts_checked` by only
-    /// attempting the flat suspend when `self.call_depth == 0` (directly
-    /// in the handler's own top-level body, the one shape `SuspendedHandler`
-    /// can represent correctly) -- a nested call now falls through to
-    /// ordinary INLINE (blocking) execution instead, exactly like
-    /// `http_get_with`/`read_file_with` already do for their own
-    /// different reason. This test now proves the CORRECTED behavior:
-    /// the call produces the right value and the process doesn't hang,
-    /// even though it does NOT genuinely suspend for this shape.
+    /// Concurrency-v3: combines PR-cv2-15's own `Call`-triggered suspend
+    /// with the chain mechanism -- an `expose fun` whose OWN top-level
+    /// statement calls a PRIVATE helper fun that does the actual
+    /// `http_get`, exercising `SuspendChain.reply` being carried through
+    /// a nested frame correctly (not just the flat, 1-frame Call case
+    /// PR-cv2-15's own test covers, and not just the Deliver-triggered
+    /// nested case the tests above cover).
     #[test]
-    fn concurrent_component_http_get_inside_a_private_helper_fun_runs_inline_and_produces_the_right_value() {
+    fn concurrent_component_call_triggered_suspend_through_a_nested_private_fun_returns_the_correct_value() {
         let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
         if !bin.exists() {
             return;
@@ -4215,7 +4195,7 @@ mod tests {
             if let Ok((mut stream, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 let _ = stream.read(&mut buf);
-                let body = "inline-inside-a-private-fun";
+                let body = "call-suspend-nested-worked";
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     body.len(),
@@ -4225,27 +4205,24 @@ mod tests {
             }
         });
 
-        let dir = std::env::temp_dir().join(format!("kupl-blocking-call-in-private-fun-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("kupl-call-suspend-nested-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("blocking_call_in_private_fun.kupl");
+        let file = dir.join("call_suspend_nested.kupl");
         let src = format!(
-            "concurrent component Fetcher {{\n    intent \"a blocking call nested inside a private helper fun\"\n    \
-             in trigger: Str\n    \
+            "concurrent component Fetcher {{\n    intent \"Call-triggered suspend through a nested private fun\"\n    \
              fun helper(url: Str) -> Str {{\n        let result = http_get(url)\n        \
              match result {{\n            Ok(body) => body,\n            Err(e) => e,\n        }}\n    }}\n    \
-             on trigger(url) {{\n        let body = helper(url)\n        print(\"GOT:{{body}}\")\n    }}\n}}\n\
-             component Driver {{\n    intent \"fires once at startup\"\n    out fire: Str\n    \
-             on start {{ emit fire(\"http://127.0.0.1:{port}/\") }}\n}}\n\
-             app Main {{\n    intent \"blocking call inside a private fun\"\n    \
-             let fetcher = Fetcher()\n    let driver = Driver()\n    wire driver.fire -> fetcher.trigger\n    \
-             on start {{ }}\n}}\n"
+             expose fun poke(url: Str) uses io.net -> Str {{\n        let x = helper(url)\n        x\n    }}\n}}\n\
+             fun main() uses io, io.net {{\n    let f = Fetcher()\n    \
+             print(f.poke(\"http://127.0.0.1:{port}/\"))\n}}\n"
         );
         std::fs::write(&file, &src).unwrap();
 
         let errs = std::process::Command::new(&bin).args(["check", file.to_str().unwrap()]).output().unwrap();
         assert!(
-            !String::from_utf8_lossy(&errs.stderr).contains("K0295"),
-            "a top-level let-bound blocking call inside a private fun must not be K0295: {errs:?}"
+            !String::from_utf8_lossy(&errs.stderr).contains("K0295")
+                && !String::from_utf8_lossy(&errs.stderr).contains("K0296"),
+            "a Call-triggered nested chain must not be K0295/K0296: {errs:?}"
         );
 
         let child = std::process::Command::new(&bin)
@@ -4255,14 +4232,234 @@ mod tests {
             .spawn()
             .expect("kupl run spawns");
         let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
-        let out = out.expect("kupl run must not hang on a blocking call nested inside a private fun");
+        let out = out.expect("kupl run must not hang while a Call-triggered nested suspend chain is in flight");
         assert_eq!(out.status.code(), Some(0), "{out:?}");
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "GOT:inline-inside-a-private-fun\n",
-            "the handler must see the real server response AND its own remaining statement \
-             (this `print`) must actually run -- a regression here would mean the private-fun \
-             case is silently losing the outer handler's continuation again: {out:?}"
+            "call-suspend-nested-worked\n",
+            "the caller must receive helper's own real return value, propagated through poke's own frame: {out:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrency-v3 (superseding PR-cv2-12/13's own "runs inline"
+    /// finding): a blocking call nested inside a private helper `fun`
+    /// now GENUINELY suspends, via `SuspendChain`'s own multi-frame
+    /// continuation mechanism (`ContinuationFrame` pushed at each call
+    /// frame level the suspend propagates through on its way out — see
+    /// that type's own doc comment in `interp.rs`). This is the
+    /// DECISIVE, non-blocking-ness version of this test (not just a
+    /// correctness check) — mirrors `concurrent_component_suspended_
+    /// http_get_does_not_block_sibling_actors_sharing_its_worker`'s own
+    /// pigeonhole-collision technique exactly, just with `Fetcher`'s own
+    /// blocking call nested one level deeper (inside `helper`, called
+    /// from `on trigger`) instead of directly in the handler's own body
+    /// — proving the chain mechanism achieves the SAME non-blocking
+    /// property for a nested call that PR-cv2-10 already proved for the
+    /// flat, single-frame case.
+    #[test]
+    fn concurrent_component_suspended_http_get_nested_in_a_private_fun_does_not_block_sibling_actors() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        const N_PINGERS: usize = 60;
+        const SERVER_DELAY_MS: u64 = 1500;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(std::time::Duration::from_millis(SERVER_DELAY_MS));
+                let body = "slow";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir =
+            std::env::temp_dir().join(format!("kupl-suspend-nonblocking-nested-fun-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("suspend_nonblocking_nested_fun.kupl");
+        let mut src = String::from(
+            "concurrent component Fetcher {\n    intent \"slow http_get, nested in a private fun\"\n    in trigger: Str\n    \
+             fun helper(url: Str) -> Str {\n        let result = http_get(url)\n        \
+             match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    }\n    \
+             on trigger(url) {\n        let body = helper(url)\n        print(\"fetched:{body}\")\n    }\n}\n\
+             concurrent component Pinger {\n    intent \"fast, no I/O\"\n    prop id: Int\n    in ping: Str\n    \
+             on ping(x) {\n        print(\"pong:{id}\")\n    }\n}\n\
+             component Driver {\n    intent \"fires everything at startup\"\n    out fire_fetch: Str\n",
+        );
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("    out fire_ping{i}: Str\n"));
+        }
+        src.push_str(&format!("    on start {{\n        emit fire_fetch(\"http://127.0.0.1:{port}/\")\n"));
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("        emit fire_ping{i}(\"p{i}\")\n"));
+        }
+        src.push_str("    }\n}\napp Main {\n    intent \"non-blocking race test, nested fun\"\n    let fetcher = Fetcher()\n");
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("    let pinger{i} = Pinger(id: {i})\n"));
+        }
+        src.push_str("    let driver = Driver()\n    wire driver.fire_fetch -> fetcher.trigger\n");
+        for i in 0..N_PINGERS {
+            src.push_str(&format!("    wire driver.fire_ping{i} -> pinger{i}.ping\n"));
+        }
+        src.push_str("}\n");
+        std::fs::write(&file, &src).unwrap();
+
+        let errs = std::process::Command::new(&bin).args(["check", file.to_str().unwrap()]).output().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&errs.stderr).contains("K0295")
+                && !String::from_utf8_lossy(&errs.stderr).contains("K0296"),
+            "a top-level let-bound blocking call inside a private fun, itself called top-level, must not be K0295/K0296: {errs:?}"
+        );
+
+        let mut child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let stdout = child.stdout.take().expect("piped stdout");
+        let start = std::time::Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            use std::io::BufRead;
+            let mut reader = std::io::BufReader::new(stdout);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        let elapsed = start.elapsed();
+                        let _ = tx.send((elapsed, line.trim_end().to_string()));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut pong_times = Vec::new();
+        let mut fetched_time = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                Ok((elapsed, line)) => {
+                    if line.starts_with("pong:") {
+                        pong_times.push(elapsed);
+                    } else if line.starts_with("fetched:") {
+                        fetched_time = Some((elapsed, line));
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        let _ = reader.join();
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must eventually exit");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+
+        assert_eq!(pong_times.len(), N_PINGERS, "every pinger must respond exactly once: {pong_times:?}");
+        let (fetched_time, fetched_line) = fetched_time.expect("Fetcher's own `fetched:` line must appear");
+        assert_eq!(fetched_line, "fetched:slow", "the resumed handler must see the real server response: {fetched_line:?}");
+        let max_pong = pong_times.iter().max().copied().unwrap();
+        assert!(
+            max_pong < std::time::Duration::from_millis(SERVER_DELAY_MS / 2),
+            "every pinger must respond well before the slow http_get (nested in a private fun) completes -- \
+             the SLOWEST pong arrived at {max_pong:?}, but the server was deliberately delayed \
+             {SERVER_DELAY_MS}ms; a pong this late means a pinger got stuck behind Fetcher's blocking \
+             I/O on a shared worker, i.e. the CHAIN-based suspend mechanism is NOT actually freeing \
+             the worker for a nested call"
+        );
+        assert!(
+            fetched_time >= std::time::Duration::from_millis(SERVER_DELAY_MS),
+            "the slow fetch must still take the full server delay: {fetched_time:?}"
+        );
+
+        let _ = server.join();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrency-v3: a 3-LEVEL transitive chain (`on trigger` calls
+    /// `middle`, which calls `inner`, which does the actual `http_get`)
+    /// — proves `SuspendChain`'s own frame-stacking generalizes beyond
+    /// 2 levels, not just "one extra frame happens to work." Correctness
+    /// only (not a decisive non-blocking-ness test — the 2-level nested
+    /// test above already establishes that property for the chain
+    /// mechanism generally; this test's own job is depth, not
+    /// non-blocking-ness specifically).
+    #[test]
+    fn concurrent_component_http_get_suspends_correctly_through_a_3_level_transitive_call_chain() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                let body = "3-level-chain-worked";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(resp.as_bytes());
+            }
+        });
+
+        let dir = std::env::temp_dir().join(format!("kupl-suspend-3-level-chain-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("suspend_3_level_chain.kupl");
+        let src = format!(
+            "concurrent component Fetcher {{\n    intent \"3-level transitive suspend chain\"\n    in trigger: Str\n    \
+             fun inner(url: Str) -> Str {{\n        let result = http_get(url)\n        \
+             match result {{\n            Ok(body) => body,\n            Err(e) => e,\n        }}\n    }}\n    \
+             fun middle(url: Str) -> Str {{\n        let x = inner(url)\n        x\n    }}\n    \
+             on trigger(url) {{\n        let y = middle(url)\n        print(\"GOT:{{y}}\")\n    }}\n}}\n\
+             component Driver {{\n    intent \"fires once at startup\"\n    out fire: Str\n    \
+             on start {{ emit fire(\"http://127.0.0.1:{port}/\") }}\n}}\n\
+             app Main {{\n    intent \"3-level chain\"\n    \
+             let fetcher = Fetcher()\n    let driver = Driver()\n    wire driver.fire -> fetcher.trigger\n    \
+             on start {{ }}\n}}\n"
+        );
+        std::fs::write(&file, &src).unwrap();
+
+        let errs = std::process::Command::new(&bin).args(["check", file.to_str().unwrap()]).output().unwrap();
+        assert!(
+            !String::from_utf8_lossy(&errs.stderr).contains("K0295")
+                && !String::from_utf8_lossy(&errs.stderr).contains("K0296"),
+            "a 3-level top-level-let chain must not be K0295/K0296: {errs:?}"
+        );
+
+        let child = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("kupl run spawns");
+        let out = wait_with_timeout(child, std::time::Duration::from_secs(15));
+        let out = out.expect("kupl run must not hang on a 3-level transitive suspend chain");
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "GOT:3-level-chain-worked\n",
+            "the value must propagate correctly through all 3 frames (inner -> middle -> the handler): {out:?}"
         );
 
         let _ = server.join();

@@ -1,69 +1,64 @@
 # Non-blocking I/O for `concurrent component` handlers — design doc
 
-**Status: §4/§6's own RESTRICTION (the diagnostic, K0295) is
-IMPLEMENTED — PR-cv2-9, KUPL commit `a065cce`. The actual §5 scheduling
-logic (suspend/resume: `Flow::Suspend`/`SuspendedHandler`,
-`WorkerCmd::IoComplete`, `PooledActor.suspended`/`.pending`/
-`.pending_stop`) is now ALSO IMPLEMENTED — PR-cv2-10. As of PR-cv2-14,
-ALL 4 blocking builtins (`http_get`, `http_post`, `http_get_with`,
-`read_file_with`) genuinely suspend at the runtime-dispatch level —
-`http_get_with`/`read_file_with`'s `CapNet`/`CapFs` argument was
-originally treated as opaque to `parallel::to_portable` (grouped with
-genuinely non-portable types like closures), but a capability's own
-carried scope is plain `Option<Str>` data with no technical Send-safety
-obstacle; `PortableValue::CapNet`/`CapFs` (PR-cv2-14) now round-trip it
-safely, and `check.rs::is_portable_ty` no longer rejects a `CapNet`/
-`CapFs` prop on a `concurrent component` (K0306) either. **However**,
-PR-cv2-14 also found a SEPARATE, pre-existing structural fact,
-unrelated to concurrency: a capability can never reach an `app`'s own
-child tree at all in v0.1 — `cap_net_root()`/`cap_fs_root()` may only
-be called in `fun main`'s own top-level body (K0304), and v0.1 apps
-must be self-contained (no props), so there is no expressible path for
-a capability to enter an app-rooted program. Since reaching a
-`Deliver`-triggered (suspend-capable) handler ALSO requires the `app`
-path (the only thing that calls `Interp::start_all`), `http_get_with`/
-`read_file_with` suspending is therefore un-exercisable by any full
-KUPL program today, even though the underlying mechanism is now
-correct and independently tested (`interp.rs`'s own
-`spawn_blocking_io_tests`, calling `spawn_blocking_io` directly).
-As of PR-cv2-15, `Call`-triggered `expose fun` execution ALSO genuinely
-suspends (`Interp.pending_call_reply` stashes the original `ActorMsg::
-Call`'s own reply channel across the suspend, threaded through exactly
-like `SuspendedHandler.reply`). A REAL bug was caught writing the very
-first test for this: reusing PR-cv2-13's own `self.call_depth == 0`
-gate unchanged silently broke suspend for EVERY Call — an expose fun's
-own body is reached via `eval_method` → `call_fun`, which ALWAYS
-increments `call_depth` by one BEFORE the fun's own body runs (unlike
-a handler's own body, reached directly via `run_handler` with no
-`call_depth` involvement at all) — so the gate never matched, and every
-Call-triggered blocking call fell back to inline execution, completely
-silently (correct VALUE, just never actually suspended). A plain
-correctness test alone did not catch this (inline execution produces
-the same right answer); what caught it was revert-and-verify on the
-UNRELATED-looking "send the reply once resumed" code, which should be
-a no-op if suspend never fires but instead caused a genuine hang,
-proving execution really did (once fixed) go through suspend+resume.
-Fixed by replacing the hardcoded `0` with `Interp.suspend_depth_floor`,
-a per-dispatch value: `call_depth` itself for `Deliver` (unchanged
-behavior), `call_depth + 1` for `Call` (anticipating `call_fun`'s own
-known, exactly-one increment). A THIRD, STILL-inline-only case, found
-live (PR-cv2-12/13): a blocking call nested inside a called PRIVATE
-`fun` (not directly a top-level statement of the handler/expose fun's
-own body) still executes inline rather than suspending —
-`SuspendedHandler` can only represent a single stack frame's
-continuation, so the runtime gates the suspend attempt on
-`self.call_depth == self.suspend_depth_floor` and falls back to inline
-execution for anything deeper, rather than silently losing the outer
-execution's remaining statements (see §7's own item on this for the
-full story). Written
-under the
-Concurrency V2 initiative's own standing maximum-risk
-mandate, as the authorized, SAFE alternative to full stack-switching
-(see `CONCURRENCY_V2.md` §5's own PR-cv2-7 entry for why hand-rolled
-stack-switching was investigated and deliberately not rushed — three
-specific, unresolved memory-safety hazards). This document exists
-because §5 itself says this item "should get its OWN dedicated design
-document when/if it's actually pursued" — this is that document.
+**Status (Concurrency-v3, current): FULLY IMPLEMENTED, including
+arbitrary nesting depth.** §4/§6's own RESTRICTION (K0295) shipped in
+PR-cv2-9; the actual §5 scheduling logic (suspend/resume) shipped in
+PR-cv2-10; PR-cv2-11 through PR-cv2-15 closed every remaining gap for
+the ORIGINAL single-frame design (REPL interaction, `CapNet`/`CapFs`
+portability, `Call`-triggered suspend). The one gap that design could
+NOT close without either full stack-switching (real `unsafe`
+coroutines) or a full CPS transform was a blocking call nested inside
+a called private `fun` — PR-cv2-10 through PR-cv2-13's own
+`SuspendedHandler` could only represent ONE call frame's worth of
+continuation, so a nested call fell back to inline (blocking)
+execution, safe but not actually non-blocking for that shape.
+**Concurrency-v3 closes this too**, entirely in SAFE Rust: `Flow::
+Suspend` now carries a `SuspendChain` — a `Vec<ContinuationFrame>`,
+one frame per call-frame level the suspend passes through on its way
+out of the call stack (innermost first). `exec_stmts_checked`
+intercepts `Err(Flow::Suspend(chain))` at EVERY statement (not just a
+special pre-check for a direct blocking-builtin call) and pushes its
+own frame before re-propagating; `eval_call`'s own dispatch for the 4
+blocking builtins is where a chain first gets CREATED (via `Interp::
+try_suspend`), with zero frames of its own — the immediately enclosing
+`exec_stmts_checked` supplies the first one. This is possible ONLY
+because `check.rs` now ALSO enforces (K0296) that a call to a
+"suspend-capable" fun (one that directly or transitively performs a
+blocking builtin call as its own top-level statement — computed via a
+fixed-point reachability analysis, `Checker::suspend_capable_funs`)
+must ITSELF be the entire top-level `let` rhs of whatever calls it,
+recursively, all the way up. That restriction is what guarantees every
+frame the runtime needs to capture has the SAME simple "remaining
+statements + bind name + env" shape `ContinuationFrame` already
+represents — no general CPS transform needed, because the checker
+narrows the reachable shapes down to exactly what the chain mechanism
+can already handle. `IoComplete`'s own resume logic processes the
+chain frame by frame: each frame's own final value feeds the next
+frame's own bind name, until the chain is exhausted (the LAST frame's
+own final value is the overall completion value — discarded for
+`Deliver`, sent as the `Call` reply otherwise) or something stops it
+early (panic, another error, or a fresh re-suspend, which correctly
+carries the REMAINING unprocessed outer frames forward). Verified
+DECISIVELY, not just for correctness: a nested-private-fun blocking
+call now demonstrably frees its shared `ActorPool` worker exactly like
+the flat case does (see §8's own test list), and a 3-level transitive
+chain propagates its value correctly end to end.
+
+Written under the Concurrency V2/V3 initiative's own standing
+maximum-risk mandate. Full hand-rolled stack-switching (real `unsafe`
+coroutines) remains a SEPARATE, larger, riskier undertaking that this
+document deliberately does NOT need — Concurrency-v3 achieves
+arbitrary-nesting-depth suspend/resume with ZERO `unsafe` code, at the
+cost of requiring the checker's own K0295/K0296 restriction (a call
+chain must be built from top-level `let`s all the way up) rather than
+supporting suspension at a truly arbitrary point in an arbitrary
+expression the way real coroutines would. See `CONCURRENCY_V2.md` §5's
+own PR-cv2-7 entry for the three specific, still-unresolved memory-
+safety hazards that made full stack-switching a considered non-choice
+even under a standing maximum-risk mandate — Concurrency-v3 is the
+safe alternative that entry itself suggested investigating ("should
+seriously consider the CPS-transform alternative... now that the
+blocking-builtin surface is precisely counted").
 
 ## 1. The actual problem, precisely stated
 
@@ -302,29 +297,27 @@ struct SuspendedHandler {
 
 - Does the top-level-only restriction apply to a `concurrent
   component`'s plain (non-`expose`) private `fun`s too? RESOLVED
-  (PR-cv2-12) — K0295's checker restriction (PR-cv2-9) covers `c.funs`
-  per its own implementation, so this shape passes the checker either
-  way. An EARLIER version of this doc claimed the runtime ALSO
-  suspends correctly for this shape, reasoning that `Interp.
-  allow_suspend` stays set across a nested `call_fun` — that claim was
-  WRONG, caught by writing the actual test rather than trusting the
-  reasoning. `SuspendedHandler` captures only ONE stack frame's own
-  continuation (the current block's remaining statements + bind name +
-  env); when the blocking call is nested inside a called private
-  `fun`, a flat single-frame suspend would resume ONLY that fun's own
-  remaining statements — its return value never reaching back to the
-  handler's own `let x = helper(...)` binding, and the handler's own
-  remaining statements silently NEVER RUNNING. Confirmed live: empty
-  output, exit 0, no crash, no diagnostic. Fixed in `exec_stmts_checked`
-  by gating the suspend attempt on `self.call_depth == 0` (directly in
-  the handler's own top-level body, the one shape `SuspendedHandler`
-  can actually represent) — a call nested inside a private `fun` now
-  falls through to ordinary INLINE (blocking) execution instead,
-  joining `http_get_with`/`read_file_with` as a third, now-documented
-  v1 shape that satisfies K0295 syntactically but does not genuinely
-  suspend at runtime. Covered by a dedicated live test
-  (`main.rs::concurrent_component_http_get_inside_a_private_helper_
-  fun_runs_inline_and_produces_the_right_value`).
+  (PR-cv2-12, then FULLY closed by Concurrency-v3) — K0295's checker
+  restriction (PR-cv2-9) covers `c.funs` per its own implementation, so
+  this shape passes the checker either way. An EARLIER version of this
+  doc claimed the runtime ALSO suspends correctly for this shape,
+  reasoning that `Interp.allow_suspend` stays set across a nested
+  `call_fun` — that claim was WRONG, caught by writing the actual test
+  rather than trusting the reasoning: `SuspendedHandler` (the
+  Concurrency-v2 design) captured only ONE stack frame's own
+  continuation, so a nested call's own outer continuation was silently
+  lost. PR-cv2-13 fixed the SILENT DATA LOSS by gating the suspend
+  attempt to `call_depth == 0` (falling back to INLINE execution for a
+  nested call instead — safe, but not actually non-blocking for that
+  shape). **Concurrency-v3 removes that limitation entirely**: `check.
+  rs` now enforces (K0296) that a call to a fun which itself performs a
+  blocking call must ALSO be a top-level `let`, recursively, and the
+  runtime's `SuspendChain` captures one `ContinuationFrame` per level —
+  a nested (or transitively multi-level) call now genuinely suspends,
+  verified decisively (a nested-fun blocking call frees its shared
+  worker exactly like the flat case) via `main.rs::concurrent_
+  component_suspended_http_get_nested_in_a_private_fun_does_not_block_
+  sibling_actors` and a 3-level-chain correctness test alongside it.
 - Cross-engine consistency: RE-CONFIRMED LIVE at implementation time —
   `concurrent component` remains interp.rs-only; PR-cv2-10 touches only
   `interp.rs` (plus this doc and `main.rs` tests), no `vm.rs`/
@@ -398,9 +391,13 @@ struct SuspendedHandler {
   `docs/design/CAPABILITIES.md` or the `app` self-contained restriction
   — e.g. permitting K0304 to also allow a direct call in an app's own
   top-level body, or allowing apps to declare props after all.
-- PR-cv2-15 closed the `Call`-triggered suspend gap (see the status
-  header above for the full `call_depth`/`suspend_depth_floor` bug and
-  fix). One thing it did NOT attempt: a decisive non-blocking-ness test
+- PR-cv2-15 closed the `Call`-triggered suspend gap via a `call_depth`/
+  `suspend_depth_floor` mechanism — since SUPERSEDED and removed
+  entirely by Concurrency-v3's own chain-based redesign (see the status
+  header above), which no longer needs any depth-floor bookkeeping at
+  all (every call frame the suspend passes through contributes its own
+  `ContinuationFrame`, so there's no single "floor" to track). One
+  thing PR-cv2-15 did NOT attempt: a decisive non-blocking-ness test
   for the Call case, mirroring PR-cv2-10's own pigeonhole-collision test
   for Deliver. `expose` calls are synchronous from the CALLER's own
   perspective (`call_remote` blocks on `reply_rx.recv()` until the reply
