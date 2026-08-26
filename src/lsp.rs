@@ -2104,6 +2104,7 @@ fn expr_binds_name(expr: &crate::ast::Expr, name: &str) -> bool {
                 || arm.guard.as_ref().is_some_and(|g| expr_binds_name(g, name))
                 || block_binds_name(&arm.body, name)
         }),
+        ExprKind::CallWithTimeout { call, .. } => expr_binds_name(call, name),
     }
 }
 

@@ -2523,6 +2523,7 @@ impl Checker {
             }
             ExprKind::Try(inner) | ExprKind::Await(inner) => self.scan_expr_for_blocking_calls(inner, suspend_capable),
             ExprKind::Receive { arms } => self.scan_receive_arms(arms, suspend_capable),
+            ExprKind::CallWithTimeout { call, .. } => self.scan_expr_for_blocking_calls(call, suspend_capable),
         }
     }
 
@@ -4115,6 +4116,55 @@ impl Checker {
                     // requires at least one arm), but Unit is a safe fallback.
                     None => Ty::Unit,
                 }
+            }
+            ExprKind::CallWithTimeout { call, timeout_ms } => {
+                // Type-check the wrapped call normally FIRST (covers arity,
+                // argument types, unknown-method, everything `MethodCall`'s
+                // own arm already does) -- `timeout`'s own restrictions are
+                // ADDITIVE checks on top, not a replacement for them.
+                let result_ty = self.infer_expr(call, ctx);
+                // K0314: `timeout` only makes sense wrapping a call that can
+                // genuinely block across threads -- a `concurrent
+                // component`'s own exposed fun, reached via `Call`
+                // (`docs/design/ASYNC.md`'s own §8.4). An ordinary
+                // same-thread call can never legitimately time out (it runs
+                // to completion or panics on the SAME call stack), so
+                // allowing `timeout` there would be silently meaningless
+                // syntax rather than a real, useful restriction.
+                match &call.kind {
+                    ExprKind::MethodCall { recv, .. } => {
+                        let recv_ty = self.infer_expr(recv, ctx);
+                        let recv_ty = self.uni.apply(&recv_ty);
+                        let is_concurrent = matches!(&recv_ty, Ty::Component(cname) if self.checked.components.get(cname).is_some_and(|s| s.concurrent));
+                        if !is_concurrent {
+                            self.err(
+                                "K0313",
+                                format!(
+                                    "`timeout` may only follow a call to a `concurrent component`'s own exposed fun -- `{recv_ty}` is not a `concurrent` component, so this call can never actually block long enough to time out"
+                                ),
+                                expr.span,
+                            );
+                        }
+                    }
+                    // Not even a method call syntactically -- unreachable
+                    // through ordinary parsing (`parser.rs` only ever
+                    // constructs `CallWithTimeout` wrapping a freshly-parsed
+                    // `MethodCall`), but a clean diagnostic beats a silent
+                    // pass-through if that invariant is ever violated later.
+                    _ => self.err(
+                        "K0314",
+                        "`timeout` may only follow a method call on a `concurrent component`".to_string(),
+                        expr.span,
+                    ),
+                }
+                if *timeout_ms <= 0 {
+                    self.err(
+                        "K0314",
+                        format!("`timeout {timeout_ms}ms` — duration must be positive (a zero/negative timeout would never let the call complete)"),
+                        expr.span,
+                    );
+                }
+                result_ty
             }
         }
     }
@@ -6518,6 +6568,41 @@ mod generic_tests {
                     app Main {\n    intent \"m\"\n}\n";
         let errs = errors(src);
         assert!(errs.iter().any(|d| d.code == "K0312"), "`receive` outside a concurrent component must be K0312: {errs:?}");
+    }
+
+    /// Call timeout (`docs/design/ASYNC.md` §9.3): a well-formed
+    /// `<call> timeout <duration>` on a `concurrent component`'s own
+    /// exposed fun must check completely clean.
+    #[test]
+    fn well_formed_call_timeout_checks_clean() {
+        let src = "concurrent component C {\n    intent \"c\"\n    \
+                    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n    let c = C()\n    \
+                    on start { let r = c.f() timeout 2s\n        print(\"{r}\") }\n}\n";
+        let errs = errors(src);
+        assert!(errs.is_empty(), "a well-formed call timeout must check clean: {errs:?}");
+    }
+
+    /// K0313: `timeout` may only wrap a call whose receiver is a
+    /// `concurrent` component -- an ordinary same-thread call can never
+    /// legitimately time out.
+    #[test]
+    fn timeout_on_a_non_concurrent_call_is_k0313() {
+        let src = "component P {\n    intent \"p\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n    let p = P()\n    \
+                    on start { let r = p.f() timeout 2s\n        print(\"{r}\") }\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K0313"), "`timeout` on a non-concurrent call must be K0313: {errs:?}");
+    }
+
+    /// K0314: a zero/negative `timeout` duration is rejected.
+    #[test]
+    fn zero_timeout_duration_is_k0314() {
+        let src = "concurrent component C {\n    intent \"c\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n    let c = C()\n    \
+                    on start { let r = c.f() timeout 0s\n        print(\"{r}\") }\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K0314"), "a zero-duration timeout must be K0314: {errs:?}");
     }
 
     /// Production-hardening 1214: a REAL, live-confirmed bug found+fixed --

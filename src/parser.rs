@@ -1909,6 +1909,17 @@ impl Parser {
                         let end = self.expect(Tok::RParen)?;
                         let span = expr.span.merge(end);
                         expr = Expr { kind: ExprKind::MethodCall { recv: Box::new(expr), name, args }, span };
+                        // `timeout <duration>` -- a soft keyword (like `at`/
+                        // `receive`), only special immediately after a
+                        // method call's own closing `)`, so an ordinary
+                        // variable literally named `timeout` elsewhere is
+                        // never affected by this.
+                        if matches!(self.peek(), Tok::Ident(s) if s == "timeout") {
+                            self.bump();
+                            let ms = self.parse_duration()?;
+                            let tspan = expr.span.merge(self.prev_span());
+                            expr = Expr { kind: ExprKind::CallWithTimeout { call: Box::new(expr), timeout_ms: ms }, span: tspan };
+                        }
                     } else {
                         let span = expr.span.merge(nspan);
                         expr = Expr { kind: ExprKind::Field { recv: Box::new(expr), name }, span };

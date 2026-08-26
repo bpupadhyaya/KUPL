@@ -3740,6 +3740,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Call timeout (`docs/design/ASYNC.md` §9.3): `<call> timeout
+    /// <duration>` genuinely bounds how long the caller waits -- a call
+    /// that completes well within budget (`fast()`) succeeds normally,
+    /// and a call that would otherwise block FOREVER (`slow_forever()`
+    /// waits on a `receive` for a port nothing ever sends to) times out
+    /// cleanly instead of hanging the test. Also confirms VM/native
+    /// compile `timeout` straight through as a no-op (§9.3's own engine-
+    /// coverage claim) rather than rejecting it like `receive` (K0809)
+    /// has to.
+    #[test]
+    fn concurrent_component_call_timeout_bounds_a_call_that_would_otherwise_hang_forever() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-call-timeout-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("call_timeout.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Slow {\n    intent \"never replies to slow_forever\"\n    \
+                 expose fun fast() -> Str { \"fast-ok\" }\n    \
+                 in nothing_ever_arrives: Str\n    \
+                 expose fun slow_forever() -> Str {\n        \
+                 let r = receive {\n            nothing_ever_arrives(v) => { v }\n        }\n        r\n    }\n}\n\
+             app Main {\n    intent \"call timeout smoke test\"\n    \
+                 let s = Slow()\n    on start {\n        \
+                 print(s.fast() timeout 2s)\n        print(s.slow_forever() timeout 300ms)\n    }\n}\n",
+        )
+        .unwrap();
+
+        let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+        assert_ne!(out.status.code(), Some(0), "the timed-out call must be a clean panic, not success: {out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "fast-ok\n", "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("timed out after 300ms"),
+            "the panic must name the actual timeout, not a generic error: {out:?}"
+        );
+
+        // VM and native: `timeout` compiles straight through to the
+        // wrapped call, unchanged -- since `concurrent` components run
+        // sequentially there (no real actor threads), the call can never
+        // actually block, so it always completes normally regardless of
+        // the timeout value (no K0809-style rejection needed).
+        let vm_src = "concurrent component C {\n    intent \"c\"\n    expose fun f() -> Int { 1 }\n}\n\
+                      app Main {\n    intent \"m\"\n    let c = C()\n    on start { print(\"{c.f() timeout 1s}\") }\n}\n";
+        let vm_file = dir.join("call_timeout_vm.kupl");
+        std::fs::write(&vm_file, vm_src).unwrap();
+        let vm_out =
+            std::process::Command::new(&bin).args(["run", "--vm", vm_file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(vm_out.status.code(), Some(0), "{vm_out:?}");
+        assert_eq!(String::from_utf8_lossy(&vm_out.stdout), "1\n", "{vm_out:?}");
+        let native_bin = dir.join("call_timeout_native");
+        let build = std::process::Command::new(&bin)
+            .args(["native", vm_file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(build.status.code(), Some(0), "{build:?}");
+        let native_out = std::process::Command::new(&native_bin).output().unwrap();
+        assert_eq!(native_out.status.code(), Some(0), "{native_out:?}");
+        assert_eq!(String::from_utf8_lossy(&native_out.stdout), "1\n", "{native_out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Concurrency-v2 PR-cv2-3 (`docs/design/CONCURRENCY_V2.md` §4.3): a
     /// fixed `ActorPool` now multiplexes MANY top-level `concurrent
     /// component` actors onto a small pool of worker threads instead of

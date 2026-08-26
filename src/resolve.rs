@@ -773,6 +773,7 @@ impl Rewriter<'_> {
                     self.pop();
                 }
             }
+            ExprKind::CallWithTimeout { call, .. } => self.expr(call),
             ExprKind::Int(_)
             | ExprKind::Float(_)
             | ExprKind::Bool(_)

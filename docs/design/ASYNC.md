@@ -807,3 +807,39 @@ cross-thread signaling protocol between the sending and receiving
 actors' own worker threads — a substantially larger change, deliberately
 left for a future increment once (or if) a real KUPL program demonstrates
 the fail-fast behavior here isn't sufficient.
+
+### 9.3 Call timeout (DONE, interp-only) — timeout, not cancellation
+
+`<call> timeout <duration>` (e.g. `worker.compute(x) timeout 2s`) bounds
+how long the CALLER waits for a `Call` to a `concurrent component`'s own
+exposed fun before giving up with a clean panic, instead of blocking
+forever. `<call>` must be a method call whose receiver's static type is
+a `concurrent` component (K0313 — a timeout on an ordinary same-thread
+call is meaningless, since such a call always completes on the same call
+stack and can never legitimately time out). `<duration>` is a plain
+literal (`parser.rs`'s own `parse_duration`, the same grammar `on every`/
+`on after` already use), not a general expression — a deliberately
+narrower v1 than a fully dynamic timeout value. Zero/negative durations
+are rejected (K0314).
+
+**This is a TIMEOUT, not CANCELLATION.** The callee actor is never told
+to stop and has no interrupt/preemption mechanism — nothing in this
+codebase (or in safe Rust generally) can forcibly halt another OS
+thread's in-flight computation. On timeout, the actor keeps running to
+whatever completion it would have reached anyway; its eventual reply (if
+any) lands on a reply channel the caller has already stopped listening
+to — a silently dropped `Sender::send` with no live receiver, which is
+safe (no panic, no hang), just wasted work. True cancellation would
+require every execution engine to support interrupting an in-flight
+actor computation, a materially larger undertaking left for a future
+increment, matching this section's own "ship the honestly-scoped slice,
+document the rest" pattern.
+
+Engine coverage: unlike `receive` (K0809, genuinely impossible on VM/
+native — no mailbox exists there), `timeout` compiles straight through
+to the wrapped call itself on the VM/native engines (`compile.rs`),
+UNCHANGED — those engines run every `concurrent` component sequentially
+(§8.8), so a call there always completes on the same call stack and can
+never actually block long enough to time out. The wrapper is therefore
+byte-identically a no-op on those two engines, not a rejected construct
+— `timeout` does not reduce engine coverage at all.

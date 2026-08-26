@@ -838,6 +838,9 @@ fn expr_str_prec(e: &Expr) -> (String, u8) {
             s.push_str(" }");
             (s, ATOM)
         }
+        ExprKind::CallWithTimeout { call, timeout_ms } => {
+            (format!("{} timeout {}", expr_str(call, P_UNARY + 1), fmt_duration(*timeout_ms)), ATOM)
+        }
     }
 }
 
@@ -1105,6 +1108,34 @@ mod tests {
         assert!(formatted.contains("receive {"), "the `receive` expression itself must survive formatting: {formatted:?}");
         assert!(formatted.contains("go(true) if v => "), "the first arm's own port/pattern/guard must survive formatting: {formatted:?}");
         assert!(formatted.contains("nack(msg) => "), "the second arm's own port/pattern must survive formatting: {formatted:?}");
+    }
+
+    /// Call timeout (`docs/design/ASYNC.md` §9.3): `<call> timeout
+    /// <duration>` must round-trip losslessly -- checked via BOTH
+    /// idempotence AND an explicit "the formatted output still contains
+    /// the timeout clause" assertion.
+    #[test]
+    fn fmt_preserves_call_timeout_clause() {
+        let src = "concurrent component C {\n    intent \"c\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n    let c = C()\n    \
+                    on start { let r = c.f() timeout 2s\n        print(\"{r}\") }\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(
+            formatted.contains("c.f() timeout 2s"),
+            "the `timeout` clause must survive formatting, not be silently dropped: {formatted:?}"
+        );
+        // An ordinary call with no `timeout` clause must be unaffected.
+        let no_timeout = "concurrent component C {\n    intent \"c\"\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n    let c = C()\n    \
+                           on start { let r = c.f()\n        print(\"{r}\") }\n}\n";
+        roundtrip(no_timeout);
+        let (p2, d2) = parser::parse(no_timeout);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains("timeout"), "an ordinary call with no timeout clause must not gain one: {formatted2:?}");
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-

@@ -469,6 +469,26 @@ pub enum ExprKind {
     /// must appear directly in the handler/exposed-fun's own body, not
     /// several call frames deep.
     Receive { arms: Vec<ReceiveArm> },
+    /// `<method-call> timeout <duration>` (e.g. `p.wait_for_go() timeout
+    /// 2s`) — bounds how long a `Call` to a `concurrent component`'s own
+    /// exposed fun may block before giving up with a clean panic instead
+    /// of waiting forever, see `docs/design/ASYNC.md`'s own "Call
+    /// timeout" section. `call` is always a `MethodCall` (checker-
+    /// enforced, K0313, mirroring `receive`'s own shape-restriction
+    /// style) whose receiver's static type must be a `concurrent`
+    /// component — a timeout on an ordinary (non-blocking, same-thread)
+    /// call is meaningless. `timeout_ms` is a plain literal duration
+    /// (`parser.rs`'s own `parse_duration`, the SAME parse `on every`/
+    /// `on after` already use), not a general expression — consistent
+    /// with those, and avoids needing a whole new "is this expression a
+    /// valid duration" checker rule for a first slice. On the VM/native
+    /// engines (`compile.rs`), this compiles straight through to the
+    /// wrapped call itself, unchanged — those engines run every
+    /// `concurrent` component sequentially (§8.8), so a call there can
+    /// never actually block long enough to time out; the wrapper is
+    /// therefore byte-identically a no-op, not a rejected construct like
+    /// `receive` (K0809) needed to be.
+    CallWithTimeout { call: Box<Expr>, timeout_ms: i64 },
 }
 
 /// One arm of a `receive { .. }` expression — see `ExprKind::Receive`'s own

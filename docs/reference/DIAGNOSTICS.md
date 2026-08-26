@@ -164,9 +164,11 @@ Severity: **E** = error, **W** = warning.
 | K0307 | E | a `concurrent` component cannot have `example` blocks — see `docs/design/ASYNC.md` §8.7 |
 | K0308 | E | a `concurrent` component instance is referenced by a `law`/`forall` — either fulfilling a contract that declares `law`s, or bound in scope when a top-level `forall` runs; `kupl test`'s law-running machinery does not support a concurrent instance yet |
 | K0309 | E | a child's `at <placement>` clause (distributed component placement, `docs/design/DISTRIBUTION.md`) — the syntax parses but no KUPL runtime supports it yet |
-| K0310 | E | `receive { .. }` (selective mailbox receive, `docs/design/ASYNC.md`) appears somewhere other than the entire top-level `let` rhs, or a bare top-level statement, of a `concurrent component`'s own `on <port>` handler or exposed-fun body |
+| K0310 | E | `receive { .. }` (selective mailbox receive, `docs/design/ASYNC.md`) appears somewhere other than the entire top-level `let` rhs of a `concurrent component`'s own `on <port>` handler or exposed-fun body |
 | K0311 | E | a port is named by both a `receive` arm and a top-level `on <port>` handler on the same component — pick one consumer |
 | K0312 | E | `receive { .. }` used outside a `concurrent component`'s own handler/exposed-fun body |
+| K0313 | E | `<call> timeout <duration>` (`docs/design/ASYNC.md`) wraps a call whose receiver is not a `concurrent` component — the call can never actually block long enough to time out |
+| K0314 | E | `timeout <duration>` — duration must be positive |
 
 ## K04xx — Loader (multi-file)
 

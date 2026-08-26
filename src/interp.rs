@@ -4057,6 +4057,30 @@ impl Interp {
                 Ok(Value::List(Rc::new(results)))
             }
             ExprKind::Receive { arms } => Err(self.try_suspend_receive(arms, expr.span)),
+            ExprKind::CallWithTimeout { call, timeout_ms } => {
+                let ExprKind::MethodCall { recv, name, args } = &call.kind else {
+                    return Err(Self::panic_flow(
+                        "internal error: `timeout` did not wrap a method call -- K0314 should have rejected this at check time".to_string(),
+                        expr.span,
+                    ));
+                };
+                let r = self.eval(recv, env)?;
+                let mut avs = Vec::with_capacity(args.len());
+                for a in args {
+                    avs.push(self.eval(&a.value, env)?);
+                }
+                if let Value::Component(id) = r {
+                    if matches!(&self.instances[id], InstanceSlot::Remote(_)) {
+                        return self.call_remote_with_timeout(id, name, avs, expr.span, *timeout_ms);
+                    }
+                }
+                // Not a Remote instance -- K0314 should already have
+                // rejected this at check time (a `timeout` may only wrap a
+                // call on a `concurrent` component's own receiver type),
+                // so this is defensive, not a reachable program state:
+                // fall through to the ordinary call rather than crash.
+                self.eval_method(r, name, avs, expr.span)
+            }
         }
     }
 
@@ -4713,6 +4737,39 @@ impl Interp {
     /// this succeeds for a `concurrent` component's exposed-fun params and
     /// return type.
     fn call_remote(&mut self, id: usize, name: &str, args: Vec<Value>, span: Span) -> EvalResult {
+        self.call_remote_impl(id, name, args, span, None)
+    }
+
+    /// `<call> timeout <duration>` (`ExprKind::CallWithTimeout`, `docs/
+    /// design/ASYNC.md`'s own "Call timeout" section) -- the SAME
+    /// dispatch as `call_remote`, just bounding how long the CALLER
+    /// waits for a reply. This is a TIMEOUT, not true cancellation: the
+    /// callee actor is never told to stop, has no interrupt/preemption
+    /// mechanism (Rust has none built in, and nothing in this codebase
+    /// adds one) -- it keeps running to whatever completion it would
+    /// have reached anyway, and its eventual reply lands on a channel
+    /// this caller has already stopped listening to (a silently dropped
+    /// `Sender::send` on a channel with no live receiver, exactly the
+    /// SAME safe "no hang, no panic" shape already proven by the bounded-
+    /// mailbox `an_overflowing_call_does_not_hang_its_own_caller` test).
+    fn call_remote_with_timeout(&mut self, id: usize, name: &str, args: Vec<Value>, span: Span, timeout_ms: i64) -> EvalResult {
+        self.call_remote_impl(id, name, args, span, Some(std::time::Duration::from_millis(timeout_ms.max(0) as u64)))
+    }
+
+    /// Shared implementation for `call_remote`/`call_remote_with_timeout`
+    /// -- `timeout: None` is byte-for-byte the ORIGINAL, pre-timeout
+    /// behavior (an unbounded `reply_rx.recv()`); `Some(d)` additionally
+    /// distinguishes "the wait itself expired" from "the channel closed
+    /// (actor gone)" so the panic message names the ACTUAL cause instead
+    /// of collapsing both into the pre-existing generic wording.
+    fn call_remote_impl(
+        &mut self,
+        id: usize,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+        timeout: Option<std::time::Duration>,
+    ) -> EvalResult {
         // Deadlock-cycle check (§8.4) -- see `pending_remote_calls`'s own
         // doc comment for why this is a defensive safety net, not
         // currently reachable given today's other restrictions.
@@ -4753,11 +4810,33 @@ impl Interp {
             ActorRoute::Pooled { worker_tx, local_id, .. } => worker_tx.send(WorkerCmd::Msg(*local_id, call_msg)).is_ok(),
         };
         self.pending_remote_calls.insert(id);
-        let reply = if sent { reply_rx.recv().ok() } else { None };
+        let mut timed_out = false;
+        let reply = if !sent {
+            None
+        } else {
+            match timeout {
+                Some(d) => match reply_rx.recv_timeout(d) {
+                    Ok(v) => Some(v),
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        timed_out = true;
+                        None
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => None,
+                },
+                None => reply_rx.recv().ok(),
+            }
+        };
         self.pending_remote_calls.remove(&id);
         match reply {
             Some(Ok(pv)) => Ok(crate::parallel::from_portable(&pv)),
             Some(Err((msg, panic_span))) => Err(Self::panic_flow(msg, panic_span)),
+            None if timed_out => Err(Self::panic_flow(
+                format!(
+                    "concurrent instance {id}'s call to `{name}` timed out after {}ms -- the actor is still running (this is a TIMEOUT, not cancellation) and its eventual reply, if any, is discarded",
+                    timeout.expect("timed_out is only ever set when timeout is Some").as_millis()
+                ),
+                span,
+            )),
             None => Err(Self::panic_flow(
                 format!("concurrent instance {id} did not respond to `{name}` (its actor thread already shut down or panicked)"),
                 span,

@@ -1808,6 +1808,15 @@ impl<'s> FnCompiler<'s> {
                 );
                 self.const_reg(Value::Unit, span)
             }
+            // `timeout` bounds how long a `Call` may block waiting for a
+            // reply -- meaningless on VM/native, where `concurrent`
+            // components run sequentially (§8.8) and a call always
+            // completes on the SAME call stack, never blocking long enough
+            // to time out. Compiles straight through to the wrapped call
+            // itself, unchanged -- a genuine no-op here, not a rejected
+            // construct like `receive` (K0809) needed to be, so this
+            // doesn't reduce engine coverage at all.
+            ExprKind::CallWithTimeout { call, .. } => self.expr(call),
         }
     }
 
