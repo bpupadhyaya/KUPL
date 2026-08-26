@@ -3570,13 +3570,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// `docs/design/ASYNC.md` §8.10 step 4: a `concurrent` component may be
-    /// a wire's DESTINATION (verified above) but not yet its SOURCE --
-    /// checked as a clean, specific K0900 panic rather than the confusing
-    /// internal `unwrap_local_mut()` panic this would have hit before the
-    /// explicit check `Interp::instantiate_local` now performs.
+    /// `docs/design/ASYNC.md` §9.4: a `concurrent` component may be a
+    /// wire's SOURCE now (verified in the actor-to-actor test below), but
+    /// ONLY when the destination is ALSO a pooled `concurrent` component
+    /// -- a plain (non-concurrent) destination is still rejected, as a
+    /// clean, specific K0900 panic rather than the confusing internal
+    /// `unwrap_local_mut()` panic this would have hit before the explicit
+    /// check `Interp::instantiate_local` performs.
     #[test]
-    fn concurrent_component_as_a_wire_source_is_a_clean_panic_not_an_ice() {
+    fn concurrent_component_as_a_wire_source_to_a_non_concurrent_destination_is_a_clean_panic_not_an_ice() {
         let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
         if !bin.exists() {
             return;
@@ -3600,10 +3602,53 @@ mod tests {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("K0900"), "{stderr}");
         assert!(
-            stderr.contains("cannot be a wire's SOURCE yet"),
+            stderr.contains("may only be a wire's SOURCE when the destination is ALSO a pooled `concurrent` component"),
             "must be the specific, clean diagnostic, not an internal-compiler-error: {stderr}"
         );
         assert!(!stderr.contains("internal compiler error"), "{stderr}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Actor-to-actor channels (`docs/design/ASYNC.md` §9.4): a `wire`
+    /// declared from one `concurrent` actor's own `out` port DIRECTLY to
+    /// another `concurrent` actor's own `in` port -- no coordinator
+    /// round-trip, no plain (non-concurrent) intermediary. `Pinger.fire()`
+    /// emits, then `Ponger.current()` (a SEPARATE, later `Call` to the
+    /// SAME actor) observes the delivered value -- correct ordering here
+    /// is not a given: it relies on BOTH the `Deliver` (sent synchronously
+    /// inside `fire()`, before it returns) and the later `current()` call
+    /// landing on Ponger's own SINGLE per-actor worker channel in that
+    /// same relative order, which this test's own pass proves holds.
+    #[test]
+    fn concurrent_actor_to_concurrent_actor_direct_wire_delivers_without_a_coordinator_round_trip() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-actor-to-actor-wire-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("actor_to_actor.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component Pinger {\n    intent \"emits to another actor when called\"\n    \
+                 out sig: Int\n    expose fun fire() -> Str {\n        emit sig(42)\n        \"fired\"\n    }\n}\n\
+             concurrent component Ponger {\n    intent \"receives directly from another actor\"\n    \
+                 in num: Int\n    state got: Int = 0\n    on num(n) { got = n }\n    expose fun current() -> Int { got }\n}\n\
+             component Caller {\n    intent \"drives the flow, after both actors already exist\"\n    \
+                 prop p: Pinger\n    prop q: Ponger\n    \
+                 expose fun run() -> Int {\n        let r = p.fire()\n        q.current()\n    }\n}\n\
+             app Main {\n    intent \"actor-to-actor channel smoke test\"\n    \
+                 let p = Pinger()\n    let q = Ponger()\n    wire p.sig -> q.num\n    \
+                 let caller = Caller(p: p, q: q)\n    on start { print(caller.run()) }\n}\n",
+        )
+        .unwrap();
+
+        for _ in 0..15 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "42\n", "{out:?}");
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

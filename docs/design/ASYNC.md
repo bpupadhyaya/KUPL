@@ -843,3 +843,53 @@ UNCHANGED — those engines run every `concurrent` component sequentially
 never actually block long enough to time out. The wrapper is therefore
 byte-identically a no-op on those two engines, not a rejected construct
 — `timeout` does not reduce engine coverage at all.
+
+### 9.4 Actor-to-actor direct channels (DONE, interp-only, pooled-to-pooled)
+
+§8.3's own "later iteration" caveat, now partially taken: `wire a.out ->
+b.in` where BOTH `a` and `b` are `concurrent` (pooled) actors now
+delivers DIRECTLY, actor-to-actor, with no coordinator round-trip — not
+the full N-to-N mesh §8.3 declined to build, but a real, wire-declared
+direct channel between two specific actors, genuinely closing "no
+explicit actor-to-actor channels" for the common case.
+
+Mechanism: when the PARENT component's own `instantiate_local` processes
+a wire whose source is a pooled `concurrent` actor and whose destination
+is ALSO a pooled `concurrent` actor, it sends the source actor a
+`WorkerCmd::RegisterRemoteWire` carrying a `RemoteWireTarget` — a
+cross-thread-sendable clone of the destination's own `worker_tx`/
+`local_id` (deliberately NOT the full `ActorRoute`, which also owns
+non-`Clone` teardown state like a `JoinHandle`). The source actor's own
+`Interp` gains a `remote_wires` table (parallel to, not replacing, the
+existing per-instance `Instance.wires` used for same-`Interp` targets);
+its own future `emit`s on that port send an `ActorMsg::Deliver` straight
+onto the destination's own worker channel.
+
+Two things remain unsupported, both a clean, specific panic rather than
+silent misbehavior: a `concurrent` source wired to a plain (non-
+concurrent) destination (the ORIGINAL "cross-Interp wire" problem, §6,
+still doesn't have a general solution), and either side using a
+dedicated (non-pooled) actor thread (the nested-spawn fallback path,
+`ActorRoute::Dedicated` — no `RemoteWireTarget` variant for it in v1).
+
+A genuinely NEW risk this introduces, closed proactively: a cross-actor
+wire cycle (`wire a.out -> b.in`, `wire b.out -> a.in`, both handlers
+re-emitting) bypasses `self.queue`/`drain()` entirely (each hop sends
+straight across an `mpsc::Sender` to a DIFFERENT actor's own worker
+thread), so `drain()`'s own existing `MAX_COMPONENT_MESSAGES` wire-cycle
+guard never sees it. A new `Interp::remote_emit_count`, capped at the
+SAME `MAX_COMPONENT_MESSAGES`, closes this the same way.
+
+A known, DETERMINISTIC (not racy) startup limitation, documented rather
+than fixed: a remote wire is not yet registered during the SOURCE
+actor's own `on start` handler or its first timer fires (`WorkerCmd::
+Spawn` runs the actor's ENTIRE startup sequence synchronously, before
+the worker loop can process any LATER command on the same channel,
+including `RegisterRemoteWire`) — an `emit` from `on start` on a port
+that will later be wired remotely is silently unwired at that moment.
+Only affects the actor's own startup; any LATER `emit` (from an exposed
+fun call, a later timer fire, or a `Deliver`-triggered handler) sees the
+wire correctly registered. Fixing this properly would mean threading
+wire info into `WorkerCmd::Spawn` itself, ahead of knowing the
+destination's own route at spawn time — left as a documented future
+increment rather than rushed into this slice.

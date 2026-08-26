@@ -442,6 +442,31 @@ enum WorkerCmd {
     /// class `eval_call`'s own `.map_err(|m| Self::panic_flow(m, span))`
     /// already turns into a panic for a non-suspended call.
     IoComplete { local_id: usize, result: Result<crate::parallel::PortableValue, String> },
+    /// Actor-to-actor channels (`docs/design/ASYNC.md` §8.3's own "later
+    /// iteration" caveat, now taken): registers a DIRECT, cross-thread
+    /// wire target on the receiving worker's own `local_id` actor,
+    /// installed by whichever `Interp` (coordinator or another pooled
+    /// worker) runs the PARENT component's `instantiate_local`, right
+    /// after BOTH the wire's source and destination actors already
+    /// exist. See `Interp::remote_wires`'s own doc comment for how this
+    /// is consumed.
+    RegisterRemoteWire { local_id: usize, port: String, target: RemoteWireTarget, dst_port: String },
+}
+
+/// A cross-thread-sendable "where to deliver a message" descriptor for
+/// actor-to-actor direct wires -- deliberately NOT the full `ActorRoute`
+/// (which also owns non-`Clone` teardown machinery like `JoinHandle`/
+/// `Receiver`, meaningful only to the OWNING actor's own lifecycle code)
+/// -- just the sendable-message half, safe to hand to a DIFFERENT
+/// actor's own worker thread. `Dedicated` targets are deliberately NOT
+/// supported in this v1 (nested-spawn actors are the uncommon fallback
+/// path, per `ActorRoute::Dedicated`'s own doc comment) -- a wire
+/// sourced from a `Dedicated` actor, or targeting one, still gets the
+/// existing "cannot be a wire's SOURCE" panic (worded to name this
+/// specific gap), not silently mishandled.
+#[derive(Clone)]
+enum RemoteWireTarget {
+    Pooled { worker_tx: std::sync::mpsc::Sender<WorkerCmd>, local_id: usize },
 }
 
 /// A pooled actor's own persistent state, owned exclusively by its
@@ -990,6 +1015,17 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                 } else {
                     stop_actor_now(&mut actors, local_id);
                     let _ = stopped_tx.send(());
+                }
+            }
+            WorkerCmd::RegisterRemoteWire { local_id, port, target, dst_port } => {
+                // Actor-to-actor channels: install a direct, cross-thread
+                // wire target on THIS actor's own `Interp` (see `Interp::
+                // remote_wires`'s own doc comment) -- best-effort, matching
+                // every other "actor already gone" path in this file (a
+                // wire to/from an actor that shut down before registration
+                // completed has no observable effect either way).
+                if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                    slot.interp.remote_wires.entry(port).or_default().push((target, dst_port));
                 }
             }
         }
@@ -1595,6 +1631,30 @@ pub struct Interp {
     /// real reply. `None` for a `Deliver`-triggered handler (no reply is
     /// ever expected for one) and for ordinary, non-suspending execution.
     pub pending_call_reply: Option<std::sync::mpsc::Sender<Result<crate::parallel::PortableValue, (String, Span)>>>,
+    /// Actor-to-actor channels: direct, cross-thread wire targets for
+    /// THIS actor's own root instance (id 0 -- the only instance a
+    /// PARENT's `wire` declaration could ever name as a Remote source,
+    /// since a nested child inside a concurrent actor's own tree isn't
+    /// independently addressable from outside it). Keyed by port name;
+    /// populated by `WorkerCmd::RegisterRemoteWire`, consulted by
+    /// `emit` alongside (not instead of) the existing per-instance
+    /// `Instance.wires` table used for same-`Interp` (Local) targets.
+    /// Always empty for a coordinator `Interp` or a dedicated-thread
+    /// actor -- only ever populated on a `PooledActor`'s own `Interp`.
+    remote_wires: HashMap<String, Vec<(RemoteWireTarget, String)>>,
+    /// Actor-to-actor channels: counts messages THIS actor has sent
+    /// across a remote wire, over its whole lifetime -- capped at
+    /// `MAX_COMPONENT_MESSAGES`, mirroring `drain()`'s own existing
+    /// same-`Interp` wire-cycle guard exactly. Needed because a
+    /// cross-actor `emit` bypasses `self.queue`/`drain()` entirely (it
+    /// sends directly over an `mpsc::Sender` to a DIFFERENT actor's own
+    /// worker thread), so `drain()`'s own counter never sees it -- an
+    /// actor-to-actor wire cycle (`wire a.out -> b.in`, `wire b.out ->
+    /// a.in`, both handlers re-emitting) would otherwise run forever
+    /// with no existing safety net catching it, a genuinely NEW hang
+    /// risk this feature introduces that the pre-existing LOCAL-only
+    /// cycle guard doesn't cover.
+    remote_emit_count: u64,
 }
 
 /// Maximum user-function call depth, shared by the interpreter and the KVM
@@ -1675,6 +1735,8 @@ impl Interp {
             pending_remote_calls: std::collections::HashSet::new(),
             allow_suspend: false,
             pending_call_reply: None,
+            remote_wires: HashMap::new(),
+            remote_emit_count: 0,
         }
     }
 
@@ -1711,6 +1773,8 @@ impl Interp {
             pending_remote_calls: std::collections::HashSet::new(),
             allow_suspend: false,
             pending_call_reply: None,
+            remote_wires: HashMap::new(),
+            remote_emit_count: 0,
         }
     }
 
@@ -1731,6 +1795,8 @@ impl Interp {
             pending_remote_calls: std::collections::HashSet::new(),
             allow_suspend: false,
             pending_call_reply: None,
+            remote_wires: HashMap::new(),
+            remote_emit_count: 0,
         }
     }
 
@@ -1962,24 +2028,59 @@ impl Interp {
             let (Some(&src), Some(&dst)) = (child_ids.get(from_child), child_ids.get(to_child)) else {
                 return Err(Self::panic_flow("wire references unknown child", wire.span));
             };
-            // `docs/design/ASYNC.md` §8.10 step 4: a wire's routing table
-            // lives on its SOURCE instance -- for a `Remote` source, that
-            // table lives on a DIFFERENT thread with its OWN, entirely
-            // separate id space (`dst` here is only meaningful in THIS
-            // `Interp`'s own space), which is exactly the "cross-Interp
-            // wire" question §6 found to be the hard, unresolved half of
-            // real concurrency. Rather than attempt it here, a `concurrent`
-            // instance as a wire SOURCE fails with a clean, specific
-            // diagnostic -- step 4 only wires up the OTHER direction
-            // (`Interp::send` below routes a message INTO a `Remote`
-            // instance's inbox when IT is the wire's destination).
+            // Actor-to-actor channels (`docs/design/ASYNC.md` §9.4,
+            // superseding §8.10 step 4's own original restriction): a
+            // wire's routing table normally lives on its SOURCE
+            // instance's own `Instance.wires` -- for a `Remote` source,
+            // that table instead lives on a DIFFERENT thread, so a
+            // cross-Interp instance id is meaningless there. When the
+            // DESTINATION is ALSO a pooled `concurrent` actor, this is
+            // solved directly: hand the source actor a cross-thread-
+            // sendable `RemoteWireTarget` (a clone of the destination's
+            // OWN `worker_tx`/`local_id`) via `WorkerCmd::
+            // RegisterRemoteWire`, so its own future `emit`s on this
+            // port route STRAIGHT to the destination's mailbox, with no
+            // coordinator round-trip at all. A plain (non-concurrent)
+            // destination, or either side using a dedicated (non-pooled)
+            // actor thread, remains unsupported -- the ORIGINAL "cross-
+            // Interp wire" problem (§6) genuinely doesn't have a clean
+            // solution for those shapes yet.
             if matches!(&self.instances[src], InstanceSlot::Remote(_)) {
-                return Err(Self::panic_flow(
-                    format!(
-                        "wire `{from_child}.{from_port} -> {to_child}.{to_port}`: a `concurrent` component cannot be a wire's SOURCE yet (only its destination) -- see docs/design/ASYNC.md §8.10 step 4"
-                    ),
-                    wire.span,
-                ));
+                let src_route = match &self.instances[src] {
+                    InstanceSlot::Remote(h) => match &h.route {
+                        ActorRoute::Pooled { worker_tx, local_id, .. } => Some((worker_tx.clone(), *local_id)),
+                        ActorRoute::Dedicated { .. } => None,
+                    },
+                    InstanceSlot::Local(_) => unreachable!("just confirmed Remote above"),
+                };
+                let dst_target = match &self.instances[dst] {
+                    InstanceSlot::Remote(h) => match &h.route {
+                        ActorRoute::Pooled { worker_tx, local_id, .. } => {
+                            Some(RemoteWireTarget::Pooled { worker_tx: worker_tx.clone(), local_id: *local_id })
+                        }
+                        ActorRoute::Dedicated { .. } => None,
+                    },
+                    InstanceSlot::Local(_) => None,
+                };
+                match (src_route, dst_target) {
+                    (Some((src_worker_tx, src_local_id)), Some(target)) => {
+                        let _ = src_worker_tx.send(WorkerCmd::RegisterRemoteWire {
+                            local_id: src_local_id,
+                            port: from_port.clone(),
+                            target,
+                            dst_port: to_port.clone(),
+                        });
+                        continue;
+                    }
+                    _ => {
+                        return Err(Self::panic_flow(
+                            format!(
+                                "wire `{from_child}.{from_port} -> {to_child}.{to_port}`: a `concurrent` component may only be a wire's SOURCE when the destination is ALSO a pooled `concurrent` component (actor-to-actor direct wires) -- a plain (non-concurrent) destination, or either side using a dedicated (non-pooled) actor thread, is not yet supported -- see docs/design/ASYNC.md §9.4"
+                            ),
+                            wire.span,
+                        ));
+                    }
+                }
             }
             self.instances[src].unwrap_local_mut()
                 .wires
@@ -2852,7 +2953,13 @@ impl Interp {
         };
         self.instances[id].unwrap_local_mut().last_emit.insert(port.to_string(), value.clone());
         let targets = self.instances[id].unwrap_local_mut().wires.get(port).cloned().unwrap_or_default();
-        if targets.is_empty() {
+        // Actor-to-actor channels (`docs/design/ASYNC.md` §9.4): only this
+        // actor's own ROOT instance (id 0) can ever have a remote wire
+        // registered on it -- a PARENT only ever wires ITS OWN children's
+        // ports, which corresponds to id 0 from inside the child's own
+        // separate `Interp` -- see `remote_wires`'s own doc comment.
+        let remote_targets = if id == 0 { self.remote_wires.get(port).cloned().unwrap_or_default() } else { Vec::new() };
+        if targets.is_empty() && remote_targets.is_empty() {
             if self.print_unwired {
                 let comp = self.instances[id].unwrap_local_mut().comp.name.clone();
                 println!("{comp}.{port} = {value}");
@@ -2872,6 +2979,34 @@ impl Interp {
                     self.send(dst, &dport, value.clone())?;
                 } else {
                     self.queue.push_back((dst, dport, value.clone()));
+                }
+            }
+            // Actor-to-actor channels: a DIRECT cross-thread send, bypassing
+            // both `self.queue`/`drain()` (this Interp's own local queue)
+            // AND the coordinator entirely -- straight onto the destination
+            // actor's own worker channel. `remote_emit_count` bounds this
+            // the SAME way `drain()` already bounds a same-`Interp` wire
+            // cycle -- a cross-actor cycle bypasses `queue`/`drain()`
+            // entirely, so `MAX_COMPONENT_MESSAGES` there would never see
+            // it without this separate counter.
+            for (target, dport) in remote_targets {
+                self.remote_emit_count += 1;
+                if self.remote_emit_count > MAX_COMPONENT_MESSAGES {
+                    return Err(Self::panic_flow(
+                        format!("actor-to-actor message limit exceeded ({MAX_COMPONENT_MESSAGES}) -- a cross-actor wire cycle?"),
+                        span,
+                    ));
+                }
+                let Some(pv) = crate::parallel::to_portable(&value) else {
+                    return Err(Self::panic_flow(
+                        format!("internal error: message on port `{port}` is not portable -- K0306 should have rejected this at check time"),
+                        span,
+                    ));
+                };
+                match target {
+                    RemoteWireTarget::Pooled { worker_tx, local_id } => {
+                        let _ = worker_tx.send(WorkerCmd::Msg(local_id, ActorMsg::Deliver(dport, pv)));
+                    }
                 }
             }
         }
