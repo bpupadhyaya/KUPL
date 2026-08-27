@@ -1212,6 +1212,54 @@ fn start_or_satisfy_suspend(actors: &mut [Option<PooledActor>], tx: &std::sync::
 /// left as a future increment; see `enqueue_pending`'s own doc comment.
 const MAILBOX_CAP: usize = 100_000;
 
+/// A short, BOUNDED grace period a `Dedicated` actor's SENDER waits for
+/// room in a full mailbox before giving up -- see `docs/design/ASYNC.md`
+/// §9.2's "why blocking isn't safe for Pooled actors" note for why this
+/// exists ONLY for `Dedicated` (one OS thread per actor, so waiting here
+/// can never stall an UNRELATED actor the way it would on a shared
+/// `Pooled` worker thread) and is still deliberately NOT unbounded back-
+/// pressure. `MAILBOX_CAP` (100,000) is a "genuine bug backstop" -- if a
+/// mailbox is genuinely at that size, the receiver is almost certainly
+/// stuck, not just briefly busy, so a LONG wait wouldn't help, only delay
+/// an inevitable clean failure. This value is just enough to smooth over
+/// a real but transient burst (receiver actively draining, momentarily
+/// behind) without changing the "clean, fast failure" character the
+/// `try_send`-only version already had.
+const DEDICATED_BACKPRESSURE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Send to a `Dedicated` actor's bounded inbox, retrying with a short
+/// exponential backoff for up to `DEDICATED_BACKPRESSURE_TIMEOUT` while
+/// the mailbox is full. `std::sync::mpsc::SyncSender` has no
+/// `send_timeout` (only `send`, unbounded blocking, and `try_send`,
+/// never waits at all) -- this hand-rolls the bounded middle ground.
+/// `Disconnected` returns immediately without waiting (the actor is
+/// gone; no amount of waiting helps); a `Full` error is returned only
+/// once the deadline has passed with the mailbox still full.
+fn try_send_with_backoff(
+    inbox: &std::sync::mpsc::SyncSender<ActorMsg>,
+    mut msg: ActorMsg,
+) -> Result<(), std::sync::mpsc::TrySendError<ActorMsg>> {
+    let deadline = std::time::Instant::now() + DEDICATED_BACKPRESSURE_TIMEOUT;
+    let mut backoff = std::time::Duration::from_micros(50);
+    loop {
+        match inbox.try_send(msg) {
+            Ok(()) => return Ok(()),
+            Err(std::sync::mpsc::TrySendError::Disconnected(m)) => {
+                return Err(std::sync::mpsc::TrySendError::Disconnected(m));
+            }
+            Err(std::sync::mpsc::TrySendError::Full(m)) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(std::sync::mpsc::TrySendError::Full(m));
+                }
+                msg = m;
+                std::thread::sleep(backoff.min(deadline - now));
+                backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 /// Bounded mailboxes: the ONE place any `ActorMsg` is ever pushed onto
 /// `PooledActor::pending` -- both call sites (`WorkerCmd::Msg`'s own
 /// suspended-queueing branches) now go through this instead of a bare
@@ -2817,7 +2865,7 @@ impl Interp {
             match &handle.route {
                 ActorRoute::Dedicated { inbox: Some(inbox), .. } => {
                     if let Err(std::sync::mpsc::TrySendError::Full(_)) =
-                        inbox.try_send(ActorMsg::Deliver(port.to_string(), pv))
+                        try_send_with_backoff(inbox, ActorMsg::Deliver(port.to_string(), pv))
                     {
                         return Err(Self::panic_flow(
                             format!(
@@ -4974,7 +5022,7 @@ impl Interp {
         let call_msg = ActorMsg::Call { fn_name: name.to_string(), args: portable_args, chain: vec![id], reply: reply_tx };
         let mut mailbox_full = false;
         let sent = match &handle.route {
-            ActorRoute::Dedicated { inbox: Some(inbox), .. } => match inbox.try_send(call_msg) {
+            ActorRoute::Dedicated { inbox: Some(inbox), .. } => match try_send_with_backoff(inbox, call_msg) {
                 Ok(()) => true,
                 Err(std::sync::mpsc::TrySendError::Full(_)) => {
                     mailbox_full = true;
@@ -9470,11 +9518,15 @@ mod mailbox_cap_tests {
 /// A Dedicated actor's own `MAILBOX_CAP` bound (production-hardening:
 /// closes the gap `mailbox_cap_tests` above never covered -- a Dedicated
 /// actor has no `pending` deque to cap, so its inbox CHANNEL itself is now
-/// bounded instead, checked via `try_send` at both call sites (`Interp::
-/// send`, the emit path, and `call_remote_impl`, the blocking-call path)).
-/// Mirrors `mailbox_cap_tests`'s own white-box style: a real `SyncSender`/
+/// bounded instead, checked via `try_send_with_backoff` at both call sites
+/// (`Interp::send`, the emit path, and `call_remote_impl`, the blocking-
+/// call path) -- a short, BOUNDED wait for room (safe ONLY because
+/// `Dedicated` is one-OS-thread-per-actor, see `try_send_with_backoff`'s
+/// own doc comment), not just an immediate `try_send`. Mirrors
+/// `mailbox_cap_tests`'s own white-box style: a real `SyncSender`/
 /// `Receiver` pair with the receiving end deliberately never drained (kept
-/// alive, unread, for the test's duration), driven through the SAME
+/// alive, unread, for most tests) or drained by a real background thread
+/// (the back-pressure-succeeds test below), driven through the SAME
 /// `Interp::send`/`call_remote` entry points ordinary KUPL code uses,
 /// rather than only exercising the raw channel primitive directly.
 #[cfg(test)]
@@ -9552,6 +9604,31 @@ mod dedicated_mailbox_cap_tests {
                 Err(_) => "Err(<non-Panic Flow>)".to_string(),
             }),
         }
+    }
+
+    /// Proves `try_send_with_backoff` is genuine BOUNDED back-pressure,
+    /// not merely a delayed version of the same failure: a slot that
+    /// frees up WITHIN `DEDICATED_BACKPRESSURE_TIMEOUT` must let the
+    /// retry succeed, instead of still panicking. A real background
+    /// thread drains exactly ONE message after a short delay (well
+    /// inside the timeout window) then parks forever -- simulating a
+    /// receiver that's busy-but-progressing, not genuinely stuck, which
+    /// is exactly the case this mechanism exists to smooth over.
+    #[test]
+    fn dedicated_actor_emit_succeeds_when_room_frees_up_within_the_backoff_window() {
+        let (mut interp, id, inbox_rx) = interp_with_one_undrained_dedicated_actor();
+        for _ in 0..MAILBOX_CAP {
+            assert!(interp.send(id, "x", super::Value::Unit).is_ok(), "must succeed up to exactly MAILBOX_CAP");
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let _ = inbox_rx.recv();
+            loop {
+                std::thread::park();
+            }
+        });
+        let result = interp.send(id, "x", super::Value::Unit);
+        assert!(result.is_ok(), "a slot freed within the backoff window must let the retry succeed");
     }
 }
 

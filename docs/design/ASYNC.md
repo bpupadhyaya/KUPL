@@ -825,17 +825,32 @@ change, arguably KIR/coroutine territory).
 unflagged gap: unlike `Pooled`, a `Dedicated` actor's inbox had NO bound
 at all before this fix — its own `mpsc::channel()` was fully unbounded).
 `ActorRoute::Dedicated`'s inbox is now a `std::sync::mpsc::SyncSender`
-bounded at the SAME `MAILBOX_CAP`, checked via `try_send` (never blocks)
-at both send sites (`Interp::send`, the `emit`/wire path, and
-`call_remote_impl`, the blocking-`Call` path) — overflow is a clean,
-diagnosed panic on the SENDER's side (the receiving actor can't be
-reached into and killed the way `kill_actor` does for `Pooled`, since it
-lives on a separate OS thread — consistent with this section's own
-"no true cancellation" limitation, §9.3). This is deliberately NOT
-sender-blocking back-pressure either — `try_send` never waits — but since
-`Dedicated` is one-OS-thread-per-actor, a genuinely blocking version
-would be architecturally SAFE here (unlike `Pooled`) if a future
-increment wants it.
+bounded at the SAME `MAILBOX_CAP`.
+
+**Dedicated actors now have genuine BOUNDED sender back-pressure**
+(`try_send_with_backoff`, `interp.rs`), not just overflow protection —
+architecturally safe here specifically because `Dedicated` is one-OS-
+thread-per-actor (see the `Pooled`-starvation reasoning above): a sender
+whose target mailbox is momentarily full retries with a short
+exponential backoff (starting at 50µs, capped at 5ms per attempt) for up
+to `DEDICATED_BACKPRESSURE_TIMEOUT` (200ms) before giving up. This is a
+deliberately SHORT, bounded wait, not unbounded blocking — `MAILBOX_CAP`
+(100,000) is a "genuine bug backstop," so a mailbox that's genuinely at
+that size almost certainly means the receiver is stuck, not just briefly
+busy, and a long wait wouldn't help, only delay an inevitable clean
+failure. The value exists to smooth over a real but transient burst (a
+receiver actively draining, momentarily behind) — `std::sync::mpsc::
+SyncSender` has no built-in `send_timeout` (only unbounded `send` and
+non-waiting `try_send`), so this hand-rolls the bounded middle ground via
+a poll-with-backoff loop rather than a true condvar-based wake-on-drain
+design (a materially bigger change, left for a future increment if this
+proves insufficient). Applied at both send sites (`Interp::send`, the
+`emit`/wire path, and `call_remote_impl`, the blocking-`Call` path) —
+overflow past the deadline is still a clean, diagnosed panic on the
+SENDER's side (the receiving actor can't be reached into and killed the
+way `kill_actor` does for `Pooled`, since it lives on a separate OS
+thread — consistent with this section's own "no true cancellation"
+limitation, §9.3).
 
 ### 9.3 Call timeout (DONE, interp-only) — timeout, not cancellation
 
