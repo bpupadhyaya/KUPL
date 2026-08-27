@@ -18,6 +18,24 @@ pub enum Item {
     /// A top-level `law "name" { … }` — a free-standing test (property or
     /// concrete) run by `kupl test`.
     Law(Law),
+    /// `protocol Foo { forbids io.net }` (`docs/design/AGENTS.md` §3) — a
+    /// rule set an `agent` may `follows`. v1 is structural-only: each
+    /// `forbids` names an effect (the SAME dotted vocabulary `uses`/`add
+    /// uses` already use, e.g. `io`, `io.net`, `io.fs`) that none of a
+    /// following agent's own exposed funs may (transitively) perform.
+    Protocol(ProtocolDecl),
+}
+
+/// See `Item::Protocol`'s own doc comment.
+#[derive(Debug, Clone)]
+pub struct ProtocolDecl {
+    pub name: String,
+    pub intent: Option<String>,
+    /// Each entry is a forbidden effect name (e.g. `"io.net"`) and the
+    /// span of that specific `forbids` clause, for a diagnostic that
+    /// points at the RULE, not just the whole `protocol` declaration.
+    pub forbids: Vec<(String, Span)>,
+    pub span: Span,
 }
 
 /// `contract Store { expose fun get(...) -> ...  law "..." { ... } }`
@@ -147,6 +165,13 @@ pub struct ComponentDecl {
     /// component`) means `Lightweight`. Always `None` when `is_agent` is
     /// `false`.
     pub weight: Option<AgentWeight>,
+    /// `agent Foo follows Protocol1, Protocol2 { .. }` (`docs/design/
+    /// AGENTS.md` §3) — protocol names this agent commits to. Parsed
+    /// the SAME way as `fulfills` (right after the component name),
+    /// but semantically agent-only (K1003) -- a plain `component`
+    /// parses the clause too (one uniform grammar rule) but is always
+    /// rejected by the checker. Always empty when `is_agent` is `false`.
+    pub follows: Vec<String>,
     pub fulfills: Vec<String>,
     pub intent: Option<String>,
     pub ports: Vec<Port>,

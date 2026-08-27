@@ -4,10 +4,14 @@ Proposal v0.1 — 2026-08-26.
 Status: **§4's own weight-class slice (`agent` + `weight lightweight/
 heavyweight/distributed`) is IMPLEMENTED** — see §4's own updated note
 below for the exact mechanism and diagnostics (K0125/K0316/K0317).
-§3 (`protocol`/`follows`) remains PROPOSAL — designed, not yet built. This
-file exists to capture the concept precisely enough that a fresh session,
-on any machine, can pick up detailed design and implementation without
-needing the conversation that produced it.
+**§3's structural slice (`protocol` + `agent ... follows Protocol` +
+`forbids <effect>`) is now ALSO IMPLEMENTED** — see §3's own updated note
+below for the exact mechanism and diagnostics (K1000-K1003). Behavioral/
+runtime-checked protocol rules (§3's own second enforcement model) remain
+a deferred THIRD slice, not yet built. This file exists to capture the
+concept precisely enough that a fresh session, on any machine, can pick up
+detailed design and implementation without needing the conversation that
+produced it.
 
 **Why this doc exists:** the user's own framing (verbatim, lightly trimmed):
 
@@ -90,7 +94,10 @@ cultural norms. The proposal: a new `protocol` declaration, analogous to
 a protocol declares BEHAVIORAL rules an agent commits to `follow`s, not a
 function-signature shape.
 
-Illustrative sketch (syntax not finalized — see §6):
+Illustrative sketch of the FULL proposal, including the still-deferred
+`rule "..."` behavioral form (§6/§7 — NOT implemented; see the "Implemented"
+note below for exactly what the shipped `forbids <effect>` structural form
+looks like instead):
 
 ```
 protocol CompanyPolicy {
@@ -104,10 +111,9 @@ protocol GDPR {
     rule "personal data may not leave the EU without explicit consent"
 }
 
-agent SupportRep {
+agent SupportRep follows CompanyPolicy, GDPR {
     intent "handles customer support tickets like a human support rep"
     weight lightweight
-    follows CompanyPolicy, GDPR
 
     let queue = TicketQueue()          // a concurrent component (actor)
     let mailer = EmailSender()          // a plain component
@@ -133,23 +139,75 @@ either/or:**
   KUPL's existing effect system (`uses`/`add uses`) and capability
   restrictions (K0304 and friends) already do — a `protocol` could compile
   down to additional checker obligations, the same family of mechanism, not
-  a new one.
+  a new one. **IMPLEMENTED** (KUPL commit history, 2026-08-26) — see below.
 - **Behavioral / runtime-checked rules** — a rule that constrains a VALUE at
   a decision point (e.g. "no financial commitment over $10,000") can't be
   fully verified statically in general — this needs a runtime guard,
   conceptually similar to `expect`/`law` (already-executable assertions) but
   attached to the PROTOCOL rather than a single call site, and evaluated
   automatically at whatever points the protocol declares matter (every
-  `expose fun` entry? every `ai fun` result? both, configurable?).
+  `expose fun` entry? every `ai fun` result? both, configurable?). **NOT
+  implemented** — remains the deferred third slice (§7).
 
-**Open, deliberately unresolved in this doc:** how MULTIPLE protocols
-compose when an agent `follows` more than one (strictest-wins? explicit
-priority? a conflict is a compile-time error?); whether a rule can be
-partially statically checked and partially runtime-checked; whether
-protocols are inherited (an agent spawned BY another agent automatically
-follows its parent's protocols, mirroring how a child process inherits
-capabilities in most sandboxing models) or must be declared explicitly every
-time.
+**Implemented (structural slice only):** the shipped v1 is deliberately
+narrower than the illustrative sketch above — one rule shape, `forbids
+<effect>` (a dotted effect name, the SAME vocabulary `uses`/`add uses`
+already use: `io`, `io.net`, `io.fs`, `ai`, …), not free-text `rule "..."`.
+
+```
+protocol NoNetwork {
+    intent "no network access"
+    forbids io.net
+}
+
+agent Rep follows NoNetwork {
+    intent "a rep that shouldn't reach the network"
+    expose fun greet(name: Str) -> Str { "hello, {name}" }
+}
+```
+
+- **Grammar**: `protocol Name { intent "..." forbids <effect>... }` is a new
+  top-level `Item::Protocol` (`token.rs::KwProtocol`, `parser.rs::
+  parse_protocol`, mirroring `parse_contract`'s own shape). `agent Foo
+  follows Protocol1, Protocol2 { .. }` — `follows` parses right after the
+  component/agent NAME, before the `{`, the exact same position and shape as
+  the existing `fulfills <contract>` clause (NOT inside the body, unlike
+  `weight`) — parser-accepts-broadly on any `component`/`agent`, checker-
+  narrowed to `agent`-only (K1003, mirroring K0317's own precedent exactly).
+- **Checker**: K1000 (duplicate protocol name), K1001 (`follows` names an
+  unknown protocol, with a `did you mean` suggestion), K1003 (`follows` on a
+  non-agent) all live in `check.rs`, mirroring `check_fulfills`'s own
+  unknown-contract-name precedent. K1002 (an agent's own EXPOSED fun
+  actually performs an effect a followed protocol forbids) lives in
+  `effects.rs::check_protocols`, reusing `infer_effects`'s already-built
+  transitive fixpoint (the SAME computation K0301/K0302's boundary-
+  explicitness enforcement is built on) and the same hierarchical `covers`
+  semantics (`forbids io` also forbids `io.net`) — called from inside
+  `check_effects` itself so none of that function's ~15 existing call sites
+  needed to change.
+- **VM/native/fmt/resolve/lsp/sdiff**: `protocol`/`follows` are purely
+  static/checker-time constructs (no runtime data needed), so `interp.rs`'s
+  `ProgramDb`, `compile.rs`, `vm.rs`, and `cgen.rs` all treat `Item::
+  Protocol` as a no-op — confirmed live (`kupl run --vm`/`kupl native` both
+  execute a `follows`-respecting agent exactly like an ordinary one, and a
+  program that fails K1002 fails identically under `kupl check`/`kupl run`,
+  since the interpreter's own entry point runs the checker first).
+  `fmt.rs` round-trips both losslessly; `sdiff.rs`'s `interface_of` treats a
+  protocol's own `forbids` list as its whole public interface (widening or
+  narrowing it is `[INTERFACE — breaking]`, matching the precedent
+  `contract`'s own effect-budget fingerprint already established).
+
+**Open, deliberately unresolved in this doc (applies to the deferred
+behavioral/rule-text slice, not the shipped structural one above):** how
+MULTIPLE protocols compose when an agent `follows` more than one
+(strictest-wins? explicit priority? a conflict is a compile-time error? —
+note the SHIPPED `forbids`-only slice sidesteps this entirely: multiple
+`forbids` lists just union, no real composition question arises yet);
+whether a rule can be partially statically checked and partially
+runtime-checked; whether protocols are inherited (an agent spawned BY
+another agent automatically follows its parent's protocols, mirroring how a
+child process inherits capabilities in most sandboxing models) or must be
+declared explicitly every time.
 
 ## 4. Weight class: let the agent pick its own concurrency implementation
 
@@ -265,18 +323,29 @@ specific answer yet, only to naming the axes:
   round-trips `agent`/`weight` losslessly; full `cargo test --bin kupl`
   (90/90) and `cargo test --lib` (1790/1790, green twice); revert-and-
   verify on both the checker restriction and the interp.rs dispatch.
-- **NOT STARTED:** §3 (`protocol`/`follows`) — the genuinely harder half
-  of this proposal (rule composition/conflict, structural vs. behavioral
-  enforcement, integration with the effect/capability system). §5's
-  open questions (identity/persistence, judgment-vs-determinism,
-  "infinite agents" bounding) also remain fully open.
-- **Recommended next slice:** `protocol` as a NEW top-level declaration
-  (parallel to `contract`), `follows <protocol>, ...` as an `agent`-only
-  clause (mirroring `weight`'s own soft-keyword-inside-body precedent).
-  Start with STRUCTURAL rules only (checker-level, extending the
-  existing effect/capability system, e.g. "an agent following protocol P
-  may not call capability root X directly") — defer behavioral/runtime-
-  checked rules (needing a NEW execution hook, closer to `expect`/`law`
-  but attached to the protocol rather than one call site) to a THIRD
-  slice, matching this whole initiative's own repeated "ship the
-  provably-scoped piece first" discipline.
+- **DONE:** §3's structural slice — `protocol Name { intent "..." forbids
+  <effect>... }` + `agent Foo follows Protocol1, Protocol2 { .. }`,
+  checker-enforced via K1000/K1001/K1002/K1003 (§3's own updated section
+  has the full mechanism). Verified: `kupl check`/`kupl run`/`kupl run
+  --vm` all agree that a protocol-violating agent is rejected (K1002) and
+  a protocol-respecting one runs cleanly; `kupl fmt` round-trips
+  `protocol`/`follows` losslessly; `kupl diff` treats a protocol's
+  `forbids` list as public interface; full `cargo test --bin kupl`
+  (91/91) and `cargo test --lib` (1799/1799, green twice); revert-and-
+  verify on both `effects.rs::check_protocols` (K1002) and `sdiff.rs`'s
+  `interface_of` Protocol arm.
+- **NOT STARTED:** §3's behavioral/runtime-checked enforcement model (free-
+  text `rule "..."` rules that constrain a VALUE at a decision point, not
+  just an effect — needs a NEW execution hook, closer to `expect`/`law` but
+  attached to the protocol rather than one call site) — the THIRD slice,
+  deliberately deferred per this whole initiative's own repeated "ship the
+  provably-scoped piece first" discipline. Multi-protocol composition/
+  conflict resolution remains open but lower-urgency now that the shipped
+  `forbids`-only slice sidesteps it (see §3's own "Open" note). §5's open
+  questions (identity/persistence, judgment-vs-determinism, "infinite
+  agents" bounding) also remain fully open.
+- **Recommended next slice:** either (a) the behavioral/runtime-checked
+  rule form above, or (b) return to §5's open questions (agent identity/
+  persistence, judgment-vs-determinism) — both are genuine, unstarted
+  design work, at the implementer's own judgment informed by which has
+  higher near-term leverage.

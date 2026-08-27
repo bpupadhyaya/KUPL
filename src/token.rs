@@ -55,6 +55,11 @@ pub enum Tok {
     /// -- `agent` is a genuinely new top-level declaration kind, not a
     /// modifier on an existing one.
     KwAgent,
+    /// `protocol Foo { forbids io.net }` (`docs/design/AGENTS.md` §3) --
+    /// a rule set an `agent` may `follows`. A hard keyword, like
+    /// `contract` (also a body-less-signature-style top-level
+    /// declaration), not a soft one.
+    KwProtocol,
     KwContract,
     KwType,
     KwFun,
@@ -156,6 +161,7 @@ pub fn keyword(s: &str) -> Option<Tok> {
         "app" => Tok::KwApp,
         "agent" => Tok::KwAgent,
         "contract" => Tok::KwContract,
+        "protocol" => Tok::KwProtocol,
         "type" => Tok::KwType,
         "fun" => Tok::KwFun,
         "let" => Tok::KwLet,
@@ -258,6 +264,7 @@ impl Tok {
             Tok::KwApp => "app",
             Tok::KwAgent => "agent",
             Tok::KwContract => "contract",
+            Tok::KwProtocol => "protocol",
             Tok::KwType => "type",
             Tok::KwFun => "fun",
             Tok::KwLet => "let",

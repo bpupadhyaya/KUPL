@@ -95,6 +95,7 @@ pub fn emit_context(path: &str, name: &str, json: bool) -> i32 {
             Item::Type(t) => (t.name.as_str(), t.span),
             Item::Component(c) => (c.name.as_str(), c.span),
             Item::Contract(ct) => (ct.name.as_str(), ct.span),
+            Item::Protocol(p) => (p.name.as_str(), p.span),
             Item::Law(l) => (l.name.as_str(), l.span),
         })
         .collect();
@@ -104,6 +105,7 @@ pub fn emit_context(path: &str, name: &str, json: bool) -> i32 {
             Item::Type(t) => &t.name,
             Item::Component(c) => &c.name,
             Item::Contract(ct) => &ct.name,
+            Item::Protocol(p) => &p.name,
             Item::Law(l) => &l.name,
         }
     }
@@ -281,6 +283,10 @@ pub fn emit_context(path: &str, name: &str, json: bool) -> i32 {
                 crate::effects::walk_block(&law.body, &mut |e| collect_expr_names(e, &mut note));
             }
         }
+        // `forbids <effect>` clauses name plain effect strings (`io.net`
+        // etc), not types/functions/components this pass traces
+        // references for -- nothing to note.
+        Item::Protocol(_) => {}
         Item::Component(c) => {
             for contract in &c.fulfills {
                 note(contract);
@@ -350,6 +356,7 @@ pub fn emit_context(path: &str, name: &str, json: bool) -> i32 {
         Item::Type(t) => t.span,
         Item::Component(c) => c.span,
         Item::Contract(ct) => ct.span,
+        Item::Protocol(p) => p.span,
         Item::Law(l) => l.span,
     };
     if json {

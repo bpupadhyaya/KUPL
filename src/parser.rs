@@ -438,6 +438,7 @@ impl Parser {
                 Ok(Some(Item::Component(self.parse_component(false, false, true, start)?)))
             }
             Tok::KwContract => Ok(Some(Item::Contract(self.parse_contract()?))),
+            Tok::KwProtocol => Ok(Some(Item::Protocol(self.parse_protocol()?))),
             Tok::KwUse => {
                 let uspan = self.span();
                 self.bump();
@@ -464,7 +465,7 @@ impl Parser {
                 format!(
                     "unexpected {} at the top level (expected `fun`, `type`, `component`, `app`, `agent`){}",
                     other.describe(),
-                    keyword_suggestion(other, &["fun", "type", "component", "app", "agent", "contract", "use", "module"])
+                    keyword_suggestion(other, &["fun", "type", "component", "app", "agent", "contract", "protocol", "use", "module"])
                 ),
                 self.span(),
             )),
@@ -849,6 +850,68 @@ impl Parser {
         Ok(c)
     }
 
+    /// `protocol Foo { intent "..." forbids io.net }` (`docs/design/
+    /// AGENTS.md` §3) -- mirrors `parse_contract`'s own shape almost
+    /// exactly (a body-less rule-set declaration), just with `forbids
+    /// <dotted-effect>` clauses instead of `expose fun`/`law`.
+    fn parse_protocol(&mut self) -> PResult<ProtocolDecl> {
+        let start = self.expect(Tok::KwProtocol)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(Tok::LBrace)?;
+        let mut p = ProtocolDecl { name, intent: None, forbids: Vec::new(), span: start };
+        loop {
+            self.skip_newlines();
+            if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
+                break;
+            }
+            match self.peek().clone() {
+                Tok::KwIntent => {
+                    self.bump();
+                    match self.bump() {
+                        Tok::Str(parts) => {
+                            p.intent = Some(str_parts_text(&parts));
+                        }
+                        other => {
+                            return Err(Diag::error(
+                                "K0104",
+                                format!("`intent` expects a string literal, found {}", other.describe()),
+                                self.prev_span(),
+                            ))
+                        }
+                    }
+                    self.expect_terminator()?;
+                }
+                Tok::Ident(ref n) if n == "forbids" => {
+                    let fspan = self.span();
+                    self.bump();
+                    let (mut eff, _) = self.expect_ident()?;
+                    while self.eat(&Tok::Dot) {
+                        let (part, _) = self.expect_ident()?;
+                        eff.push('.');
+                        eff.push_str(&part);
+                    }
+                    let span = fspan.merge(self.prev_span());
+                    p.forbids.push((eff, span));
+                    self.expect_terminator()?;
+                }
+                other => {
+                    return Err(Diag::error(
+                        "K0126",
+                        format!(
+                            "unexpected {} in protocol body (expected `intent` or `forbids`){}",
+                            other.describe(),
+                            keyword_suggestion(&other, &["intent", "forbids"])
+                        ),
+                        self.span(),
+                    ))
+                }
+            }
+        }
+        let end = self.expect(Tok::RBrace)?;
+        p.span = start.merge(end);
+        Ok(p)
+    }
+
     /// A body-less `fun name(params) [uses ...] [-> Ty]` signature.
     fn parse_fun_sig(&mut self) -> PResult<FunSig> {
         let start = self.expect(Tok::KwFun)?;
@@ -893,6 +956,21 @@ impl Parser {
                 }
             }
         }
+        // `agent Foo follows Protocol1, Protocol2 { .. }` (`docs/design/
+        // AGENTS.md` §3) -- parsed the SAME way as `fulfills` just above,
+        // deliberately checker-narrowed (K1003) to `agent`-only rather
+        // than parser-restricted, matching `weight`'s own precedent.
+        let mut follows = Vec::new();
+        if matches!(self.peek(), Tok::Ident(n) if n == "follows") {
+            self.bump();
+            loop {
+                let (protocol, _) = self.expect_ident()?;
+                follows.push(protocol);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         self.expect(Tok::LBrace)?;
         let mut c = ComponentDecl {
             name,
@@ -900,6 +978,7 @@ impl Parser {
             concurrent: concurrent || is_agent,
             is_agent,
             weight: None,
+            follows,
             fulfills,
             intent: None,
             ports: Vec::new(),

@@ -217,6 +217,7 @@ pub(crate) fn item_name(item: &Item) -> &str {
         Item::Type(t) => &t.name,
         Item::Component(c) => &c.name,
         Item::Contract(ct) => &ct.name,
+        Item::Protocol(p) => &p.name,
         Item::Law(l) => &l.name,
     }
 }
@@ -232,6 +233,7 @@ pub(crate) fn kind_tag(item: &Item) -> &'static str {
         Item::Type(_) => "type",
         Item::Component(_) => "component",
         Item::Contract(_) => "contract",
+        Item::Protocol(_) => "protocol",
         Item::Law(_) => "law",
     }
 }
@@ -246,6 +248,7 @@ pub(crate) fn item_span(item: &Item) -> crate::diag::Span {
         Item::Type(t) => t.span,
         Item::Component(c) => c.span,
         Item::Contract(ct) => ct.span,
+        Item::Protocol(p) => p.span,
         Item::Law(l) => l.span,
     }
 }
@@ -257,6 +260,7 @@ fn kind(item: &Item) -> &'static str {
         Item::Component(c) if c.is_app => "app      ",
         Item::Component(_) => "component",
         Item::Contract(_) => "contract ",
+        Item::Protocol(_) => "protocol ",
         Item::Law(_) => "law      ",
     }
 }
@@ -582,6 +586,17 @@ fn interface_of(item: &Item) -> String {
                 });
                 s.push_str(&format!(" law:{}[{body_text}]", law.name));
             }
+        }
+        // A protocol's `forbids` list IS its whole public contract -- any
+        // agent that `follows` it is checked against exactly this list
+        // (K1002). Widening or narrowing it changes what's rejected for
+        // every following agent, so (mirroring the contract effect-budget
+        // fix above) it must be fingerprinted, sorted for the same
+        // declaration-order-insensitivity reason as every other list here.
+        Item::Protocol(p) => {
+            let mut forbids: Vec<&str> = p.forbids.iter().map(|(e, _)| e.as_str()).collect();
+            forbids.sort();
+            s.push_str(&format!("protocol {} forbids[{}]", p.name, forbids.join(",")));
         }
         // a top-level law has no public interface (it is a test, not surface)
         Item::Law(l) => s.push_str(&format!("law {}", l.name)),
@@ -963,6 +978,31 @@ mod tests {
             "contract Store {\n    intent \"kv\"\n    expose fun get(key: Str) -> Int\n}\n",
         );
         assert_eq!(lines, vec!["interface Store"]);
+    }
+
+    /// KUPL Agents (`docs/design/AGENTS.md` §3): a protocol's `forbids` list
+    /// IS its whole public contract (`interface_of`'s own `Item::Protocol`
+    /// arm) -- widening or narrowing it must be reported as an interface
+    /// change, since it changes what's rejected for every agent that
+    /// follows it, mirroring the contract effect-budget precedent just above.
+    #[test]
+    fn protocol_forbids_change_is_interface() {
+        let (lines, _) = diff_lines(
+            "protocol NoNetwork {\n    intent \"no network\"\n    forbids io.net\n}\n",
+            "protocol NoNetwork {\n    intent \"no network\"\n    forbids io.net\n    forbids io.fs\n}\n",
+        );
+        assert_eq!(lines, vec!["interface NoNetwork"]);
+
+        // `canonical()` preserves source order, so reordering two `forbids`
+        // entries still registers as SOME change (same NOTE as the sibling
+        // `contract_sigs_and_laws_reorder_is_not_interface` test below) --
+        // but `interface_of` sorts its own `forbids` fingerprint, so the
+        // classification must be `impl`, not `interface`.
+        let (lines2, _) = diff_lines(
+            "protocol P {\n    intent \"p\"\n    forbids io.net\n    forbids io.fs\n}\n",
+            "protocol P {\n    intent \"p\"\n    forbids io.fs\n    forbids io.net\n}\n",
+        );
+        assert_eq!(lines2, vec!["impl P"], "reordering `forbids` entries must be implementation-only");
     }
 
     /// A REAL, LIVE-CONFIRMED misclassification bug found+fixed (production-

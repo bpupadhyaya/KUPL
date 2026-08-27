@@ -82,6 +82,14 @@ pub struct Checked {
     /// widening `funs`'s own tuple, to avoid touching its many existing
     /// consumers that have no need to know about bounds.
     pub fun_type_param_bounds: HashMap<String, Vec<Option<String>>>,
+    /// KUPL Agents §3 (`docs/design/AGENTS.md`): names of every `protocol`
+    /// declaration in the program -- just existence, no signature data
+    /// needed here (an agent's `follows` clause only needs to know the
+    /// name resolves; the actual `forbids` rule enforcement is a
+    /// SEPARATE pass, `effects::check_protocols`, which reads the AST's
+    /// own `ProtocolDecl`s directly since it needs their `forbids` lists,
+    /// not just a name).
+    pub protocols: HashSet<String>,
 }
 
 pub fn check(program: &Program) -> (Checked, Vec<Diag>) {
@@ -897,6 +905,17 @@ impl Checker {
             if let Item::Contract(ct) = item {
                 self.checked.contracts.entry(ct.name.clone()).or_default();
             }
+            // register protocol names early so an agent's own `follows`
+            // clause can validate against them during `check_bodies`.
+            if let Item::Protocol(p) = item {
+                if !self.checked.protocols.insert(p.name.clone()) {
+                    self.err(
+                        "K1000",
+                        format!("protocol `{}` is defined more than once", p.name),
+                        p.span,
+                    );
+                }
+            }
         }
         // now resolve type bodies
         for item in &program.items {
@@ -1216,6 +1235,13 @@ impl Checker {
                     }
                 }
                 Item::Law(_) => {} // no signature to collect
+                // `protocol` declarations have no type-checkable signature to
+                // collect here (their own `forbids` clauses just name plain
+                // effect strings, resolved later) -- validated in a SEPARATE
+                // pass, `effects::check_protocols`, alongside K0301/K0302/
+                // K0303, since it needs `infer_effects`'s own already-
+                // computed data, not this type-checking pass's own state.
+                Item::Protocol(_) => {}
             }
         }
         self.collect_ai_funs(program);
@@ -1542,6 +1568,10 @@ impl Checker {
                 Item::Type(_) => {}
                 Item::Component(c) => self.check_component(c),
                 Item::Contract(ct) => self.check_contract(ct),
+                // No expression bodies to check -- `forbids <effect>`
+                // clauses are plain effect-name strings, and duplicate-
+                // name detection already happened in `collect()`.
+                Item::Protocol(_) => {}
                 Item::Law(l) => {
                     let mut ctx = Ctx {
                         scopes: Scopes::new(),
@@ -2571,6 +2601,35 @@ impl Checker {
                 "`weight` is only valid on an `agent` -- a plain `component`/`concurrent component` always uses the pooled (lightweight) tier".to_string(),
                 c.span,
             );
+        }
+        // `docs/design/AGENTS.md` §3: `follows` is `agent`-only (K1003 --
+        // mirrors K0317's own "parser accepts broadly, checker narrows"
+        // shape exactly), and each named protocol must actually exist
+        // (K1001, mirroring `check_fulfills`'s own unknown-contract
+        // check). The RULE-enforcement half (does this agent's own code
+        // actually violate a followed protocol's `forbids` list, K1002)
+        // is a separate pass, `effects::check_protocols` -- it needs
+        // `infer_effects`'s own already-computed data, which isn't
+        // available from inside this type-checking pass.
+        if !c.follows.is_empty() && !c.is_agent {
+            self.err(
+                "K1003",
+                "`follows` is only valid on an `agent` -- a plain `component`/`concurrent component` cannot follow a protocol".to_string(),
+                c.span,
+            );
+        }
+        for protocol in &c.follows {
+            if !self.checked.protocols.contains(protocol) {
+                let hint = match suggest(protocol, self.checked.protocols.iter().map(String::as_str)) {
+                    Some(s) => format!(" — did you mean `{s}`?"),
+                    None => String::new(),
+                };
+                self.err(
+                    "K1001",
+                    format!("agent `{}` follows unknown protocol `{protocol}`{hint}", c.name),
+                    c.span,
+                );
+            }
         }
         if c.concurrent {
             self.check_concurrent_component(c);
@@ -6677,6 +6736,54 @@ mod generic_tests {
                            app Main {\n    intent \"m\"\n}\n";
         let errs2 = errors(concurrent);
         assert!(errs2.iter().any(|d| d.code == "K0317"), "`weight` on a concurrent component must be K0317: {errs2:?}");
+    }
+
+    /// KUPL Agents (`docs/design/AGENTS.md` §3): a well-formed `protocol` +
+    /// `agent ... follows` pair must check completely clean.
+    #[test]
+    fn well_formed_protocol_and_follows_checks_clean() {
+        let src = "protocol NoNetwork {\n    intent \"no network access\"\n    forbids io.net\n}\n\
+                    agent Rep follows NoNetwork {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.is_empty(), "a well-formed protocol+follows pair must check clean: {errs:?}");
+    }
+
+    /// K1000: a protocol defined more than once is rejected.
+    #[test]
+    fn duplicate_protocol_is_k1000() {
+        let src = "protocol P {\n    intent \"p\"\n    forbids io.net\n}\n\
+                    protocol P {\n    intent \"p again\"\n    forbids io.fs\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K1000"), "a duplicate protocol must be K1000: {errs:?}");
+    }
+
+    /// K1001: `follows` naming an unknown protocol is rejected.
+    #[test]
+    fn follows_unknown_protocol_is_k1001() {
+        let src = "agent Rep follows NoSuchProtocol {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K1001"), "`follows` on an unknown protocol must be K1001: {errs:?}");
+    }
+
+    /// K1003: `follows` is agent-only -- rejected on a plain `component`
+    /// AND on a `concurrent component`, mirroring K0317's own `weight`
+    /// shape exactly.
+    #[test]
+    fn follows_on_a_non_agent_is_k1003() {
+        let plain = "protocol P {\n    intent \"p\"\n    forbids io.net\n}\n\
+                      component C follows P {\n    intent \"c\"\n}\n\
+                      app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(plain);
+        assert!(errs.iter().any(|d| d.code == "K1003"), "`follows` on a plain component must be K1003: {errs:?}");
+
+        let concurrent = "protocol P {\n    intent \"p\"\n    forbids io.net\n}\n\
+                           concurrent component C follows P {\n    intent \"c\"\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n}\n";
+        let errs2 = errors(concurrent);
+        assert!(errs2.iter().any(|d| d.code == "K1003"), "`follows` on a concurrent component must be K1003: {errs2:?}");
     }
 
     /// Production-hardening 1214: a REAL, live-confirmed bug found+fixed --

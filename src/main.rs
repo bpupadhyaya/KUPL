@@ -3717,6 +3717,69 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Live, end-to-end verification of `docs/design/AGENTS.md` §3 (the
+    /// `protocol`/`follows` structural slice): an agent whose own exposed
+    /// fun performs an effect forbidden by a protocol it follows is
+    /// rejected by `kupl check` with K1002, and the SAME violating program
+    /// is refused by `kupl run` too (it never gets to execute the
+    /// forbidden call) -- alongside a positive control, an agent that
+    /// follows the identical protocol but never performs the forbidden
+    /// effect, which must check AND run cleanly.
+    #[test]
+    fn agent_violating_a_followed_protocol_is_rejected_end_to_end() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-protocol-follows-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let violating_file = dir.join("violating.kupl");
+        std::fs::write(
+            &violating_file,
+            "protocol NoNetwork {\n    intent \"no network access\"\n    forbids io.net\n}\n\
+             agent Rep follows NoNetwork {\n    intent \"a rep that shouldn't reach the network\"\n    \
+                 expose fun poke(url: Str) uses io.net -> Str {\n        let result = http_get(url)\n        \
+                 match result {\n            Ok(body) => body,\n            Err(e) => e,\n        }\n    }\n}\n\
+             app Main {\n    intent \"protocol violation test\"\n    let rep = Rep()\n    \
+                 on start { print(rep.poke(\"http://example.com\")) }\n}\n",
+        )
+        .unwrap();
+
+        let check_out =
+            std::process::Command::new(&bin).args(["check", violating_file.to_str().unwrap()]).output().unwrap();
+        assert_ne!(check_out.status.code(), Some(0), "a protocol violation must fail `kupl check`: {check_out:?}");
+        assert!(
+            String::from_utf8_lossy(&check_out.stderr).contains("K1002"),
+            "a protocol violation must be reported as K1002: {check_out:?}"
+        );
+
+        let run_out =
+            std::process::Command::new(&bin).args(["run", violating_file.to_str().unwrap()]).output().unwrap();
+        assert_ne!(run_out.status.code(), Some(0), "`kupl run` must also refuse a protocol-violating program: {run_out:?}");
+
+        let respecting_file = dir.join("respecting.kupl");
+        std::fs::write(
+            &respecting_file,
+            "protocol NoNetwork {\n    intent \"no network access\"\n    forbids io.net\n}\n\
+             agent Rep follows NoNetwork {\n    intent \"a rep that respects its protocol\"\n    \
+                 expose fun greet(name: Str) -> Str {\n        \"hello, {name}\"\n    }\n}\n\
+             app Main {\n    intent \"protocol respect control\"\n    let rep = Rep()\n    \
+                 on start { print(rep.greet(\"world\")) }\n}\n",
+        )
+        .unwrap();
+
+        let check_ok =
+            std::process::Command::new(&bin).args(["check", respecting_file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(check_ok.status.code(), Some(0), "an agent respecting its protocol must check clean: {check_ok:?}");
+
+        let run_ok = std::process::Command::new(&bin).args(["run", respecting_file.to_str().unwrap()]).output().unwrap();
+        assert_eq!(run_ok.status.code(), Some(0), "an agent respecting its protocol must run cleanly: {run_ok:?}");
+        assert_eq!(String::from_utf8_lossy(&run_ok.stdout), "hello, world\n", "{run_ok:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live, end-to-end verification of `docs/design/ASYNC.md` §8.10 step
     /// 5 (blocking `Call` messages): the coordinator calls a `concurrent`
     /// instance's own `expose fun` synchronously, twice in a row, checking

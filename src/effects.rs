@@ -191,7 +191,7 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
                     );
                 }
             }
-            Item::Type(_) | Item::Contract(_) | Item::Law(_) => {}
+            Item::Type(_) | Item::Contract(_) | Item::Law(_) | Item::Protocol(_) => {}
         }
     }
 
@@ -564,6 +564,75 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
         }
     }
 
+    diags.extend(check_protocols(program));
+    diags
+}
+
+/// K1002: structural enforcement of `agent ... follows Protocol` (see
+/// `docs/design/AGENTS.md` §3 -- the "protocol" slice, deliberately
+/// structural-only for v1; behavioral/runtime-checked rules are a later,
+/// separate slice). For every `agent` that follows one or more protocols,
+/// every one of its own EXPOSED funs' transitively-inferred effect set (via
+/// `infer_effects` -- the SAME computation `check_effects`'s own K0301/K0302
+/// boundary-explicitness enforcement is built on, so a protocol violation is
+/// caught with exactly the same precision/limitations as any other effect
+/// diagnostic in this file) is checked against every followed protocol's
+/// `forbids` list, using the SAME hierarchical `covers` semantics as
+/// everywhere else here (a protocol that forbids `io` also forbids
+/// `io.net`). An agent `follows`-ing an unknown protocol name is K1001's job
+/// (`check.rs`, a separate pass over raw syntax) -- unresolvable names are
+/// silently skipped here rather than double-reported.
+fn check_protocols(program: &Program) -> Vec<Diag> {
+    let mut diags = Vec::new();
+    let protocols: HashMap<&str, &ProtocolDecl> = program
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Protocol(p) => Some((p.name.as_str(), p)),
+            _ => None,
+        })
+        .collect();
+    // The overwhelming common case (no agent follows any protocol) skips
+    // `infer_effects`'s own whole-program fixpoint entirely.
+    let any_agent_follows = program.items.iter().any(|item| match item {
+        Item::Component(c) => c.is_agent && !c.follows.is_empty(),
+        _ => false,
+    });
+    if !any_agent_follows {
+        return diags;
+    }
+    let inferred = infer_effects(program);
+    for item in &program.items {
+        let Item::Component(c) = item else { continue };
+        if !c.is_agent || c.follows.is_empty() {
+            continue;
+        }
+        let forbidden: Vec<&str> = c
+            .follows
+            .iter()
+            .filter_map(|name| protocols.get(name.as_str()))
+            .flat_map(|p| p.forbids.iter().map(|(e, _)| e.as_str()))
+            .collect();
+        if forbidden.is_empty() {
+            continue;
+        }
+        for f in &c.exposes {
+            let key = fun_key(Some(&c.name), &f.name);
+            let Some((used, _)) = inferred.get(&key) else { continue };
+            for u in used {
+                if let Some(rule) = forbidden.iter().find(|fe| covers(fe, u)) {
+                    diags.push(Diag::error(
+                        "K1002",
+                        format!(
+                            "agent `{}`'s `{}` performs effect `{u}`, forbidden by a protocol it follows (`forbids {rule}`)",
+                            c.name, f.name
+                        ),
+                        f.span,
+                    ));
+                }
+            }
+        }
+    }
     diags
 }
 
@@ -589,7 +658,7 @@ pub fn infer_effects(program: &Program) -> HashMap<String, (EffectSet, bool)> {
                     funs.insert(fun_key(Some(&c.name), &f.name), (f, Some(c.name.as_str())));
                 }
             }
-            Item::Type(_) | Item::Contract(_) | Item::Law(_) => {}
+            Item::Type(_) | Item::Contract(_) | Item::Law(_) | Item::Protocol(_) => {}
         }
     }
 
@@ -2534,5 +2603,49 @@ mod tests {
             "a PLAIN call through a parameter whose name collides with an existing function must \
              still warn K0303 -- this is the PR-it933 case, unaffected by PR-it1203: {plain_call_collision:?}"
         );
+    }
+
+    /// K1002 (`docs/design/AGENTS.md` §3, the `follows`/`forbids`
+    /// structural slice): an agent's own EXPOSED fun that performs an
+    /// effect its followed protocol forbids is rejected -- and the
+    /// violation is caught even when the forbidden effect flows in
+    /// transitively through a private helper, exercising the SAME
+    /// `infer_effects` fixpoint K0301 already relies on elsewhere in this
+    /// file, not a separate/narrower mechanism.
+    #[test]
+    fn agent_violating_a_followed_protocol_is_k1002() {
+        let d = diags_for(
+            "protocol NoNetwork {\n    intent \"no network access\"\n    forbids io.net\n}\n\
+             agent Rep follows NoNetwork {\n    intent \"a\"\n    \
+             fun sneaky() uses io.net {\n        http_get(\"http://example.com\")\n    }\n    \
+             expose fun f() uses io.net {\n        sneaky()\n    }\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K1002"), "an agent violating a followed protocol must be K1002: {d:?}");
+    }
+
+    /// The positive control for the test above: an agent that follows a
+    /// protocol but never performs the forbidden effect must check clean --
+    /// confirms `follows` alone doesn't spuriously trigger K1002.
+    #[test]
+    fn agent_respecting_a_followed_protocol_is_clean() {
+        let d = diags_for(
+            "protocol NoNetwork {\n    intent \"no network access\"\n    forbids io.net\n}\n\
+             agent Rep follows NoNetwork {\n    intent \"a\"\n    \
+             expose fun f() uses io.fs {\n        read_file(\"x\")\n    }\n}\n",
+        );
+        assert!(!d.iter().any(|d| d.code == "K1002"), "an agent that never performs the forbidden effect must not be K1002: {d:?}");
+    }
+
+    /// An agent with NO `follows` clause at all must never pay for (or
+    /// trigger) `check_protocols`'s own `infer_effects` fixpoint -- confirms
+    /// the early-return fast path doesn't accidentally skip real K0301
+    /// enforcement for ordinary agents.
+    #[test]
+    fn agent_without_follows_is_unaffected_by_protocol_enforcement() {
+        let d = diags_for(
+            "agent Rep {\n    intent \"a\"\n    expose fun f() {\n        http_get(\"http://example.com\")\n    }\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K0301"), "ordinary K0301 enforcement must still fire: {d:?}");
+        assert!(!d.iter().any(|d| d.code == "K1002"), "no `follows` clause means K1002 cannot apply: {d:?}");
     }
 }

@@ -129,6 +129,7 @@ fn defined_names(item: &Item) -> Vec<String> {
         }
         Item::Component(c) => vec![c.name.clone()],
         Item::Contract(c) => vec![c.name.clone()],
+        Item::Protocol(p) => vec![p.name.clone()],
         Item::Law(_) => vec![],
     }
 }
@@ -212,6 +213,7 @@ impl Rewriter<'_> {
             }
             Item::Component(c) => self.component(c),
             Item::Contract(c) => self.contract(c),
+            Item::Protocol(p) => self.protocol(p),
             Item::Law(l) => {
                 self.push();
                 self.block(&mut l.body);
@@ -345,6 +347,11 @@ impl Rewriter<'_> {
         for fc in &mut c.fulfills {
             if let Some(m) = self.name(fc) {
                 *fc = m;
+            }
+        }
+        for p in &mut c.follows {
+            if let Some(m) = self.name(p) {
+                *p = m;
             }
         }
         for p in &mut c.ports {
@@ -483,6 +490,16 @@ impl Rewriter<'_> {
             self.pop();
         }
         self.pop();
+    }
+
+    /// `protocol` (`docs/design/AGENTS.md` §3) -- mangles its own
+    /// declared name (so a `follows` reference elsewhere in this package
+    /// resolves correctly); `forbids <effect>` clauses are plain effect
+    /// strings, not names this rewriter's own rename map ever touches.
+    fn protocol(&mut self, p: &mut ProtocolDecl) {
+        if let Some(m) = self.rename.get(&p.name) {
+            p.name = m.clone();
+        }
     }
 
     fn contract(&mut self, c: &mut ContractDecl) {

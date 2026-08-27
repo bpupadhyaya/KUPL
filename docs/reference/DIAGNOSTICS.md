@@ -54,6 +54,7 @@ Severity: **E** = error, **W** = warning.
 | K0123 | E | unsupported generic bound (only `[T: Ord]` is currently supported) |
 | K0124 | E | a restart strategy (`one_for_all`/`rest_for_one`) only applies to `restart on_failure`, not `restart never` |
 | K0125 | E | `weight` expects `lightweight`, `heavyweight`, or `distributed` |
+| K0126 | E | unexpected token in protocol body (expected `intent` or `forbids`) |
 
 ## K02xx — Type & semantic checker
 
@@ -207,3 +208,17 @@ A panic inside a component whose parent declared
 `supervise child restart on_failure` does **not** exit: the child's state is
 reset, `on start` re-runs, and `[supervise] … restarted after panic: …` is
 printed to stderr.
+
+## K10xx — Agents & protocols
+
+`protocol`/`follows` (`docs/design/AGENTS.md` §3) is a structural-only slice:
+it checks that an `agent`'s own exposed funs never perform an effect a
+followed protocol forbids. Behavioral/runtime-checked protocol rules are a
+deferred, later slice.
+
+| Code | Sev | Meaning |
+|---|---|---|
+| K1000 | E | `protocol` defined more than once |
+| K1001 | E | `follows` names a protocol that doesn't exist |
+| K1002 | E | an agent's own exposed fun performs an effect forbidden by a protocol it follows |
+| K1003 | E | `follows` is only valid on an `agent`, not a plain `component`/`concurrent component` |

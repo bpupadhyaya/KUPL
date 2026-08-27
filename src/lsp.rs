@@ -2018,6 +2018,7 @@ fn top_level_item_named(program: &crate::ast::Program, name: &str) -> bool {
         Item::Type(t) => t.name == name || t.variants.iter().any(|v| v.name == name),
         Item::Component(c) => c.name == name,
         Item::Contract(ct) => ct.name == name,
+        Item::Protocol(p) => p.name == name,
         Item::Law(_) => false,
     })
 }
@@ -2907,6 +2908,7 @@ fn item_symbol(text: &str, item: &crate::ast::Item, line_index: &LineIndex) -> S
             children.extend(c.laws.iter().map(|l| symbol_json(&l.name, 12, &lsp_range(line_index, text, l.span), "", &[])));
             symbol_json(&c.name, 11, &lsp_range(line_index, text, c.span), "", &children)
         }
+        Item::Protocol(p) => symbol_json(&p.name, 11, &lsp_range(line_index, text, p.span), "", &[]),
         Item::Law(l) => symbol_json(&l.name, 12, &lsp_range(line_index, text, l.span), "", &[]),
         Item::Component(c) => {
             // Ports used to be entirely absent from the document outline too,
@@ -2988,6 +2990,7 @@ fn foldable_spans(item: &crate::ast::Item, out: &mut Vec<crate::diag::Span>) {
             out.extend(c.sigs.iter().map(|s| s.span));
             out.extend(c.laws.iter().map(|l| l.span));
         }
+        Item::Protocol(p) => out.push(p.span),
         Item::Law(l) => out.push(l.span),
         Item::Component(c) => {
             out.push(c.span);
@@ -3171,6 +3174,7 @@ fn collect_workspace_symbol_matches(
                 maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle, line_index);
             }
         }
+        Item::Protocol(p) => maybe_push_symbol_info(out, text, uri, &p.name, 11, p.span, needle, line_index),
         Item::Law(l) => maybe_push_symbol_info(out, text, uri, &l.name, 12, l.span, needle, line_index),
         Item::Component(c) => {
             maybe_push_symbol_info(out, text, uri, &c.name, 5, c.span, needle, line_index);

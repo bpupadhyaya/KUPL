@@ -148,6 +148,7 @@ pub fn format_program(p: &Program) -> String {
             Item::Type(t) => fmt_type(&mut out, t),
             Item::Component(c) => fmt_component(&mut out, c),
             Item::Contract(ct) => fmt_contract(&mut out, ct),
+            Item::Protocol(p) => fmt_protocol(&mut out, p),
             Item::Law(l) => {
                 out.push_str(&format!("law \"{}\" ", escape_str(&l.name)));
                 fmt_block(&mut out, &l.body, 0);
@@ -344,6 +345,28 @@ fn fmt_contract(out: &mut String, ct: &ContractDecl) {
     out.push_str("}\n");
 }
 
+/// `protocol Foo { intent "..." forbids io.net }` (`docs/design/
+/// AGENTS.md` §3) -- mirrors `fmt_contract`'s own shape.
+fn fmt_protocol(out: &mut String, p: &ProtocolDecl) {
+    out.push_str(&format!("protocol {} {{\n", p.name));
+    let mut first = true;
+    if let Some(intent) = &p.intent {
+        indent(out, 1);
+        out.push_str(&format!("intent \"{}\"\n", escape_str(intent)));
+        first = false;
+    }
+    if !p.forbids.is_empty() {
+        if !first {
+            out.push('\n');
+        }
+        for (effect, _) in &p.forbids {
+            indent(out, 1);
+            out.push_str(&format!("forbids {effect}\n"));
+        }
+    }
+    out.push_str("}\n");
+}
+
 fn fmt_component(out: &mut String, c: &ComponentDecl) {
     if c.is_agent {
         // `agent` implies `concurrent` implicitly (`ast.rs::ComponentDecl::
@@ -361,6 +384,9 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
     out.push_str(&c.name);
     if !c.fulfills.is_empty() {
         out.push_str(&format!(" fulfills {}", c.fulfills.join(", ")));
+    }
+    if !c.follows.is_empty() {
+        out.push_str(&format!(" follows {}", c.follows.join(", ")));
     }
     out.push_str(" {\n");
     let mut first_group = true;
@@ -1183,6 +1209,31 @@ mod tests {
         assert!(d2.is_empty(), "{d2:?}");
         let formatted2 = super::format_program(&p2);
         assert!(!formatted2.contains("weight"), "an agent with no weight clause must not gain one: {formatted2:?}");
+    }
+
+    /// KUPL Agents (`docs/design/AGENTS.md` §3): a `protocol` declaration
+    /// and an agent's `follows` clause must both round-trip losslessly.
+    #[test]
+    fn fmt_preserves_protocol_and_follows_clause() {
+        let src = "protocol NoNetwork {\n    intent \"no network access\"\n    forbids io.net\n}\n\
+                    agent Rep follows NoNetwork {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(formatted.contains("protocol NoNetwork {"), "the `protocol` declaration must survive formatting: {formatted:?}");
+        assert!(formatted.contains("forbids io.net"), "the `forbids` clause must survive formatting: {formatted:?}");
+        assert!(formatted.contains("follows NoNetwork"), "the `follows` clause must survive formatting: {formatted:?}");
+
+        // An agent with NO `follows` clause must not gain one.
+        let no_follows = "agent Rep {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n}\n";
+        roundtrip(no_follows);
+        let (p2, d2) = parser::parse(no_follows);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains("follows"), "an agent with no follows clause must not gain one: {formatted2:?}");
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-

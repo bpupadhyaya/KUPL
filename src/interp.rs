@@ -195,7 +195,9 @@ impl ProgramDb {
                 Item::Contract(ct) => {
                     contracts.insert(ct.name.clone(), Rc::new(ct.clone()));
                 }
-                Item::Type(_) | Item::Law(_) => {}
+                // `protocol` is a purely static (checker-time) construct --
+                // no runtime data to store, matching `Item::Type`/`Item::Law`.
+                Item::Type(_) | Item::Law(_) | Item::Protocol(_) => {}
             }
         }
         let ctors = checked
