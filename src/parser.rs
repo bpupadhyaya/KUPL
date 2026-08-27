@@ -402,7 +402,7 @@ impl Parser {
             let start = self.span();
             self.bump();
             let is_app = matches!(self.peek(), Tok::KwApp);
-            return Ok(Some(Item::Component(self.parse_component(is_app, true, start)?)));
+            return Ok(Some(Item::Component(self.parse_component(is_app, true, false, start)?)));
         }
         // top-level `law "name" { … }` — a free-standing test (soft keyword)
         if matches!(self.peek(), Tok::Ident(n) if n == "law") {
@@ -427,11 +427,15 @@ impl Parser {
             Tok::KwType => Ok(Some(Item::Type(self.parse_type_decl()?))),
             Tok::KwComponent => {
                 let start = self.span();
-                Ok(Some(Item::Component(self.parse_component(false, false, start)?)))
+                Ok(Some(Item::Component(self.parse_component(false, false, false, start)?)))
             }
             Tok::KwApp => {
                 let start = self.span();
-                Ok(Some(Item::Component(self.parse_component(true, false, start)?)))
+                Ok(Some(Item::Component(self.parse_component(true, false, false, start)?)))
+            }
+            Tok::KwAgent => {
+                let start = self.span();
+                Ok(Some(Item::Component(self.parse_component(false, false, true, start)?)))
             }
             Tok::KwContract => Ok(Some(Item::Contract(self.parse_contract()?))),
             Tok::KwUse => {
@@ -458,9 +462,9 @@ impl Parser {
             other => Err(Diag::error(
                 "K0103",
                 format!(
-                    "unexpected {} at the top level (expected `fun`, `type`, `component`, `app`){}",
+                    "unexpected {} at the top level (expected `fun`, `type`, `component`, `app`, `agent`){}",
                     other.describe(),
-                    keyword_suggestion(other, &["fun", "type", "component", "app", "contract", "use", "module"])
+                    keyword_suggestion(other, &["fun", "type", "component", "app", "agent", "contract", "use", "module"])
                 ),
                 self.span(),
             )),
@@ -875,8 +879,8 @@ impl Parser {
 
     // ---- components -----------------------------------------------------
 
-    fn parse_component(&mut self, is_app: bool, concurrent: bool, start: Span) -> PResult<ComponentDecl> {
-        self.bump(); // `component` or `app`
+    fn parse_component(&mut self, is_app: bool, concurrent: bool, is_agent: bool, start: Span) -> PResult<ComponentDecl> {
+        self.bump(); // `component`, `app`, or `agent`
         let (name, _) = self.expect_ident()?;
         let mut fulfills = Vec::new();
         if matches!(self.peek(), Tok::Ident(n) if n == "fulfills") {
@@ -893,7 +897,9 @@ impl Parser {
         let mut c = ComponentDecl {
             name,
             is_app,
-            concurrent,
+            concurrent: concurrent || is_agent,
+            is_agent,
+            weight: None,
             fulfills,
             intent: None,
             ports: Vec::new(),
@@ -951,6 +957,29 @@ impl Parser {
                         ))
                     }
                 }
+                self.expect_terminator()
+            }
+            // `weight <lightweight|heavyweight|distributed>` (`agent`-only,
+            // `docs/design/AGENTS.md` §4) -- a contextual keyword, like
+            // `state` below, valid only in member position; K0317 rejects
+            // it on a plain `component`/`concurrent component` (checker,
+            // not here -- the parser accepts the SHAPE uniformly).
+            Tok::Ident(s) if s == "weight" => {
+                self.bump();
+                let (w, wspan) = self.expect_ident()?;
+                let weight = match w.as_str() {
+                    "lightweight" => AgentWeight::Lightweight,
+                    "heavyweight" => AgentWeight::Heavyweight,
+                    "distributed" => AgentWeight::Distributed,
+                    _ => {
+                        return Err(Diag::error(
+                            "K0125",
+                            format!("`weight` expects `lightweight`, `heavyweight`, or `distributed`, found `{w}`"),
+                            wspan,
+                        ))
+                    }
+                };
+                c.weight = Some(weight);
                 self.expect_terminator()
             }
             // `in`/`out` port declarations. `out` is a contextual keyword (a plain

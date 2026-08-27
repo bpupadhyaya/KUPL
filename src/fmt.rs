@@ -345,10 +345,19 @@ fn fmt_contract(out: &mut String, ct: &ContractDecl) {
 }
 
 fn fmt_component(out: &mut String, c: &ComponentDecl) {
-    if c.concurrent {
-        out.push_str("concurrent ");
+    if c.is_agent {
+        // `agent` implies `concurrent` implicitly (`ast.rs::ComponentDecl::
+        // is_agent`'s own doc comment) -- never render a redundant
+        // `concurrent agent` (which also isn't valid input syntax at all,
+        // `parser.rs`'s own `concurrent` soft-keyword only recognizes
+        // `component`/`app` immediately after it).
+        out.push_str("agent ");
+    } else {
+        if c.concurrent {
+            out.push_str("concurrent ");
+        }
+        out.push_str(if c.is_app { "app " } else { "component " });
     }
-    out.push_str(if c.is_app { "app " } else { "component " });
     out.push_str(&c.name);
     if !c.fulfills.is_empty() {
         out.push_str(&format!(" fulfills {}", c.fulfills.join(", ")));
@@ -368,6 +377,16 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         sep(out, true);
         indent(out, 1);
         out.push_str(&format!("intent \"{}\"\n", escape_str(intent)));
+    }
+    if let Some(w) = c.weight {
+        sep(out, true);
+        indent(out, 1);
+        let w = match w {
+            AgentWeight::Lightweight => "lightweight",
+            AgentWeight::Heavyweight => "heavyweight",
+            AgentWeight::Distributed => "distributed",
+        };
+        out.push_str(&format!("weight {w}\n"));
     }
     sep(out, !c.props.is_empty());
     for p in &c.props {
@@ -1136,6 +1155,34 @@ mod tests {
         assert!(d2.is_empty(), "{d2:?}");
         let formatted2 = super::format_program(&p2);
         assert!(!formatted2.contains("timeout"), "an ordinary call with no timeout clause must not gain one: {formatted2:?}");
+    }
+
+    /// KUPL Agents (`docs/design/AGENTS.md`): `agent Foo { weight <w> .. }`
+    /// must round-trip losslessly -- the `agent` keyword itself (NOT
+    /// rendered as `concurrent component`/`concurrent agent`, even though
+    /// `is_agent` implies `concurrent: true` internally) and the `weight`
+    /// clause both checked explicitly, not just via idempotence.
+    #[test]
+    fn fmt_preserves_agent_keyword_and_weight_clause() {
+        let src = "agent Rep {\n    intent \"a\"\n    weight heavyweight\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(formatted.starts_with("agent Rep {"), "must render as `agent`, not `concurrent component`/`concurrent agent`: {formatted:?}");
+        assert!(!formatted.contains("concurrent"), "the implicit `concurrent` must never be rendered explicitly for an agent: {formatted:?}");
+        assert!(formatted.contains("weight heavyweight"), "the `weight` clause must survive formatting: {formatted:?}");
+
+        // An agent with NO `weight` clause (defaults to lightweight) must
+        // not gain one.
+        let no_weight = "agent Rep {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                          app Main {\n    intent \"m\"\n}\n";
+        roundtrip(no_weight);
+        let (p2, d2) = parser::parse(no_weight);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains("weight"), "an agent with no weight clause must not gain one: {formatted2:?}");
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-

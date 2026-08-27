@@ -2055,9 +2055,25 @@ impl Checker {
     ///    `is_portable_ty` below.
     fn check_concurrent_component(&mut self, c: &ComponentDecl) {
         if c.is_app {
+            let what = if c.is_agent { "an `agent`" } else { "a `concurrent` component" };
             self.err(
                 "K0305",
-                "a `concurrent` component cannot also be the root `app` — the coordinator thread already runs the app-level instance directly".to_string(),
+                format!(
+                    "{what} cannot also be the root `app` — the coordinator thread already runs the app-level instance directly"
+                ),
+                c.span,
+            );
+        }
+        // `docs/design/AGENTS.md` §4: `weight` picks which of KUPL's
+        // existing concurrency tiers backs an `agent` -- `distributed`
+        // parses (mirrors K0309's own "syntax now, real transport later"
+        // precedent for `at node(...)`) but has no real transport yet, so
+        // it's rejected here rather than silently falling back to a
+        // different tier than the one written.
+        if c.weight == Some(AgentWeight::Distributed) {
+            self.err(
+                "K0316",
+                "`weight distributed` is not yet supported by any KUPL runtime -- see docs/design/DISTRIBUTION.md for the design and current status".to_string(),
                 c.span,
             );
         }
@@ -2543,6 +2559,19 @@ impl Checker {
 
     fn check_component(&mut self, c: &ComponentDecl) {
         self.check_fulfills(c);
+        // `docs/design/AGENTS.md` §4: `weight` is `agent`-only -- the
+        // parser accepts the SHAPE on any `component`/`concurrent
+        // component` too (a single, uniform grammar rule, matching this
+        // codebase's own "parser accepts broadly, checker narrows"
+        // convention used throughout), so this check is unconditional,
+        // not gated behind `c.concurrent`.
+        if c.weight.is_some() && !c.is_agent {
+            self.err(
+                "K0317",
+                "`weight` is only valid on an `agent` -- a plain `component`/`concurrent component` always uses the pooled (lightweight) tier".to_string(),
+                c.span,
+            );
+        }
         if c.concurrent {
             self.check_concurrent_component(c);
         }
@@ -6603,6 +6632,51 @@ mod generic_tests {
                     on start { let r = c.f() timeout 0s\n        print(\"{r}\") }\n}\n";
         let errs = errors(src);
         assert!(errs.iter().any(|d| d.code == "K0314"), "a zero-duration timeout must be K0314: {errs:?}");
+    }
+
+    /// KUPL Agents (`docs/design/AGENTS.md`): a well-formed `agent` with a
+    /// `weight` clause must check completely clean, on all three
+    /// currently-legal weight values (`distributed` is checker-rejected
+    /// separately, K0316).
+    #[test]
+    fn well_formed_agent_checks_clean() {
+        for weight in ["lightweight", "heavyweight"] {
+            let src = format!(
+                "agent Rep {{\n    intent \"a\"\n    weight {weight}\n    expose fun f() -> Int {{ 1 }}\n}}\n\
+                 app Main {{\n    intent \"m\"\n}}\n"
+            );
+            let errs = errors(&src);
+            assert!(errs.is_empty(), "a well-formed `agent Rep {{ weight {weight} }}` must check clean: {errs:?}");
+        }
+        // `weight` omitted entirely (defaults to lightweight) must ALSO be clean.
+        let src = "agent Rep {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.is_empty(), "an agent with no `weight` clause must check clean: {errs:?}");
+    }
+
+    /// K0316: `weight distributed` parses but has no real transport yet.
+    #[test]
+    fn weight_distributed_is_k0316() {
+        let src = "agent Rep {\n    intent \"a\"\n    weight distributed\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K0316"), "`weight distributed` must be K0316: {errs:?}");
+    }
+
+    /// K0317: `weight` is agent-only -- rejected on a plain `component`
+    /// AND on a `concurrent component`.
+    #[test]
+    fn weight_on_a_non_agent_is_k0317() {
+        let plain = "component P {\n    intent \"p\"\n    weight lightweight\n}\n\
+                      app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(plain);
+        assert!(errs.iter().any(|d| d.code == "K0317"), "`weight` on a plain component must be K0317: {errs:?}");
+
+        let concurrent = "concurrent component C {\n    intent \"c\"\n    weight lightweight\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n}\n";
+        let errs2 = errors(concurrent);
+        assert!(errs2.iter().any(|d| d.code == "K0317"), "`weight` on a concurrent component must be K0317: {errs2:?}");
     }
 
     /// Production-hardening 1214: a REAL, live-confirmed bug found+fixed --

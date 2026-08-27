@@ -129,6 +129,24 @@ pub struct ComponentDecl {
     /// `state`/`out`'s own contextual-keyword precedent (token.rs) rather
     /// than a globally reserved word.
     pub concurrent: bool,
+    /// `agent Foo { .. }` (`docs/design/AGENTS.md`) — `true` for an
+    /// `agent` declaration (a hard keyword, `parser.rs`'s own `KwAgent`),
+    /// always implies `concurrent: true` (an agent is inherently its own
+    /// actor -- there is no "sequential agent"). Kept as a SEPARATE flag
+    /// from `concurrent` (rather than folding agents into plain
+    /// `concurrent component`s) so diagnostics/tooling can distinguish
+    /// "this is an agent" from "this is a concurrent component," and so
+    /// future agent-only fields (`weight` below, later `protocol`/
+    /// `follows`) have an unambiguous place to attach without touching
+    /// every existing `concurrent component` construction site.
+    pub is_agent: bool,
+    /// `agent`-only: `weight <lightweight|heavyweight|distributed>` picks
+    /// which of KUPL's existing concurrency tiers backs this agent (see
+    /// `docs/design/AGENTS.md` §4's own mapping table). `None` (the
+    /// default, and the only legal value for a plain `concurrent
+    /// component`) means `Lightweight`. Always `None` when `is_agent` is
+    /// `false`.
+    pub weight: Option<AgentWeight>,
     pub fulfills: Vec<String>,
     pub intent: Option<String>,
     pub ports: Vec<Port>,
@@ -142,6 +160,25 @@ pub struct ComponentDecl {
     pub funs: Vec<FunDecl>,
     pub examples: Vec<Example>,
     pub span: Span,
+}
+
+/// `docs/design/AGENTS.md` §4's own table: which existing KUPL
+/// concurrency tier backs an `agent`. `Distributed` parses (K0316
+/// rejects it at check time, mirroring K0309's own "distributed
+/// placement parses but isn't implemented yet" precedent) -- real
+/// transport doesn't exist yet, see `docs/design/DISTRIBUTION.md`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentWeight {
+    /// Go-goroutine-style: multiplexed onto a shared `ActorPool` worker
+    /// thread (`interp.rs::ActorRoute::Pooled`) -- the default.
+    Lightweight,
+    /// Java-thread-style: a dedicated, always-resident OS thread
+    /// (`interp.rs::ActorRoute::Dedicated`), even at the top level (not
+    /// just the pre-existing nested-spawn fallback case).
+    Heavyweight,
+    /// Erlang-distribution-style: a remote node. Not yet implemented --
+    /// see `docs/design/DISTRIBUTION.md`'s own Phase 6+ note.
+    Distributed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

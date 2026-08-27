@@ -2150,7 +2150,16 @@ impl Interp {
         // own command loop) -- see `ActorPool`'s own doc comment for the
         // full reasoning. Falls back to the pre-existing dedicated-thread
         // path below, UNCHANGED, for a nested spawn.
-        let route = if POOL_WORKER_ID.with(|c| c.get()).is_none() {
+        //
+        // `docs/design/AGENTS.md` §4: `weight heavyweight` FORCES the
+        // dedicated-thread path even at the top level (not just the
+        // pre-existing nested-spawn case) -- an agent's own explicit
+        // weight choice always wins over the pooled default. `weight
+        // lightweight`/unset both mean "use the ordinary pooled-unless-
+        // nested logic," i.e. no behavior change for anything that isn't
+        // `weight heavyweight`.
+        let force_dedicated = matches!(comp.weight, Some(AgentWeight::Heavyweight));
+        let route = if POOL_WORKER_ID.with(|c| c.get()).is_none() && !force_dedicated {
             let worker_tx = ActorPool::get().assign();
             let (local_id_tx, local_id_rx) = std::sync::mpsc::channel::<usize>();
             worker_tx

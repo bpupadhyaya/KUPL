@@ -3653,6 +3653,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// KUPL Agents v1 (`docs/design/AGENTS.md` §4/§7): `agent` + `weight`
+    /// dispatch onto the two currently-implemented concurrency tiers
+    /// (`weight distributed` is checker-rejected, K0316, separately).
+    /// Runs the SAME functional scenario (state accumulates correctly
+    /// across two calls) under `weight lightweight` (pooled, the
+    /// default) and `weight heavyweight` (forced dedicated thread, even
+    /// though this is a top-level, non-nested spawn -- ordinarily only
+    /// pooled) -- proving BOTH weight classes route through their own
+    /// distinct, already-proven `ActorRoute` variant and still produce
+    /// identical, correct results. Also confirms VM/native compile an
+    /// `agent` exactly like an ordinary `concurrent component` (no
+    /// special-casing needed, matching `ASYNC.md` §8.8's own existing
+    /// claim for `concurrent` -- `is_agent`/`weight` are new AST fields
+    /// compile.rs/cgen.rs never read at all).
+    #[test]
+    fn agent_weight_lightweight_and_heavyweight_both_produce_correct_results_on_every_engine() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-agent-weight-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let expected = "handled: ticket-1 (total 1)\nhandled: ticket-2 (total 2)\n";
+
+        for weight in ["lightweight", "heavyweight"] {
+            let file = dir.join(format!("agent_{weight}.kupl"));
+            std::fs::write(
+                &file,
+                format!(
+                    "agent SupportRep {{\n    intent \"handles customer tickets like a human support rep\"\n    \
+                         weight {weight}\n    state handled: Int = 0\n    \
+                         expose fun handle(ticket: Str) -> Str {{\n        handled = handled + 1\n        \
+                         \"handled: {{ticket}} (total {{handled}})\"\n    }}\n}}\n\
+                     app Main {{\n    intent \"agent weight test\"\n    let rep = SupportRep()\n    \
+                         on start {{\n        print(rep.handle(\"ticket-1\"))\n        print(rep.handle(\"ticket-2\"))\n    }}\n}}\n"
+                ),
+            )
+            .unwrap();
+
+            for _ in 0..10 {
+                let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+                assert_eq!(out.status.code(), Some(0), "weight {weight}: {out:?}");
+                assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "weight {weight}: {out:?}");
+            }
+
+            let vm_out =
+                std::process::Command::new(&bin).args(["run", "--vm", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(vm_out.status.code(), Some(0), "weight {weight} (vm): {vm_out:?}");
+            assert_eq!(String::from_utf8_lossy(&vm_out.stdout), expected, "weight {weight} (vm): {vm_out:?}");
+
+            let native_bin = dir.join(format!("agent_{weight}_native"));
+            let build = std::process::Command::new(&bin)
+                .args(["native", file.to_str().unwrap(), "-o", native_bin.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert_eq!(build.status.code(), Some(0), "weight {weight} (native build): {build:?}");
+            let native_out = std::process::Command::new(&native_bin).output().unwrap();
+            assert_eq!(native_out.status.code(), Some(0), "weight {weight} (native): {native_out:?}");
+            assert_eq!(String::from_utf8_lossy(&native_out.stdout), expected, "weight {weight} (native): {native_out:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live, end-to-end verification of `docs/design/ASYNC.md` §8.10 step
     /// 5 (blocking `Call` messages): the coordinator calls a `concurrent`
     /// instance's own `expose fun` synchronously, twice in a row, checking

@@ -47,6 +47,14 @@ pub enum Tok {
     // PR-it656).
     KwComponent,
     KwApp,
+    /// `agent Foo { .. }` (`docs/design/AGENTS.md`) — a higher-level unit
+    /// than `concurrent component`: always concurrent (its own actor), a
+    /// declared `weight` (lightweight/heavyweight/distributed) picking
+    /// which of KUPL's existing concurrency tiers backs it. A hard
+    /// keyword (like `component`/`app`), not a soft one like `concurrent`
+    /// -- `agent` is a genuinely new top-level declaration kind, not a
+    /// modifier on an existing one.
+    KwAgent,
     KwContract,
     KwType,
     KwFun,
@@ -146,6 +154,7 @@ pub fn keyword(s: &str) -> Option<Tok> {
     Some(match s {
         "component" => Tok::KwComponent,
         "app" => Tok::KwApp,
+        "agent" => Tok::KwAgent,
         "contract" => Tok::KwContract,
         "type" => Tok::KwType,
         "fun" => Tok::KwFun,
@@ -247,6 +256,7 @@ impl Tok {
         match self {
             Tok::KwComponent => "component",
             Tok::KwApp => "app",
+            Tok::KwAgent => "agent",
             Tok::KwContract => "contract",
             Tok::KwType => "type",
             Tok::KwFun => "fun",

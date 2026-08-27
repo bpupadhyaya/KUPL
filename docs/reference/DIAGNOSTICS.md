@@ -53,6 +53,7 @@ Severity: **E** = error, **W** = warning.
 | K0122 | E | malformed `supervise ... restart on_failure max <n> in <duration>` restart-intensity clause |
 | K0123 | E | unsupported generic bound (only `[T: Ord]` is currently supported) |
 | K0124 | E | a restart strategy (`one_for_all`/`rest_for_one`) only applies to `restart on_failure`, not `restart never` |
+| K0125 | E | `weight` expects `lightweight`, `heavyweight`, or `distributed` |
 
 ## K02xx — Type & semantic checker
 
@@ -169,6 +170,8 @@ Severity: **E** = error, **W** = warning.
 | K0312 | E | `receive { .. }` used outside a `concurrent component`'s own handler/exposed-fun body |
 | K0313 | E | `<call> timeout <duration>` (`docs/design/ASYNC.md`) wraps a call whose receiver is not a `concurrent` component — the call can never actually block long enough to time out |
 | K0314 | E | `timeout <duration>` — duration must be positive |
+| K0316 | E | `weight distributed` (`docs/design/AGENTS.md`) — the syntax parses but no KUPL runtime supports real distributed transport yet |
+| K0317 | E | `weight` is only valid on an `agent`, not a plain `component`/`concurrent component` |
 
 ## K04xx — Loader (multi-file)
 

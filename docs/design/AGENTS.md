@@ -1,10 +1,13 @@
 # KUPL Agents
 
 Proposal v0.1 — 2026-08-26.
-Status: PROPOSAL — **documented now, detailed design and implementation later.**
-This file exists to capture the concept precisely enough that a fresh session,
-on any machine, can pick up detailed design and implementation without needing
-the conversation that produced it.
+Status: **§4's own weight-class slice (`agent` + `weight lightweight/
+heavyweight/distributed`) is IMPLEMENTED** — see §4's own updated note
+below for the exact mechanism and diagnostics (K0125/K0316/K0317).
+§3 (`protocol`/`follows`) remains PROPOSAL — designed, not yet built. This
+file exists to capture the concept precisely enough that a fresh session,
+on any machine, can pick up detailed design and implementation without
+needing the conversation that produced it.
 
 **Why this doc exists:** the user's own framing (verbatim, lightly trimmed):
 
@@ -168,15 +171,37 @@ directly:
 This table is the single most important insight this proposal makes: **an
 `agent` is not a fourth concurrency primitive that needs its own runtime.**
 It is a NAMING and DEFAULTS layer over the three concurrency tiers this
-codebase already has (two fully built — lightweight/heavyweight — one
-syntax-scaffolded and explicitly deferred — distributed). Implementing
-`agent`'s weight-class dispatch should mostly be: parse the keyword, and at
-construction time, route to whichever of the THREE ALREADY-EXISTING spawn
-paths (`instantiate_concurrent`'s own `ActorRoute` choice, or a future
-`at node(...)` real-transport path once Phase 6+ lands) the weight class
-names. Real new engineering work is concentrated in §3 (protocols) and the
-agent-level orchestration surface (§5), not in re-deriving concurrency
-primitives that already exist.
+codebase already has. The prediction held: implementing this slice was
+almost entirely parse-the-keyword-and-route, confirmed by the actual
+implementation (KUPL commit history, 2026-08-26):
+
+- **Grammar**: `agent Foo { .. }` is a new hard keyword (`token.rs::
+  KwAgent`, parsed by the SAME `parse_component` function `component`/
+  `app` already share, extended with an `is_agent: bool` parameter) —
+  reusing `ast::ComponentDecl` wholesale (`is_agent: bool` + `weight:
+  Option<AgentWeight>` fields added, mirroring the EXISTING `is_app: bool`
+  precedent) rather than a new AST node, so an agent gets ports/state/
+  handlers/exposed-funs/children/supervision for free, identical to a
+  `concurrent component`. `is_agent` always forces `concurrent: true` at
+  parse time (an agent IS inherently its own actor). A `weight <value>`
+  clause is a new contextual keyword inside the body (`parser.rs`, same
+  style as `state`), agent-only (K0317), with `distributed` parsing but
+  checker-rejected (K0316, mirroring K0309's own precedent exactly) since
+  real transport doesn't exist yet.
+- **Runtime**: `interp.rs::instantiate_concurrent` gained ONE new
+  condition — `weight heavyweight` forces the dedicated-thread path
+  (`ActorRoute::Dedicated`) even at the TOP level (not just the pre-
+  existing nested-spawn case); `lightweight`/unset are a complete no-op,
+  identical to `concurrent component`'s existing pooled-by-default
+  behavior. No new `ActorRoute` variant, no new dispatch machinery.
+- **VM/native**: needed ZERO changes — `compile.rs`/`cgen.rs` never read
+  `is_agent`/`weight` at all, confirmed live (`kupl run --vm`/`kupl
+  native` both execute an `agent` exactly like an ordinary `concurrent
+  component`, byte-identical output).
+
+Real new engineering work remains concentrated in §3 (protocols, NOT YET
+implemented) and the agent-level orchestration surface (§5, largely
+unaddressed) — not in concurrency mechanics, exactly as predicted.
 
 ## 5. What "simulate/emulate/represent a human" should mean, concretely
 
@@ -230,15 +255,28 @@ specific answer yet, only to naming the axes:
 
 ## 7. Sequencing
 
-- **Now (this doc):** capture the concept, the "agent is a naming/defaults
-  layer over three ALREADY-BUILT concurrency tiers" insight, and the open
-  questions — documentation only, no parser/checker/interp changes.
-- **Next (a future session/pass):** resolve §6's open questions into a
-  committed grammar, likely starting with the narrowest useful slice
-  (probably: `agent` + `weight` dispatch onto the three existing spawn
-  paths, with `protocol`/`follows` deferred to a SECOND slice — mirroring
-  this session's own repeated "syntax now, harder semantics later,
-  documented not silently promised" pattern used for distribution
-  placement, selective receive, and call timeout).
-- **Not started:** any parser, checker, or interp.rs implementation for
-  `agent`/`protocol`/`weight`/`follows`.
+- **DONE:** `agent` + `weight lightweight/heavyweight/distributed` dispatch
+  onto the three existing spawn paths (§4's own updated section has the
+  full mechanism). Verified: `kupl check`/`kupl run`/`kupl run --vm`/
+  `kupl native` all agree; a real end-to-end test proves BOTH
+  `lightweight` and `heavyweight` produce correct results on every
+  engine; K0125 (malformed `weight` value)/K0316 (`distributed` not
+  implemented)/K0317 (`weight` is agent-only) diagnostics; `kupl fmt`
+  round-trips `agent`/`weight` losslessly; full `cargo test --bin kupl`
+  (90/90) and `cargo test --lib` (1790/1790, green twice); revert-and-
+  verify on both the checker restriction and the interp.rs dispatch.
+- **NOT STARTED:** §3 (`protocol`/`follows`) — the genuinely harder half
+  of this proposal (rule composition/conflict, structural vs. behavioral
+  enforcement, integration with the effect/capability system). §5's
+  open questions (identity/persistence, judgment-vs-determinism,
+  "infinite agents" bounding) also remain fully open.
+- **Recommended next slice:** `protocol` as a NEW top-level declaration
+  (parallel to `contract`), `follows <protocol>, ...` as an `agent`-only
+  clause (mirroring `weight`'s own soft-keyword-inside-body precedent).
+  Start with STRUCTURAL rules only (checker-level, extending the
+  existing effect/capability system, e.g. "an agent following protocol P
+  may not call capability root X directly") — defer behavioral/runtime-
+  checked rules (needing a NEW execution hook, closer to `expect`/`law`
+  but attached to the protocol rather than one call site) to a THIRD
+  slice, matching this whole initiative's own repeated "ship the
+  provably-scoped piece first" discipline.
