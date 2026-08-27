@@ -404,13 +404,30 @@ specific answer yet, only to naming the axes:
   storage, out of scope for THIS language-level proposal but worth flagging
   as a real gap (KUPL has no persistence/database layer today, per
   `docs/GAPS.md`'s own existing assessment).
-- **Judgment vs. determinism**: `ai fun` is already non-deterministic
-  (a live LLM call) — an agent leaning on it inherits that. Should `agent`
-  bodies be ALLOWED to mix pure/deterministic exposed funs with `ai fun`
-  judgment calls freely (as sketched in §3's `SupportRep` example), or
-  should there be a way to mark parts of an agent as required-deterministic
-  (auditable, replayable) vs. judgment-based (not)? Real products built on
-  agents often need this distinction for compliance/debugging reasons.
+- **Judgment vs. determinism — PARTIALLY ANSWERED by existing machinery,
+  2026-08-27**: `ai fun` is already non-deterministic (a live LLM call) —
+  an agent leaning on it inherits that. The distinction this axis asks
+  for ("mark parts of an agent as required-deterministic vs. judgment-
+  based") turns out to ALREADY EXIST, for free, in KUPL's own effect
+  system — confirmed by reading `effects.rs` directly: an `ai fun`
+  performs the `ai` EFFECT (`info.decl.ai.is_some()` inserts `"ai"` into
+  its own direct effect set), which propagates transitively through the
+  SAME `infer_effects` fixpoint every other effect uses, and is enforced
+  by the SAME K0301 boundary-explicitness rule (`must_declare` funs —
+  `pub`/`expose` — are REJECTED if they transitively reach an effect they
+  don't declare). Consequence: an agent's own `expose fun` that does NOT
+  declare `uses ai` is ALREADY statically GUARANTEED, by machinery this
+  whole initiative never had to build, to be free of any AI judgment call
+  anywhere in its transitive call graph — auditable/replayable by
+  construction, no new language feature needed. What remains genuinely
+  OPEN: this is a per-FUNCTION distinction, not a per-agent one (an agent
+  can freely mix `uses ai` and non-`uses ai` exposed funs, exactly as
+  §3's own `SupportRep` sketch already does) — whether a coarser,
+  agent-level "this agent is fully deterministic" declaration has
+  independent value (e.g. for a checker-enforced compliance guarantee
+  stronger than "each fun individually declares its own effects
+  correctly") is still unresolved, but is now a strictly SMALLER
+  question than the one originally posed.
 - **"Infinite agents"**: does this mean elastic, demand-driven spawning (an
   agent POOL that grows/shrinks, closer to how `lightweight` already
   multiplexes), or literally unbounded concurrent instances (which the
