@@ -1,18 +1,18 @@
 # KUPL Agents
 
 Proposal v0.1 — 2026-08-26.
-Status: **§4's own weight-class slice (`agent` + `weight lightweight/
-heavyweight/distributed`) is IMPLEMENTED** — see §4's own updated note
-below for the exact mechanism and diagnostics (K0125/K0316/K0317).
-**§3's structural slice (`protocol` + `agent ... follows Protocol` +
-`forbids <effect>`) is now ALSO IMPLEMENTED** — see §3's own updated note
-below for the exact mechanism and diagnostics (K1000-K1003). Behavioral/
-runtime-checked protocol rules (§3's own second enforcement model) remain
-a deferred THIRD slice — **NOT yet built, but its own design is now
-RESOLVED** (`guard`/`guards`, mirroring `contract`'s own `law`-against-
-`sigs` pattern — see §3's "Behavioral rules: the design that unblocks
-them"), narrowing the remaining work to one well-scoped, correctness-
-critical AST rewrite pass. This file exists to capture the concept
+Status: **All three originally-scoped slices are now IMPLEMENTED.** §4's
+weight-class slice (`agent` + `weight lightweight/heavyweight/
+distributed`) — see §4's own updated note (K0125/K0316/K0317). §3's
+structural slice (`protocol` + `agent ... follows Protocol` + `forbids
+<effect>`) — see §3's own updated note (K1000/K1001/K1002/K1003). §3's
+behavioral slice (`guard Name: Type { .. }` + `guards Name`, desugared to
+plain `expect` checks with zero new interp/vm/cgen work) — see §3's own
+"Behavioral rules: `guard`/`guards`" section (K1004/K1005). Remaining
+open work is §5's own open questions (agent identity/persistence,
+judgment-vs-determinism, "infinite agents" bounding) and the
+deliberately-deferred multi-protocol composition/conflict question — see
+§7's own updated Sequencing note. This file exists to capture the concept
 precisely enough that a fresh session, on any machine, can pick up
 detailed design and implementation without needing the conversation that
 produced it.
@@ -155,7 +155,7 @@ either/or:**
   previously-blocking DESIGN QUESTION is now RESOLVED (2026-08-26) — see
   "Behavioral rules: the design that unblocks them" below.
 
-### Behavioral rules: the design that unblocks them (design RESOLVED, 2026-08-26 — not yet implemented)
+### Behavioral rules: `guard`/`guards` (IMPLEMENTED, 2026-08-27)
 
 The blocker, stated precisely: KUPL is statically typed, and a behavioral
 rule needs to reference the VALUE it's constraining (e.g. `result <
@@ -190,62 +190,98 @@ agent Rep follows SpendingLimit {
 }
 ```
 
-- `guard Name: Type { <block> }` inside `protocol` — mirrors `law "..." {
-  <block> }` inside `contract` exactly, except the block's scope binds
-  `result: Type` (a name+type FIXED by the protocol itself, resolved once,
-  the same way `check_contract` already binds a contract's own `sigs`
-  names into a law body's scope) instead of the contract's method names.
-  Reuses `expect` for the actual check — already a general, working,
-  cross-engine runtime assertion (`Stmt::Expect`, PANICS on `false`,
-  compiles identically on interp/VM/native via `compile.rs`'s shared
-  `Op::JumpIfTrue`+`Op::Panic` lowering — confirmed by reading `compile.rs`
-  directly, not assumed).
-- `guards Name` — a new clause on an `expose fun` inside an `agent`,
-  explicit OPT-IN (a protocol's guard does NOT implicitly apply to every
-  exposed fun — deliberately, so an unrelated method like `greet(name:
-  Str) -> Str` on an agent following `SpendingLimit` is untouched).
-  Checker validates: `Name` is a guard on one of the agent's own
-  `follows`ed protocols (new K10xx, "did you mean" mirroring K1001's own
-  precedent), and the fun's OWN return type matches the guard's declared
-  `Type` exactly (new K10xx, a real type-mismatch class distinct from
-  ordinary K0200 since it's cross-referencing a protocol's own
-  declaration).
+- **Grammar**: `guard Name: Type { <block> }` inside `protocol` (parser.rs::
+  parse_protocol, mirroring `law "..." { <block> }` inside `contract`
+  exactly except the name is a bare identifier, referenceable from
+  `guards`). `guards Name1, Name2` — a soft-keyword clause on ANY `fun`
+  (parsed in `parse_fun`, right before the body, the same position as
+  `ai fun`'s own `tools [..]` clause) — parser-accepts-broadly, mirroring
+  `weight`/`follows`'s own precedent.
+- **Checker/resolution (`src/guards.rs`, a NEW pre-check pass)**:
+  `desugar_guards` runs from the SAME pipeline position as `callargs::
+  resolve_call_args` (`run::compile`, the loader-check path, and
+  `loader.rs`'s own multi-file merge — all three call sites), BEFORE
+  `check::check`. It resolves each `guards Name` reference against the
+  union of every guard declared by the agent's own `follows`ed protocols:
+  K1004 if `guards` appears anywhere other than an `agent`'s own `expose
+  fun` (a top-level `fun`, a component's private `fun`, or a plain
+  component's `expose fun`), K1005 if the name doesn't resolve (with a
+  `did you mean` suggestion, mirroring K1001's precedent). A genuine
+  return-type mismatch is deliberately NOT its own diagnostic code — it
+  surfaces as an ordinary K0200 pointing at the rewritten code's own
+  explicit `let result: Type = ...` annotation (see below), since the
+  rewrite makes the fun's actual return type and the guard's declared
+  type meet at a concrete, ordinarily-type-checked expression.
 - **Enforcement, avoiding new per-engine runtime work entirely**: rather
   than a new interp.rs/vm.rs/cgen.rs hook (which would need each engine to
   intercept a function's own return value, correctly handling early
-  `return` — a real hazard: naively wrapping just the tail expression
-  silently skips a `return expr` earlier in the body), desugar a `guards
-  Name` fun ONCE, at parse/resolve time, into an ordinary KUPL function
-  whose EVERY syntactic exit point (implicit tail expression AND every
-  `return expr`, walked recursively through nested `if`/`match`/loop
-  blocks, NOT through nested closures/inner funs, which have their own
-  separate return scope) is rewritten to `{ let __guard_result = <exit
-  value>; <guard's own block, with `result` renamed to `__guard_result`>;
-  __guard_result }` (for a `return`, `return { let __guard_result = ...;
-  ...; __guard_result }`). Because this happens at the AST level BEFORE
-  any engine sees the program, and because `expect` already compiles
-  identically on all four engines (confirmed above), this needs ZERO new
-  runtime engine code — the exact same "reuse existing machinery instead
-  of inventing a fourth" discipline `receive`/selective-receive and
-  `weight` both already demonstrated this session.
-- **Still genuinely open** (deliberately not resolved by this design,
-  left for whoever implements it): the AST-rewrite pass itself (finding
-  every exit point correctly, including inside `match` arms and nested
-  blocks) is the single largest new piece of engineering this needs — a
-  real, non-trivial correctness surface (getting an exit-point walk WRONG
-  silently under-enforces a safety rule, which is worse than not having
-  the feature at all) that deserves the SAME "snapshot, disable, confirm
-  the predicted live failure, restore, `cmp` byte-identical" rigor this
-  whole session has applied to everything else, PLUS a dedicated fuzzing-
-  style sweep across every KUPL control-flow construct (`if`/`match`/
-  `while`/`for`/`loop`/nested blocks) to build confidence no exit point is
-  silently missed — not something to rush in the same sitting as the
-  design write-up itself.
+  `return`), `desugar_guards` rewrites a `guards`-bearing fun's body ONCE,
+  at the AST level, before type-checking: every syntactic exit point
+  (the implicit tail expression, and every `return`, walked recursively
+  through `if`/`match`/`while`/`for`/`receive`/nested blocks — NOT
+  through `Lambda` bodies, which have their own separate return-catching
+  boundary, `interp.rs::call_value`'s `Closure` branch, confirmed by
+  reading it directly) becomes `{ let __guard_result = <exit value>; let
+  result: Type = __guard_result; <guard's own body statements, spliced in
+  verbatim>; __guard_result }` (chained once per applicable guard, for
+  `guards A, B`). `result` binding via an ordinary `let` (not textual
+  renaming) means the guard's own body needs no AST rewriting of its own
+  — it's spliced in unchanged. Because this happens BEFORE any engine
+  sees the program, and `expect` already compiles identically on all four
+  engines (confirmed by reading `compile.rs`'s shared `Op::JumpIfTrue`+
+  `Op::Panic` lowering directly), this needed ZERO new runtime engine
+  code — `kupl fmt`/the LSP never see the desugared form at all, since
+  the pass runs only from the compile/check pipeline, never from bare
+  `parser::parse`.
+- **A REAL, pre-existing, UNRELATED bug found+fixed along the way**: the
+  exhaustive control-flow test sweep this feature's own correctness
+  demanded (every exit-point shape needs live verification, not just
+  "looks right") surfaced a genuine pre-existing checker bug, present
+  since long before this feature: a function/closure whose body's own
+  LAST statement was `return EXPR` was spuriously rejected with K0200
+  ("expected T, found Unit"). Root cause: `Stmt::Return` correctly checks
+  its own value's type, but reports `Ty::Unit` as ITS OWN contribution to
+  the enclosing BLOCK's tail-type inference (correct in isolation — a
+  `return` has no "block value" of its own) — but every caller comparing
+  a block's own reported type against an expectation (a fun/closure's own
+  declared return type, two `match` arms required to agree) blindly used
+  that `Ty::Unit`, with no awareness the block actually DIVERGES via the
+  return and never falls through. Fixed centrally in `check_block`
+  itself: a block ending in `Stmt::Return` now reports a fresh,
+  freely-unifying type variable instead of `Ty::Unit`, so every caller's
+  unification against it succeeds trivially — the closest approximation
+  this checker has to a real "never" type. `fun probe() -> Int { return
+  50000 }` (previously rejected) now checks clean; `fun probe() -> Int {
+  return "wrong" }` is still correctly rejected (that check is
+  `Stmt::Return`'s own, unaffected by this fix).
+- **Verified**: `src/guards.rs`'s own test module (~15 unit tests) drives
+  `apply_guards` directly against real interpreter execution (the
+  oracle), covering: plain tail value (respecting/violating), the
+  correctness-critical early-`return` case, `return` inside `while`/`for`/
+  `match` arms, `return` nested several levels deep, an `if`-expression
+  used as the fun's own tail (checked once, not per-branch), a `return`
+  inside a `Lambda` correctly NOT touched by the enclosing fun's own
+  guard, a body with no trailing expression (implicit `Unit`), a bare
+  `return` (also `Unit`), a trailing `return` as the body's own last
+  statement (wrapped exactly once, not double-wrapped), and multiple
+  guards on one fun each running independently. A `main.rs` end-to-end
+  test proves both the tail-value AND early-return violations panic at
+  real `kupl run` (with `kupl check` passing clean, since a `guard` is a
+  runtime check, not statically provable) and a guard-respecting agent
+  runs cleanly. `fmt.rs` confirms `guard`/`guards` round-trip losslessly
+  and are NEVER shown in desugared form. Full `cargo test --bin kupl`
+  (92/92) and `cargo test --lib` (1817/1817, green twice — plus a single,
+  confirmed-environmental unrelated flake on an unrelated native-process
+  I/O test, reproduced as passing cleanly in isolation). Revert-and-
+  verify: `apply_guards` temporarily made a no-op, confirmed a genuine
+  guard violation silently succeeds instead of panicking (live-verified
+  directly against the built binary), restored, `cmp` byte-identical.
 
-**Implemented (structural slice only):** the shipped v1 is deliberately
-narrower than the illustrative sketch above — one rule shape, `forbids
-<effect>` (a dotted effect name, the SAME vocabulary `uses`/`add uses`
-already use: `io`, `io.net`, `io.fs`, `ai`, …), not free-text `rule "..."`.
+**The STRUCTURAL slice (`forbids`), for reference — implemented earlier,
+before `guard`/`guards` above:** narrower than the illustrative sketch at
+the top of this section — one rule shape, `forbids <effect>` (a dotted
+effect name, the SAME vocabulary `uses`/`add uses` already use: `io`,
+`io.net`, `io.fs`, `ai`, …), not a value-level check.
 
 ```
 protocol NoNetwork {
@@ -427,32 +463,33 @@ specific answer yet, only to naming the axes:
   (91/91) and `cargo test --lib` (1799/1799, green twice); revert-and-
   verify on both `effects.rs::check_protocols` (K1002) and `sdiff.rs`'s
   `interface_of` Protocol arm.
-- **DESIGN RESOLVED, NOT YET IMPLEMENTED:** §3's behavioral/runtime-
-  checked enforcement model. The typing question that previously blocked
-  even STARTING this (a rule's `result` has no fixed type across
-  different following agents' own exposed funs) is now resolved — see
-  "Behavioral rules: the design that unblocks them" in §3 above: a
-  `guard Name: Type { .. }` on `protocol` (mirroring `contract`'s own
-  `law`-against-`sigs` pattern, already proven in this exact codebase) +
-  an explicit opt-in `guards Name` clause on an agent's own exposed fun,
-  desugared at parse/resolve time into ordinary `expect` checks (already
-  cross-engine, zero new interp.rs/vm.rs/cgen.rs work needed). The
-  remaining, genuinely open engineering surface is narrower now: a
-  correctness-critical AST exit-point-rewrite pass (every `return` plus
-  the implicit tail expression, across all of KUPL's control-flow
-  constructs) — deliberately NOT rushed in the same sitting as this
-  design write-up, given how much a silent under-enforcement bug there
-  would cost (see §3's own "Still genuinely open" note for the exact
-  verification bar this needs before shipping).
+- **DONE:** §3's behavioral/runtime-checked enforcement model —
+  `guard Name: Type { .. }` on `protocol` + explicit opt-in `guards Name`
+  on an agent's own exposed fun, desugared to plain `expect` checks at
+  every syntactic exit point BEFORE type-checking (§3's own updated
+  "Behavioral rules: `guard`/`guards`" section has the full mechanism).
+  Verified: `src/guards.rs`'s own ~15-test control-flow sweep (tail
+  value, early `return`, nested `if`/`match`/`while`/`for`, `Lambda`
+  correctly excluded, `Unit`/bare-return, multiple guards); a real
+  end-to-end test proves both a tail-value AND an early-return violation
+  panic at `kupl run` (with `kupl check` passing clean, since a `guard`
+  is a runtime check); `kupl fmt` round-trips `guard`/`guards` losslessly
+  and never shows the desugared form; full `cargo test --bin kupl`
+  (92/92) and `cargo test --lib` (1817/1817, green twice); revert-and-
+  verify on `apply_guards`. Along the way, found+fixed a genuine
+  pre-existing, unrelated checker bug (`check_block` treating a
+  block ending in `return` as `Ty::Unit` for tail-type-unification
+  purposes, spuriously rejecting valid `return`-terminated fun/closure
+  bodies and mismatched `match` arms) — see §3's own writeup.
 - **NOT STARTED:** multi-protocol composition/conflict resolution remains
-  open but lower-urgency now that the shipped `forbids`-only slice
-  sidesteps it (see §3's own "Open" note). §5's open questions (identity/
-  persistence, judgment-vs-determinism, "infinite agents" bounding) also
-  remain fully open.
-- **Recommended next slice:** implement the now-resolved `guard`/`guards`
-  design above (the AST exit-point-rewrite pass is the critical-path
-  piece), or return to §5's open questions (agent identity/persistence,
-  judgment-vs-determinism) — both are genuine next steps, at the
-  implementer's own judgment informed by which has higher near-term
-  leverage. The behavioral-rules design is no longer blocked, only
-  un-implemented.
+  open but lower-urgency now that both shipped slices (`forbids`-only
+  union, `guards`-only explicit-opt-in) sidestep it (see §3's own "Open"
+  note). §5's open questions (identity/persistence, judgment-vs-
+  determinism, "infinite agents" bounding) remain fully open — the
+  natural next slice for whoever picks this up.
+- **Recommended next slice:** §5's open questions (agent identity/
+  persistence, judgment-vs-determinism, "infinite agents" bounding) —
+  all still fully open design work, no code written. Both of §3's own
+  enforcement models (structural `forbids`, behavioral `guard`/`guards`)
+  are now implemented; §3 itself has no remaining unstarted work besides
+  the deliberately-deferred composition/conflict question above.

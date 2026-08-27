@@ -1918,6 +1918,10 @@ impl Checker {
         } else {
             let body_ty = self.check_block(&f.body, &mut ctx);
             // The block's tail value must match the return type (unless Unit-returning).
+            // `check_block` itself returns a fresh, freely-unifying type
+            // variable (not `Ty::Unit`) when the body diverges via a
+            // trailing `return` -- see its own doc comment -- so this
+            // check needs no special-casing for that shape here.
             let ret = self.uni.apply(&ctx.ret.clone());
             if ret != Ty::Unit {
                 self.check_assign(&ret, &body_ty, f.body.span, &format!("return value of `{}`", f.name));
@@ -3215,6 +3219,37 @@ impl Checker {
             }
         }
         ctx.scopes.pop();
+        // A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening,
+        // found via the KUPL Agents `guards` feature's own exhaustive
+        // control-flow test sweep): a block whose OWN LAST statement is
+        // `Stmt::Return` genuinely DIVERGES -- execution never reaches
+        // "the block's own value" at all, since the function already
+        // exited. `check_stmt`'s own `Stmt::Return` arm correctly reports
+        // `Ty::Unit` for THAT statement in isolation (it has no real
+        // "block value" of its own) -- but blindly propagating that
+        // `Ty::Unit` up as if it were the block's genuine tail value
+        // caused every CALLER that unifies a block's type against an
+        // expectation (a fun/closure's own declared return type; two
+        // `match` arms required to agree; `if`/`else` branch unification)
+        // to spuriously reject perfectly valid code whenever the LAST
+        // reachable path through a block happened to be an unconditional
+        // `return`. Live-confirmed BEFORE this fix, via THREE independent
+        // symptoms: `fun probe() -> Int { return 50000 }` (K0200 on the
+        // fun's own body); a `match` arm `_ => { return x }` alongside a
+        // sibling arm of a different type (K0200 "match arms must have
+        // the same type"); the same shape inside a closure literal. Fixed
+        // HERE, centrally, rather than patching each caller individually
+        // (which this bug's own three-symptom discovery already showed
+        // is an incomplete, whack-a-mole approach): substitute a FRESH
+        // unification variable (unifies with ANY expected type, the
+        // closest approximation this checker has to a real "never" type)
+        // for a block's own reported type whenever it diverges via a
+        // trailing `return` -- every caller's own unification against
+        // that fresh var succeeds trivially, exactly matching "this block
+        // never actually produces a value of its own to compare."
+        if matches!(block.stmts.last(), Some(Stmt::Return(..))) {
+            return self.uni.fresh();
+        }
         last
     }
 

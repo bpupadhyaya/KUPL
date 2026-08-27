@@ -35,6 +35,27 @@ pub struct ProtocolDecl {
     /// span of that specific `forbids` clause, for a diagnostic that
     /// points at the RULE, not just the whole `protocol` declaration.
     pub forbids: Vec<(String, Span)>,
+    /// `guard Name: Type { expect result ... }` (`docs/design/AGENTS.md`
+    /// §3, the behavioral/runtime-checked slice) — a NAMED, concretely
+    /// typed postcondition an agent's own exposed fun opts into via
+    /// `guards Name` (`FunDecl.guards`). `Type` is fixed HERE, at the
+    /// protocol's own declaration site — mirroring `ContractDecl.laws`'
+    /// own body, which type-checks against the CONTRACT's own `sigs`,
+    /// not any fulfilling component's types (see `check_contract`) — so
+    /// a guard's body is well-typed regardless of which agent, or which
+    /// of an agent's own exposed funs, ultimately opts in.
+    pub guards: Vec<GuardDecl>,
+    pub span: Span,
+}
+
+/// See `ProtocolDecl.guards`'s own doc comment.
+#[derive(Debug, Clone)]
+pub struct GuardDecl {
+    pub name: String,
+    /// The FIXED type `result` is bound to inside `body` — chosen by the
+    /// protocol author, independent of any following agent.
+    pub ty: TyExpr,
+    pub body: Block,
     pub span: Span,
 }
 
@@ -95,6 +116,19 @@ pub struct FunDecl {
     pub is_pub: bool,
     /// `ai fun` — a typed prompt function; the body is the AiDecl, not code.
     pub ai: Option<AiDecl>,
+    /// `guards Name1, Name2` (`docs/design/AGENTS.md` §3, behavioral
+    /// protocol rules) — names of `GuardDecl`s this fun opts into, each
+    /// with the span of that specific reference (for a diagnostic that
+    /// points at the RIGHT name, not just the whole fun). Parses on ANY
+    /// `fun` (mirrors `weight`/`follows`'s own "parser accepts broadly,
+    /// checker narrows" precedent) but is checker-restricted to an
+    /// `expose fun` on an `agent` that `follows` the guard's own owning
+    /// protocol (new K10xx). A separate desugaring pass (`guards.rs`,
+    /// run from `run::compile`'s own pipeline, mirroring `callargs::
+    /// resolve_call_args`'s position) rewrites a validated `guards`-
+    /// bearing fun's body BEFORE type-checking proper -- `fmt`/`lsp`
+    /// never see the desugared form, only the original source shape.
+    pub guards: Vec<(String, Span)>,
     pub span: Span,
 }
 

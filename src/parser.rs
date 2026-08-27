@@ -527,9 +527,25 @@ impl Parser {
         } else {
             None
         };
+        // `guards Name1, Name2` (`docs/design/AGENTS.md` §3, behavioral
+        // protocol rules) -- a soft keyword right before the body, same
+        // position as `ai fun`'s own `tools [..]` clause. Parses on ANY
+        // fun (parser-accepts-broadly, like `weight`/`follows`), checker-
+        // narrowed to an `expose fun` on an `agent` (new K10xx).
+        let mut guards = Vec::new();
+        if matches!(self.peek(), Tok::Ident(n) if n == "guards") {
+            self.bump();
+            loop {
+                let (gname, gspan) = self.expect_ident()?;
+                guards.push((gname, gspan));
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
         let body = self.parse_block()?;
         let span = start.merge(body.span);
-        Ok(FunDecl { name, type_params, type_param_bounds, params, ret, effects, body, is_pub, ai: None, span })
+        Ok(FunDecl { name, type_params, type_param_bounds, params, ret, effects, body, is_pub, ai: None, guards, span })
     }
 
     /// `ai fun name(params) -> T { intent "..." [model "..."] }`
@@ -607,6 +623,7 @@ impl Parser {
             body: Block { stmts: Vec::new(), span },
             is_pub,
             ai: Some(AiDecl { intent, intent_expr, model, tools }),
+            guards: Vec::new(),
             span,
         })
     }
@@ -858,7 +875,7 @@ impl Parser {
         let start = self.expect(Tok::KwProtocol)?;
         let (name, _) = self.expect_ident()?;
         self.expect(Tok::LBrace)?;
-        let mut p = ProtocolDecl { name, intent: None, forbids: Vec::new(), span: start };
+        let mut p = ProtocolDecl { name, intent: None, forbids: Vec::new(), guards: Vec::new(), span: start };
         loop {
             self.skip_newlines();
             if matches!(self.peek(), Tok::RBrace | Tok::Eof) {
@@ -894,13 +911,28 @@ impl Parser {
                     p.forbids.push((eff, span));
                     self.expect_terminator()?;
                 }
+                // `guard Name: Type { .. }` (`docs/design/AGENTS.md` §3,
+                // behavioral rules) -- mirrors `law "..." { .. }`'s own
+                // shape exactly, except the name is a bare identifier (so
+                // `guards Name` on a fun can reference it) and it carries
+                // an explicit `: Type` the body's own `result` binds to.
+                Tok::Ident(ref n) if n == "guard" => {
+                    let gspan = self.span();
+                    self.bump();
+                    let (gname, _) = self.expect_ident()?;
+                    self.expect(Tok::Colon)?;
+                    let ty = self.parse_ty()?;
+                    let body = self.parse_block()?;
+                    let span = gspan.merge(body.span);
+                    p.guards.push(GuardDecl { name: gname, ty, body, span });
+                }
                 other => {
                     return Err(Diag::error(
                         "K0126",
                         format!(
-                            "unexpected {} in protocol body (expected `intent` or `forbids`){}",
+                            "unexpected {} in protocol body (expected `intent`, `forbids`, or `guard`){}",
                             other.describe(),
-                            keyword_suggestion(&other, &["intent", "forbids"])
+                            keyword_suggestion(&other, &["intent", "forbids", "guard"])
                         ),
                         self.span(),
                     ))

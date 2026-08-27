@@ -38,6 +38,13 @@ pub fn compile(src: &str) -> Result<Compiled, Vec<Diag>> {
     // resolve named args + fill default parameters into positional form, so the
     // checker and every engine see plain positional calls
     diags.extend(crate::callargs::resolve_call_args(&mut program));
+    // desugar `guards Name` into plain `expect` checks BEFORE type-checking,
+    // so the checker sees ordinary already-typed code, not a new construct
+    // (`docs/design/AGENTS.md` §3's "Behavioral rules" section) -- deliberately
+    // AFTER `resolve_call_args` (both are AST-rewriting pre-check passes; order
+    // between them doesn't matter today, but this mirrors the file's own
+    // declaration order) and BEFORE `check::check`.
+    diags.extend(crate::guards::desugar_guards(&mut program));
     let (checked, check_diags) = check::check(&program);
     diags.extend(check_diags);
     // Effects only make sense on a program that parsed; skip if already broken.
@@ -644,6 +651,7 @@ pub fn load_compile(path: &str) -> Result<(Compiled, crate::loader::SourceMap), 
     };
     inject_prelude(&mut program);
     let mut diags = crate::callargs::resolve_call_args(&mut program);
+    diags.extend(crate::guards::desugar_guards(&mut program));
     let (checked, check_diags) = check::check(&program);
     diags.extend(check_diags);
     if !diags.iter().any(|d| d.severity == Severity::Error) {

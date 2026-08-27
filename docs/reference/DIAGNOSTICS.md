@@ -211,10 +211,12 @@ printed to stderr.
 
 ## K10xx — Agents & protocols
 
-`protocol`/`follows` (`docs/design/AGENTS.md` §3) is a structural-only slice:
-it checks that an `agent`'s own exposed funs never perform an effect a
-followed protocol forbids. Behavioral/runtime-checked protocol rules are a
-deferred, later slice.
+`protocol`/`follows` (`docs/design/AGENTS.md` §3) has two enforcement
+models: STRUCTURAL (`forbids <effect>` — an agent's own exposed funs must
+never perform a forbidden effect) and BEHAVIORAL (`guard Name: Type { .. }`
++ `guards Name` — a value-level runtime check, desugared to plain `expect`
+checks before type-checking; `kupl check` cannot statically prove a `guard`
+clean or violated, only `kupl run` can).
 
 | Code | Sev | Meaning |
 |---|---|---|
@@ -222,3 +224,5 @@ deferred, later slice.
 | K1001 | E | `follows` names a protocol that doesn't exist |
 | K1002 | E | an agent's own exposed fun performs an effect forbidden by a protocol it follows |
 | K1003 | E | `follows` is only valid on an `agent`, not a plain `component`/`concurrent component` |
+| K1004 | E | `guards` is only valid on an `agent`'s own `expose fun` |
+| K1005 | E | `guards` names a guard that doesn't exist on any protocol the agent follows |

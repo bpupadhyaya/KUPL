@@ -3780,6 +3780,97 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Live, end-to-end verification of `docs/design/AGENTS.md` §3's
+    /// behavioral-rules slice (`guard`/`guards`): an agent's own exposed
+    /// fun that violates a followed protocol's `guard` is rejected at
+    /// RUNTIME (a `guard` is a behavioral, value-level check -- unlike
+    /// `forbids`, it cannot be statically proven at `kupl check` time, so
+    /// `kupl check` passes clean and `kupl run` is where the violation
+    /// actually panics). Covers BOTH exit-point shapes this feature's own
+    /// desugaring pass exists to handle correctly: the plain TAIL value,
+    /// and -- the single most correctness-critical case for the whole
+    /// feature -- an EARLY `return` bypassing the tail entirely. A naive
+    /// "wrap only the last expression" implementation would silently miss
+    /// the early-return case; this test would catch that regression.
+    #[test]
+    fn agent_violating_a_followed_protocols_guard_is_rejected_end_to_end() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-protocol-guard-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        const PROTO: &str = "protocol SpendingLimit {\n    intent \"no single response commits more than $10,000\"\n    \
+             guard CommitAmount: Int {\n        expect result < 10000\n    }\n}\n";
+
+        let tail_violation = dir.join("tail_violation.kupl");
+        std::fs::write(
+            &tail_violation,
+            format!(
+                "{PROTO}agent Rep follows SpendingLimit {{\n    intent \"a rep that overspends via its tail value\"\n    \
+                     expose fun commit(amount: Int) -> Int guards CommitAmount {{\n        amount\n    }}\n}}\n\
+                 app Main {{\n    intent \"tail-value guard violation test\"\n    let rep = Rep()\n    \
+                     on start {{ print(\"{{rep.commit(50000)}}\") }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let check_ok =
+            std::process::Command::new(&bin).args(["check", tail_violation.to_str().unwrap()]).output().unwrap();
+        assert_eq!(
+            check_ok.status.code(),
+            Some(0),
+            "a `guard` is a runtime check -- `kupl check` must pass clean even for a violating program: {check_ok:?}"
+        );
+        let run_out =
+            std::process::Command::new(&bin).args(["run", tail_violation.to_str().unwrap()]).output().unwrap();
+        assert_ne!(run_out.status.code(), Some(0), "a tail-value guard violation must fail `kupl run`: {run_out:?}");
+        assert!(
+            String::from_utf8_lossy(&run_out.stderr).contains("expectation failed"),
+            "the panic must come from the guard's own `expect`: {run_out:?}"
+        );
+
+        let early_return_violation = dir.join("early_return_violation.kupl");
+        std::fs::write(
+            &early_return_violation,
+            format!(
+                "{PROTO}agent Rep follows SpendingLimit {{\n    intent \"overspends via an EARLY RETURN, not the tail\"\n    \
+                     expose fun commit(amount: Int) -> Int guards CommitAmount {{\n        \
+                         if amount > 1000000 {{\n            return amount\n        }}\n        amount\n    }}\n}}\n\
+                 app Main {{\n    intent \"early-return guard violation test\"\n    let rep = Rep()\n    \
+                     on start {{ print(\"{{rep.commit(9000000)}}\") }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let run_out2 =
+            std::process::Command::new(&bin).args(["run", early_return_violation.to_str().unwrap()]).output().unwrap();
+        assert_ne!(
+            run_out2.status.code(),
+            Some(0),
+            "an EARLY-RETURN guard violation must also fail `kupl run` -- a naive tail-only rewrite would miss this: {run_out2:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&run_out2.stderr).contains("expectation failed"),
+            "{run_out2:?}"
+        );
+
+        let respecting = dir.join("respecting.kupl");
+        std::fs::write(
+            &respecting,
+            format!(
+                "{PROTO}agent Rep follows SpendingLimit {{\n    intent \"a rep that respects the limit\"\n    \
+                     expose fun commit(amount: Int) -> Int guards CommitAmount {{\n        amount\n    }}\n}}\n\
+                 app Main {{\n    intent \"guard respect control\"\n    let rep = Rep()\n    \
+                     on start {{ print(\"{{rep.commit(5000)}}\") }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let run_ok = std::process::Command::new(&bin).args(["run", respecting.to_str().unwrap()]).output().unwrap();
+        assert_eq!(run_ok.status.code(), Some(0), "an agent respecting its guard must run cleanly: {run_ok:?}");
+        assert_eq!(String::from_utf8_lossy(&run_ok.stdout), "5000\n", "{run_ok:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Live, end-to-end verification of `docs/design/ASYNC.md` §8.10 step
     /// 5 (blocking `Call` messages): the coordinator calls a `concurrent`
     /// instance's own `expose fun` synchronously, twice in a row, checking

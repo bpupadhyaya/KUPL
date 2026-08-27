@@ -1042,6 +1042,9 @@ pub fn load_with(
     // resolve named args + default parameters into positional form on the
     // merged program, so every downstream phase sees plain positional calls
     diags.extend(crate::callargs::resolve_call_args(&mut program));
+    // desugar `guards Name` before the caller's own check::check -- see
+    // `run::compile`'s own identical call for the full rationale.
+    diags.extend(crate::guards::desugar_guards(&mut program));
 
     let has_errors = diags.iter().any(|d| d.severity == crate::diag::Severity::Error);
     if has_errors {

@@ -273,6 +273,10 @@ fn fmt_fun(out: &mut String, f: &FunDecl, level: usize) {
     if let Some(r) = &f.ret {
         out.push_str(&format!(" -> {}", ty_str(r)));
     }
+    if !f.guards.is_empty() {
+        let names: Vec<&str> = f.guards.iter().map(|(n, _)| n.as_str()).collect();
+        out.push_str(&format!(" guards {}", names.join(", ")));
+    }
     out.push(' ');
     if let Some(ai) = &f.ai {
         if !ai.tools.is_empty() {
@@ -359,10 +363,21 @@ fn fmt_protocol(out: &mut String, p: &ProtocolDecl) {
         if !first {
             out.push('\n');
         }
+        first = false;
         for (effect, _) in &p.forbids {
             indent(out, 1);
             out.push_str(&format!("forbids {effect}\n"));
         }
+    }
+    for g in &p.guards {
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        indent(out, 1);
+        out.push_str(&format!("guard {}: {} ", g.name, ty_str(&g.ty)));
+        fmt_block(out, &g.body, 1);
+        out.push('\n');
     }
     out.push_str("}\n");
 }
@@ -1234,6 +1249,43 @@ mod tests {
         assert!(d2.is_empty(), "{d2:?}");
         let formatted2 = super::format_program(&p2);
         assert!(!formatted2.contains("follows"), "an agent with no follows clause must not gain one: {formatted2:?}");
+    }
+
+    /// KUPL Agents (`docs/design/AGENTS.md` §3, behavioral rules): a
+    /// `protocol`'s own `guard Name: Type { .. }` and an agent's
+    /// `guards Name` clause must both round-trip losslessly -- critically,
+    /// `kupl fmt` must show the ORIGINAL source shape, never the
+    /// desugared/expanded form `guards.rs::desugar_guards` produces (that
+    /// pass runs only from `run::compile`'s own pipeline, never from bare
+    /// `parser::parse`, which is all `roundtrip`/`format_program` ever use).
+    #[test]
+    fn fmt_preserves_guard_declaration_and_guards_clause() {
+        let src = "protocol SpendingLimit {\n    intent \"no single response commits more than $10,000\"\n    \
+                    guard CommitAmount: Int {\n        expect result < 10000\n    }\n}\n\
+                    agent Rep follows SpendingLimit {\n    intent \"a\"\n    \
+                    expose fun commit(amount: Int) -> Int guards CommitAmount {\n        amount\n    }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(formatted.contains("guard CommitAmount: Int {"), "the `guard` declaration must survive formatting: {formatted:?}");
+        assert!(formatted.contains("expect result < 10000"), "the guard's own body must survive formatting: {formatted:?}");
+        assert!(formatted.contains("guards CommitAmount"), "the `guards` clause must survive formatting: {formatted:?}");
+        assert!(
+            !formatted.contains("__guard_result"),
+            "`kupl fmt` must show the ORIGINAL source, never the desugared form: {formatted:?}"
+        );
+
+        // An exposed fun with NO `guards` clause must not gain one.
+        let no_guards = "protocol SpendingLimit {\n    intent \"p\"\n    guard CommitAmount: Int {\n        expect result < 10000\n    }\n}\n\
+                          agent Rep follows SpendingLimit {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                          app Main {\n    intent \"m\"\n}\n";
+        roundtrip(no_guards);
+        let (p2, d2) = parser::parse(no_guards);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains("guards"), "a fun with no `guards` clause must not gain one: {formatted2:?}");
     }
 
     /// A REAL, live-confirmed silent-DATA-LOSS bug found+fixed (production-

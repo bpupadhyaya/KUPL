@@ -26,6 +26,7 @@ pub mod rational;
 pub mod callargs;
 pub mod effects;
 pub mod fmt;
+pub mod guards;
 pub mod vm;
 pub mod interp;
 pub mod parallel;
