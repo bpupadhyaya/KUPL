@@ -1408,7 +1408,16 @@ enum ActorRoute {
     /// `ActorPool`'s doc comment.
     Dedicated {
         join: Option<std::thread::JoinHandle<()>>,
-        inbox: Option<std::sync::mpsc::Sender<ActorMsg>>,
+        /// `SyncSender`, bounded at `MAILBOX_CAP` (production-hardening:
+        /// closes a real gap a Pooled actor's own `pending`/
+        /// `enqueue_pending` guard never covered -- a Dedicated actor has
+        /// no separate downstream queue to cap, since its own `recv()`
+        /// loop consumes directly from this channel, so the CHANNEL
+        /// itself must be the bound instead. Every send site uses
+        /// `try_send` (never blocks), so this can NEVER become sender-
+        /// side back-pressure -- see `docs/design/ASYNC.md` §9.2's own
+        /// "not sender back-pressure" note, which applies here too.
+        inbox: Option<std::sync::mpsc::SyncSender<ActorMsg>>,
     },
     /// This actor is multiplexed onto a shared `ActorPool` worker thread
     /// alongside other actors, addressed by `local_id` within that
@@ -2180,7 +2189,7 @@ impl Interp {
             );
             ActorRoute::Pooled { worker_tx, local_id, stopped_rx: None, stop_sent: false }
         } else {
-            let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+            let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
             let shutdown_panic_writer = shutdown_panic.clone();
             let join = Self::spawn_dedicated_actor(comp_name, portable_args, span, image, ready_tx, shutdown_panic_writer, inbox_rx);
             ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) }
@@ -2800,10 +2809,23 @@ impl Interp {
             // Best-effort: if the actor has already fully shut down, the
             // send fails silently -- matching an ordinary message arriving
             // after a program has already finished, which has no
-            // observable effect either.
+            // observable effect either. A FULL mailbox is different: the
+            // actor is still alive but hasn't kept up, so (mirroring
+            // `enqueue_pending`'s own overflow behavior for Pooled actors)
+            // this is a clean, diagnosed panic instead of silent unbounded
+            // growth or a silent drop.
             match &handle.route {
                 ActorRoute::Dedicated { inbox: Some(inbox), .. } => {
-                    let _ = inbox.send(ActorMsg::Deliver(port.to_string(), pv));
+                    if let Err(std::sync::mpsc::TrySendError::Full(_)) =
+                        inbox.try_send(ActorMsg::Deliver(port.to_string(), pv))
+                    {
+                        return Err(Self::panic_flow(
+                            format!(
+                                "actor mailbox overflow: concurrent instance {id}'s mailbox has more than {MAILBOX_CAP} messages queued without being consumed -- the receiving actor is alive but too slow/stuck to keep up with its senders"
+                            ),
+                            Span::default(),
+                        ));
+                    }
                 }
                 ActorRoute::Dedicated { inbox: None, .. } => {}
                 ActorRoute::Pooled { worker_tx, local_id, stop_sent, .. } => {
@@ -4950,8 +4972,16 @@ impl Interp {
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let call_msg = ActorMsg::Call { fn_name: name.to_string(), args: portable_args, chain: vec![id], reply: reply_tx };
+        let mut mailbox_full = false;
         let sent = match &handle.route {
-            ActorRoute::Dedicated { inbox: Some(inbox), .. } => inbox.send(call_msg).is_ok(),
+            ActorRoute::Dedicated { inbox: Some(inbox), .. } => match inbox.try_send(call_msg) {
+                Ok(()) => true,
+                Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                    mailbox_full = true;
+                    false
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => false,
+            },
             ActorRoute::Dedicated { inbox: None, .. } => false,
             ActorRoute::Pooled { worker_tx, local_id, .. } => worker_tx.send(WorkerCmd::Msg(*local_id, call_msg)).is_ok(),
         };
@@ -4980,6 +5010,12 @@ impl Interp {
                 format!(
                     "concurrent instance {id}'s call to `{name}` timed out after {}ms -- the actor is still running (this is a TIMEOUT, not cancellation) and its eventual reply, if any, is discarded",
                     timeout.expect("timed_out is only ever set when timeout is Some").as_millis()
+                ),
+                span,
+            )),
+            None if mailbox_full => Err(Self::panic_flow(
+                format!(
+                    "actor mailbox overflow: concurrent instance {id}'s mailbox has more than {MAILBOX_CAP} messages queued without being consumed -- cannot call `{name}` (the actor is alive but too slow/stuck to keep up with its senders)"
                 ),
                 span,
             )),
@@ -9431,6 +9467,94 @@ mod mailbox_cap_tests {
     }
 }
 
+/// A Dedicated actor's own `MAILBOX_CAP` bound (production-hardening:
+/// closes the gap `mailbox_cap_tests` above never covered -- a Dedicated
+/// actor has no `pending` deque to cap, so its inbox CHANNEL itself is now
+/// bounded instead, checked via `try_send` at both call sites (`Interp::
+/// send`, the emit path, and `call_remote_impl`, the blocking-call path)).
+/// Mirrors `mailbox_cap_tests`'s own white-box style: a real `SyncSender`/
+/// `Receiver` pair with the receiving end deliberately never drained (kept
+/// alive, unread, for the test's duration), driven through the SAME
+/// `Interp::send`/`call_remote` entry points ordinary KUPL code uses,
+/// rather than only exercising the raw channel primitive directly.
+#[cfg(test)]
+mod dedicated_mailbox_cap_tests {
+    use super::{ActorHandle, ActorRoute, Flow, Interp, InstanceSlot, ProgramDb, MAILBOX_CAP};
+
+    /// Builds a bare `Interp` with one `Remote(Dedicated)` instance whose
+    /// receiving half is returned too (kept alive by the caller, never
+    /// read) -- so every `try_send` against it fills the bounded channel
+    /// exactly like a genuinely stuck/slow actor's inbox would.
+    fn interp_with_one_undrained_dedicated_actor() -> (Interp, usize, std::sync::mpsc::Receiver<super::ActorMsg>) {
+        let compiled = crate::run::compile("fun main() {}\n").expect("trivial program must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new_bare(db);
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<super::ActorMsg>(MAILBOX_CAP);
+        let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
+        // No real thread at all -- `join: None` is fine here since these
+        // tests never call `stop_all`/`join()`, only `send`/`call_remote`,
+        // neither of which touches `join`.
+        let id = interp.instances.len();
+        interp.instances.push(InstanceSlot::Remote(ActorHandle {
+            route: ActorRoute::Dedicated { join: None, inbox: Some(inbox_tx) },
+            ready: Some(ready_rx),
+            shutdown_panic: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        }));
+        (interp, id, inbox_rx)
+    }
+
+    /// Filling a Dedicated actor's mailbox to EXACTLY `MAILBOX_CAP` via
+    /// `emit` (`Interp::send`) must succeed for every message; the
+    /// `(MAILBOX_CAP + 1)`th must be a clean, diagnosed panic naming the
+    /// overflow, not a hang and not silent unbounded growth.
+    #[test]
+    fn dedicated_actor_emit_exactly_at_capacity_succeeds_then_one_past_is_a_clean_panic() {
+        let (mut interp, id, _inbox_rx) = interp_with_one_undrained_dedicated_actor();
+        for _ in 0..MAILBOX_CAP {
+            assert!(interp.send(id, "x", super::Value::Unit).is_ok(), "must succeed up to exactly MAILBOX_CAP");
+        }
+        let overflow = interp.send(id, "x", super::Value::Unit);
+        match overflow {
+            Err(Flow::Panic { msg, .. }) => {
+                assert!(msg.contains("actor mailbox overflow"), "unexpected message: {msg:?}");
+                assert!(msg.contains(&MAILBOX_CAP.to_string()), "message should name the cap: {msg:?}");
+            }
+            other => panic!("expected Err(Flow::Panic {{ .. }}) on overflow, got {}", match &other {
+                Ok(()) => "Ok(())".to_string(),
+                Err(_) => "Err(<non-Panic Flow>)".to_string(),
+            }),
+        }
+    }
+
+    /// Companion for `call_remote` (the blocking-`Call` path): a `Call`
+    /// against a full Dedicated mailbox must fail FAST with a clean,
+    /// distinctly-worded panic (not the generic "already shut down"
+    /// message, and not a hang waiting on `reply_rx`) -- `sent = false`
+    /// short-circuits `call_remote_impl` before it ever touches
+    /// `reply_rx.recv()`, so this genuinely cannot hang by construction.
+    #[test]
+    fn dedicated_actor_call_exactly_at_capacity_succeeds_then_one_past_is_a_clean_panic_not_a_hang() {
+        let (mut interp, id, _inbox_rx) = interp_with_one_undrained_dedicated_actor();
+        for _ in 0..MAILBOX_CAP {
+            assert!(interp.send(id, "x", super::Value::Unit).is_ok(), "must succeed up to exactly MAILBOX_CAP");
+        }
+        let overflow = interp.call_remote(id, "f", vec![], super::Span::default());
+        match overflow {
+            Err(Flow::Panic { msg, .. }) => {
+                assert!(msg.contains("actor mailbox overflow"), "unexpected message: {msg:?}");
+                assert!(
+                    !msg.contains("already shut down"),
+                    "a full-but-alive mailbox must not be confused with an already-shut-down actor: {msg:?}"
+                );
+            }
+            other => panic!("expected Err(Flow::Panic {{ .. }}) on overflow, got {}", match &other {
+                Ok(_) => "Ok(_)".to_string(),
+                Err(_) => "Err(<non-Panic Flow>)".to_string(),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod http_client_tests {
     use super::{base_curl_cmd, MAX_HTTP_RESPONSE_SIZE};
@@ -9617,7 +9741,7 @@ mod capfs_tests {
 /// its own doc comment) can do at all.
 #[cfg(test)]
 mod concurrent_tests {
-    use super::{ActorHandle, ActorMsg, ActorRoute, Flow, Interp, InstanceSlot, ProgramDb};
+    use super::{ActorHandle, ActorMsg, ActorRoute, Flow, Interp, InstanceSlot, ProgramDb, MAILBOX_CAP};
 
     /// Production-hardening 1218: a REAL, live-confirmed-by-code-reading
     /// gap found+fixed -- `stop_all` used to discard `join()`'s `Result`
@@ -9640,7 +9764,7 @@ mod concurrent_tests {
         let db = ProgramDb::build(&compiled.program, &compiled.checked);
         let mut interp = Interp::new_bare(db);
 
-        let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (inbox_tx, _inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
         let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let join = std::thread::spawn(|| {
             panic!("deliberate test panic, simulating a genuine internal interpreter bug reached on an actor thread")
@@ -9675,7 +9799,7 @@ mod concurrent_tests {
         let db = ProgramDb::build(&compiled.program, &compiled.checked);
         let mut interp = Interp::new_bare(db);
 
-        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
         let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let join = std::thread::spawn(move || {
             // Exits cleanly once the inbox's Sender is dropped (stop_all's
@@ -9719,7 +9843,7 @@ mod concurrent_tests {
         let db = ProgramDb::build(&compiled.program, &compiled.checked);
         let mut interp = Interp::new_bare(db);
 
-        let (inbox_tx, inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
         let (_ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, super::Span)>>> =
             std::sync::Arc::new(std::sync::Mutex::new(None));
@@ -9775,7 +9899,7 @@ mod concurrent_tests {
         let db = ProgramDb::build(&compiled.program, &compiled.checked);
         let mut interp = Interp::new_bare(db);
 
-        let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (inbox_tx, _inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let _ = ready_tx.send(Some(("deliberate on-start panic message, verbatim".to_string(), super::Span::default())));
         let join = std::thread::spawn(|| {});
@@ -9813,7 +9937,7 @@ mod concurrent_tests {
         let db = ProgramDb::build(&compiled.program, &compiled.checked);
         let mut interp = Interp::new_bare(db);
 
-        let (inbox_tx, _inbox_rx) = std::sync::mpsc::channel::<ActorMsg>();
+        let (inbox_tx, _inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Option<(String, super::Span)>>();
         let _ = ready_tx.send(None);
         let join = std::thread::spawn(|| {});

@@ -808,6 +808,35 @@ actors' own worker threads — a substantially larger change, deliberately
 left for a future increment once (or if) a real KUPL program demonstrates
 the fail-fast behavior here isn't sufficient.
 
+**A specific reason blocking sends are NOT a safe default for `Pooled`
+actors**: `ActorPool` multiplexes many actors onto a small, shared set of
+worker threads (Go-goroutine-style). If a `Pooled` actor's own worker
+thread BLOCKED while sending to a full peer, it would stall EVERY other
+actor time-sliced onto that same worker thread too, not just the sender —
+a worse failure mode than today's fail-fast panic (one actor dies) since
+it would silently freeze unrelated actors that happen to share a pool
+thread with the blocked sender. Any future back-pressure design needs to
+either scope blocking to `Dedicated` actors only (one OS thread per actor,
+so blocking only affects that one actor — see below) or give `Pooled`
+workers their own cooperative/async scheduler first (a materially bigger
+change, arguably KIR/coroutine territory).
+
+**Dedicated actors are ALSO now capped** (closing a real, previously
+unflagged gap: unlike `Pooled`, a `Dedicated` actor's inbox had NO bound
+at all before this fix — its own `mpsc::channel()` was fully unbounded).
+`ActorRoute::Dedicated`'s inbox is now a `std::sync::mpsc::SyncSender`
+bounded at the SAME `MAILBOX_CAP`, checked via `try_send` (never blocks)
+at both send sites (`Interp::send`, the `emit`/wire path, and
+`call_remote_impl`, the blocking-`Call` path) — overflow is a clean,
+diagnosed panic on the SENDER's side (the receiving actor can't be
+reached into and killed the way `kill_actor` does for `Pooled`, since it
+lives on a separate OS thread — consistent with this section's own
+"no true cancellation" limitation, §9.3). This is deliberately NOT
+sender-blocking back-pressure either — `try_send` never waits — but since
+`Dedicated` is one-OS-thread-per-actor, a genuinely blocking version
+would be architecturally SAFE here (unlike `Pooled`) if a future
+increment wants it.
+
 ### 9.3 Call timeout (DONE, interp-only) — timeout, not cancellation
 
 `<call> timeout <duration>` (e.g. `worker.compute(x) timeout 2s`) bounds
