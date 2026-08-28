@@ -808,6 +808,23 @@ actors' own worker threads — a substantially larger change, deliberately
 left for a future increment once (or if) a real KUPL program demonstrates
 the fail-fast behavior here isn't sufficient.
 
+**`MAILBOX_CAP` bounds each actor's own queue DEPTH, not the total
+NUMBER of actors** — a separate gap, closed 2026-08-28:
+`interp.rs::MAX_ACTOR_INSTANCES` (1,000,000) caps the total count of
+`concurrent component`/`agent` instances one program may spawn over its
+whole run (enforced in `instantiate_concurrent` via
+`reserve_actor_slot`, checked before any thread/worker-pool work
+begins) — a runaway/recursive spawn loop now fails with a clean,
+diagnosed panic instead of unbounded thread/memory growth, matching
+`docs/design/AGENTS.md` §5's own "infinite agents" leaning. Unlike
+`MAILBOX_CAP`, this is a MONOTONIC total-spawned-this-run counter, not a
+live-instance gauge — no cross-thread "actor died, free its slot"
+signal exists today, so this cannot distinguish "1,000,000 actors alive
+at once" from "1,000,000 short-lived actors spawned one after another
+over a long-running program." Tracking true liveness would need that
+death-notification mechanism built first; deliberately left as a
+separate, larger future increment, same as `Pooled` back-pressure above.
+
 **A specific reason blocking sends are NOT a safe default for `Pooled`
 actors**: `ActorPool` multiplexes many actors onto a small, shared set of
 worker threads (Go-goroutine-style). If a `Pooled` actor's own worker

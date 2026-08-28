@@ -435,7 +435,22 @@ specific answer yet, only to naming the axes:
   even if generous, for the same DoS-safety reasons)? Leaning toward: the
   SAME `MAILBOX_CAP`-style "generous but bounded, clean panic on genuine
   runaway growth" philosophy this whole session has applied consistently,
-  not a literal unbounded claim.
+  not a literal unbounded claim. **UPDATE, 2026-08-28 — the bounding half
+  of this is now DONE**: `interp.rs::MAX_ACTOR_INSTANCES` (1,000,000)
+  caps the TOTAL number of `concurrent component`/`agent` instances one
+  program may spawn over its whole run, enforced in
+  `instantiate_concurrent` via `reserve_actor_slot` — a runaway/recursive
+  spawn loop now fails with a clean, diagnosed panic instead of unbounded
+  thread/memory growth, exactly the leaning stated above. This is a
+  monotonic total-spawned-this-run counter, NOT a live-instance gauge
+  (unlike `MAILBOX_CAP`, which shrinks as messages are consumed) — no
+  cross-thread "actor died, free its slot" signal exists yet to support
+  true liveness tracking, so a program that spawns-and-lets-die
+  1,000,001 SHORT-LIVED actors over a long run would still hit this cap
+  even though far fewer than that are ever alive at once. The "elastic,
+  demand-driven POOL" framing above remains genuinely unresolved — this
+  update only closes the "is spawning literally unbounded" half of the
+  question, not the pool-sizing/backpressure design.
 
 ## 6. Explicitly open questions (do not resolve in this pass)
 

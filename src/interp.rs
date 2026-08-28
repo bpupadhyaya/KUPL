@@ -1246,6 +1246,60 @@ fn start_or_satisfy_suspend(actors: &mut [Option<PooledActor>], tx: &std::sync::
 /// left as a future increment; see `enqueue_pending`'s own doc comment.
 const MAILBOX_CAP: usize = 100_000;
 
+/// The total number of `concurrent component`/`agent` instances (`Pooled`
+/// OR `Dedicated`, combined) any ONE process may spawn over its whole
+/// lifetime -- the same "generous backstop against a genuine bug/DoS, not
+/// a normal-operation limit" philosophy as `MAILBOX_CAP` above, closing
+/// the gap `docs/design/AGENTS.md` §5 ("infinite agents") explicitly
+/// flagged as open: unlike `MAILBOX_CAP` (a LIVE queue depth, shrinking as
+/// messages are consumed), there is no natural "actor died, free its
+/// slot" signal that reaches back to this counter -- every `Interp`
+/// treats `instances` as an append-only slab and no cross-thread
+/// liveness-tracking mechanism exists to decrement it correctly. A
+/// monotonic total-spawned-this-run counter is the tractable version of
+/// this guard: it still turns a genuine runaway spawn loop (e.g. a
+/// recursive `let x = Self()` with no base case) into a clean, diagnosed
+/// panic instead of unbounded thread/memory growth, without requiring a
+/// new actor-death-notification protocol to get there. 1,000,000 is 10x
+/// the existing `perf_guard_100000_concurrent_actors...` test's own
+/// proven-safe scale, so no legitimate program should ever be close to
+/// this in ordinary operation.
+const MAX_ACTOR_INSTANCES: usize = 1_000_000;
+
+/// Global, process-wide count of every `concurrent component`/`agent`
+/// instance ever spawned (`instantiate_concurrent`'s only caller) --
+/// mirrors `ACTOR_POOL`'s own `static`-with-interior-mutability shape
+/// since actors are spawned from many different threads (the coordinator,
+/// every `ActorPool` worker, every `Dedicated` actor's own thread).
+static TOTAL_ACTORS_SPAWNED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Reserve one slot against `MAX_ACTOR_INSTANCES`, atomically. Split from
+/// its only real caller (`instantiate_concurrent`) so tests can drive the
+/// exact same accounting logic against a small, local counter/cap instead
+/// of actually spawning `MAX_ACTOR_INSTANCES` real OS threads.
+fn reserve_actor_slot_impl(
+    counter: &std::sync::atomic::AtomicUsize,
+    cap: usize,
+    span: Span,
+) -> Result<(), Flow> {
+    let prior = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if prior >= cap {
+        return Err(Interp::panic_flow(
+            format!(
+                "too many concurrent actor instances: more than {cap} `concurrent component`/`agent` instances have been spawned by this program -- a recursive or otherwise runaway spawn loop with no base case is the likely cause"
+            ),
+            span,
+        ));
+    }
+    Ok(())
+}
+
+/// See `reserve_actor_slot_impl`'s own doc comment; this is the real
+/// entry point, threading in the process-wide counter and the real cap.
+fn reserve_actor_slot(span: Span) -> Result<(), Flow> {
+    reserve_actor_slot_impl(&TOTAL_ACTORS_SPAWNED, MAX_ACTOR_INSTANCES, span)
+}
+
 /// A short, BOUNDED grace period a `Dedicated` actor's SENDER waits for
 /// room in a full mailbox before giving up -- see `docs/design/ASYNC.md`
 /// §9.2's "why blocking isn't safe for Pooled actors" note for why this
@@ -2286,6 +2340,7 @@ impl Interp {
         restart_on_failure: bool,
         max_restarts: Option<(u32, i64)>,
     ) -> EvalResult {
+        reserve_actor_slot(span)?;
         let mut portable_args: Vec<(Option<String>, crate::parallel::PortableValue)> =
             Vec::with_capacity(args.len());
         for (name, v) in args {
@@ -9657,6 +9712,59 @@ mod mailbox_cap_tests {
         );
         assert_eq!(overflow, Err(()));
         assert!(reply_rx.recv().is_err(), "the caller's own reply channel must observe closure, not hang");
+    }
+}
+
+/// `MAX_ACTOR_INSTANCES`/`reserve_actor_slot_impl` (production-hardening:
+/// closes the gap `docs/design/AGENTS.md` §5 "infinite agents" explicitly
+/// flagged -- no total cap existed on the number of `concurrent
+/// component`/`agent` instances a program could spawn, unlike the
+/// existing per-actor `MAILBOX_CAP`). Drives the exact same accounting
+/// logic `instantiate_concurrent` uses in production, against a small
+/// local counter/cap so the test never has to actually spawn hundreds of
+/// thousands of real OS threads.
+#[cfg(test)]
+mod actor_instance_cap_tests {
+    use super::{reserve_actor_slot_impl, Span};
+    use std::sync::atomic::AtomicUsize;
+
+    /// Reserving up to EXACTLY the cap must succeed for every call (a
+    /// genuine limit, not an off-by-one that rejects one call early).
+    #[test]
+    fn exactly_at_capacity_all_succeed() {
+        let counter = AtomicUsize::new(0);
+        for _ in 0..5 {
+            assert!(reserve_actor_slot_impl(&counter, 5, Span::default()).is_ok());
+        }
+    }
+
+    /// The reservation that would push the count PAST the cap is rejected
+    /// with a clean, diagnosed panic -- not silently allowed through.
+    #[test]
+    fn one_past_capacity_is_a_clean_diagnosed_panic() {
+        let counter = AtomicUsize::new(0);
+        for _ in 0..5 {
+            reserve_actor_slot_impl(&counter, 5, Span::default()).unwrap_or_else(|_| panic!("must succeed up to exactly capacity"));
+        }
+        let overflow = reserve_actor_slot_impl(&counter, 5, Span::default());
+        let Err(super::Flow::Panic { msg, .. }) = overflow else {
+            panic!("expected a clean Flow::Panic");
+        };
+        assert!(msg.contains('5'), "message should name the cap: {msg:?}");
+        assert!(msg.to_lowercase().contains("actor"), "message should mention actors: {msg:?}");
+    }
+
+    /// Every call increments the counter regardless of outcome (a rejected
+    /// reservation must not silently retry into an infinite loop if a
+    /// caller ignored the error and tried again -- the counter keeps
+    /// climbing, so it stays rejected).
+    #[test]
+    fn rejections_keep_the_counter_monotonically_increasing() {
+        let counter = AtomicUsize::new(0);
+        reserve_actor_slot_impl(&counter, 1, Span::default()).unwrap_or_else(|_| panic!("first reservation must succeed"));
+        assert!(reserve_actor_slot_impl(&counter, 1, Span::default()).is_err());
+        assert!(reserve_actor_slot_impl(&counter, 1, Span::default()).is_err());
+        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 3);
     }
 }
 
