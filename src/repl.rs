@@ -611,7 +611,12 @@ fn upgrade_instances(interp: &mut crate::interp::Interp, name: &str) -> Result<u
             let v = if old_child_map.contains_key(&child.name) {
                 old_env.get(&child.name).ok_or_else(|| format!("internal error: child `{}` unexpectedly missing", child.name))?
             } else {
-                interp.instantiate_child(&new_comp.supervises, child, &new_env).map_err(|_| {
+                // `defer_start = false`: this path has no equivalent of
+                // `instantiate_local`'s own post-wires-loop `StartSpawned`
+                // dispatch, so a deferred child would construct and then
+                // never actually start -- see `instantiate_child`'s own
+                // doc comment.
+                interp.instantiate_child(&new_comp.supervises, child, &new_env, false).map_err(|_| {
                     format!("constructing new child `{}` failed", child.name)
                 })?
             };

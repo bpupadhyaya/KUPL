@@ -3653,6 +3653,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Async-shutdown-timing fix, "Bug A" half (`docs/design/ASYNC.md`
+    /// §9.4, `interp.rs::WorkerCmd::StartSpawned`'s own doc comment): a
+    /// `concurrent` actor's `on start` handler emitting on an actor-to-
+    /// actor direct wire used to be a DETERMINISTIC race, not a rare
+    /// one -- `WorkerCmd::Spawn` ran construct-AND-`on start` as ONE
+    /// synchronous command, so a wire SOURCE's own startup-triggered
+    /// `emit` always ran before its own `RegisterRemoteWire` (sent only
+    /// after the whole sibling list finished constructing) had been
+    /// processed, live-confirmed 20/20 runs pre-fix (this exact
+    /// scenario). Now split into construct-only + a separate
+    /// `StartSpawned` sent after every sibling's wires are registered.
+    #[test]
+    fn concurrent_actor_emitting_on_its_own_on_start_reaches_a_direct_wire_target_every_time() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-on-start-wire-race-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("on_start_wire_race.kupl");
+        std::fs::write(
+            &file,
+            "concurrent component A {\n    intent \"emits on its own on start\"\n    \
+                 out sig: Int\n    on start { emit sig(42) }\n}\n\
+             concurrent component B {\n    intent \"prints on receipt\"\n    \
+                 in num: Int\n    on num(n) { print(\"B got: {n}\") }\n}\n\
+             app Main {\n    intent \"on-start emit must always reach its direct wire target\"\n    \
+                 let a = A()\n    let b = B()\n    wire a.sig -> b.num\n    \
+                 on start { print(\"app started\") }\n}\n",
+        )
+        .unwrap();
+
+        for _ in 0..20 {
+            let out = std::process::Command::new(&bin).args(["run", file.to_str().unwrap()]).output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert!(stdout.contains("B got: 42"), "on-start emit must reach B every run, not just sometimes: {out:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// KUPL Agents v1 (`docs/design/AGENTS.md` §4/§7): `agent` + `weight`
     /// dispatch onto the two currently-implemented concurrency tiers
     /// (`weight distributed` is checker-rejected, K0316, separately).

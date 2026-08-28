@@ -941,48 +941,98 @@ thread), so `drain()`'s own existing `MAX_COMPONENT_MESSAGES` wire-cycle
 guard never sees it. A new `Interp::remote_emit_count`, capped at the
 SAME `MAX_COMPONENT_MESSAGES`, closes this the same way.
 
-A known, DETERMINISTIC (not racy) startup limitation, documented rather
-than fixed: a remote wire is not yet registered during the SOURCE
-actor's own `on start` handler or its first timer fires (`WorkerCmd::
-Spawn` runs the actor's ENTIRE startup sequence synchronously, before
-the worker loop can process any LATER command on the same channel,
-including `RegisterRemoteWire`) — an `emit` from `on start` on a port
-that will later be wired remotely is silently unwired at that moment.
-Only affects the actor's own startup; any LATER `emit` (from an exposed
-fun call, a later timer fire, or a `Deliver`-triggered handler) sees the
-wire correctly registered. Fixing this properly would mean threading
-wire info into `WorkerCmd::Spawn` itself, ahead of knowing the
-destination's own route at spawn time — left as a documented future
-increment rather than rushed into this slice.
+**UPDATE, 2026-08-28 — FIXED.** The startup wire-registration race
+described in this paragraph (a remote wire not yet registered during
+the SOURCE actor's own `on start`/first timer fire, a DETERMINISTIC,
+not racy, gap — live-confirmed 20/20 runs before the fix, exactly this
+scenario) is now closed. `WorkerCmd::Spawn` no longer runs an actor's
+whole startup sequence as one synchronous command: it now CONSTRUCTS
+only (the actor exists, its own root instance is fully built, but `on
+start`/timers have not run). A new `WorkerCmd::StartSpawned { local_id
+}` runs the deferred `start_all()`/`run_timers(100)` and finally
+signals readiness. `instantiate_local`'s own children loop passes a
+new `defer_start = true` down through `instantiate_child` /
+`instantiate_supervised` / `instantiate_concurrent` for every `Pooled`
+child it constructs — meaning it does NOT send that child's
+`StartSpawned` immediately; instead, AFTER the whole sibling group is
+constructed AND every wire touching them (including cross-actor
+`RegisterRemoteWire`s) is registered, it sends `StartSpawned` to each
+one. Since `RegisterRemoteWire` and `StartSpawned` are both sent to the
+SAME actor's own worker channel, by the SAME coordinator thread, in
+that exact order, the actor's own `on start` is now GUARANTEED to run
+after its own outgoing wires are registered — not by accident. Every
+OTHER caller of `instantiate_concurrent` (ordinary ad-hoc `let x =
+Component()` outside a declarative children list, `repl.rs`'s own
+`:upgrade` path, which has no equivalent "send `StartSpawned` once
+wiring is done" step of its own) passes `defer_start = false` and gets
+the old "construct, then immediately start" behavior back, functionally
+unchanged. `ActorRoute::Dedicated` is untouched entirely — it can't be
+a `RegisterRemoteWire` endpoint either way, so there was never a race
+to fix for it. See `interp.rs::WorkerCmd::StartSpawned`'s own doc
+comment for the full ordering argument. Verified: revert-and-verify
+(20/20 runs failing on the pre-fix code, 20/20 succeeding after,
+`cmp`-confirmed byte-identical restore), full `cargo test --lib` green
+twice, `cargo test --bin kupl` green, a new permanent regression test
+(`concurrent_actor_emitting_on_its_own_on_start_reaches_a_direct_wire_
+target_every_time`, `main.rs`, 20 real `kupl run` invocations per test
+run). The SEPARATE settling/quiescence gap described just below is
+UNCHANGED by this fix — deliberately not attempted in this same pass.
 
 **A SEPARATE, newly-discovered limitation (2026-08-28, found while
 verifying the `supervise`+`concurrent` child fix in §4.1 of `docs/
-design/CONCURRENCY_V2.md`, unrelated to supervision itself), documented
-here rather than fixed in that same pass:** the coordinator's own
-top-level program lifecycle does NOT wait for an in-flight cross-actor
-`emit`/`Deliver` chain to fully settle before shutting down. Live-
-confirmed with a MINIMAL repro (no panic, no supervision, no agent
-involved at all — two plain `concurrent component`s, `A` emits on its
-own `on start`, wired directly to `B`, whose own handler `print`s): the
-program consistently exits 0 with ZERO output, 3/3 runs. Root cause
-(by inspection, not yet fixed): `start_all` only waits for each LOCAL/
-Remote instance's own INITIAL `on start` + `run_timers(100)` to settle
-(`ready_rx.recv()`) — it has no way to know that `A`'s own `on start`
-triggered a cross-actor `Deliver` to `B` that `B`'s own worker thread
-hasn't processed yet, so `stop_all` can run (dropping every actor's own
-channel `Sender`, ending their `recv()` loops) before that delivery is
-even picked up. This is why the earlier actor-to-actor channels test
+design/CONCURRENCY_V2.md`, unrelated to supervision itself), still NOT
+fixed (only the WIRE-REGISTRATION race just above is):** the
+coordinator's own top-level program lifecycle does NOT wait for an
+in-flight cross-actor `emit`/`Deliver` chain to fully settle before
+shutting down.
+
+**UPDATE, 2026-08-28 — the ORIGINAL repro quoted in this paragraph
+turned out to be misdiagnosed; corrected here.** It was originally
+described as "two plain `concurrent component`s, `A` emits on its own
+`on start`, wired directly to `B`, whose own handler `print`s" —
+but that is EXACTLY the wire-registration race fixed just above, not a
+pure settling-gap repro: once that fix landed, this exact scenario now
+succeeds 20/20 (see the regression test added for it). A genuinely
+PURE settling-gap repro, with the wire-registration race structurally
+excluded (the triggering `emit` is from a plain, non-`concurrent`
+component, so no `RegisterRemoteWire` timing is involved at all): a
+plain `component Trigger` fire-and-forget emits (via `Interp::send`,
+straight into a `concurrent` actor `C`'s inbox) on ITS OWN `on start`;
+`C` forwards via an actor-to-actor direct wire to `concurrent` actor
+`D`, whose handler `print`s. Live-confirmed: the program consistently
+exits 0 with ZERO output, 20/20 runs, UNCHANGED by the wire-registration
+fix above (as expected — that fix only changes when an actor's OWN `on
+start` may safely emit on its OWN outgoing wire, which isn't what's
+racing here). Root cause (by inspection, still not fixed): `start_all`
+only waits for each LOCAL/Remote instance's own INITIAL `on start` +
+`run_timers(100)` to settle (`ready_rx.recv()`) — it has no way to know
+that `C`'s own `Deliver`-triggered handler (itself triggered by
+`Trigger`'s local emit) sent a FURTHER cross-actor `Deliver` to `D` that
+`D`'s own worker thread hasn't processed yet, so `stop_all` can run
+(dropping every actor's own channel `Sender`, ending their `recv()`
+loops) before that delivery is even picked up. This is why the earlier
+actor-to-actor channels test
 (`concurrent_actor_to_concurrent_actor_direct_wire_delivers_without_a_
 coordinator_round_trip`, §9.4 above) deliberately observes its own
 result via a LATER, SEPARATE BLOCKING `Call` (which inherently waits for
 a reply) rather than a fire-and-forget `print` inside the destination's
 own handler — a pattern that, in hindsight, was quietly sidestepping
-this exact gap rather than proving it doesn't exist. Not fixed here:
-this is a genuinely separate, likely nontrivial architecture question
-(what does "the async work triggered by startup is done" even mean in
-general, for an arbitrarily deep/cyclic cross-actor emit graph?) — left
-as a documented, real limitation for a future increment, matching this
-whole file's own "known limitation, not silently ignored" discipline.
-Any test or example relying on a `concurrent`/`agent` handler's own
-`print`/side-effect being observable before process exit should use a
+this exact gap rather than proving it doesn't exist, and — a further
+caveat worth being explicit about — even THAT sidestep is only reliable
+for observing the ONE actor actually being `Call`ed, not any FURTHER
+downstream actor a `Call`ed handler's own fire-and-forget `emit` might
+reach: any ordering that appears to work there (e.g. a one-hop forward
+that happens to complete before the `Call`'s own reply is sent, on the
+same sender thread) is an ACCIDENT of `mpsc` program-order, not a
+documented guarantee, and would not necessarily survive a slower
+handler or an extra forwarding hop. Not fixed here: this is a genuinely
+separate, likely nontrivial architecture question (what does "the async
+work triggered by startup is done" even mean in general, for an
+arbitrarily deep/cyclic cross-actor emit graph — this is, in essence,
+the classical distributed termination-detection problem, not a small
+wait-loop fix) — left as a documented, real limitation for a future
+increment, matching this whole file's own "known limitation, not
+silently ignored" discipline. Any test or example relying on a
+`concurrent`/`agent` handler's own `print`/side-effect being observable
+before process exit should use a
 blocking `Call` to synchronize instead, until this is addressed.

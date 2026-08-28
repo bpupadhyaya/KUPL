@@ -467,6 +467,24 @@ enum WorkerCmd {
     /// exist. See `Interp::remote_wires`'s own doc comment for how this
     /// is consumed.
     RegisterRemoteWire { local_id: usize, port: String, target: RemoteWireTarget, dst_port: String },
+    /// Async-shutdown-timing fix, "Bug A" half (`docs/design/ASYNC.md`
+    /// §9.4): runs the deferred second half of a `Spawn`'d `Pooled`
+    /// actor's own startup -- `start_all()` (its `on start` handler) +
+    /// `run_timers(100)` -- and finally sends the ONE `ready_tx` reply
+    /// `start_all`'s own second pass is waiting on. Split out of `Spawn`
+    /// itself so a PARENT's `instantiate_local` can send every sibling's
+    /// `RegisterRemoteWire` in between constructing its children and
+    /// actually starting them: before this split, `Spawn` ran construct
+    /// AND `on start` synchronously as ONE command, so any `emit` during
+    /// a wire SOURCE's own `on start` always ran before that source's
+    /// outgoing `RegisterRemoteWire` (sent only after the whole sibling
+    /// list finished constructing) had been processed -- a deterministic
+    /// race, not a rare one, live-confirmed 10/10 runs. See `instantiate_
+    /// local`'s own doc comment at its post-wires-loop send site for the
+    /// full ordering argument. A no-op if the named actor's own
+    /// construction already failed (`Spawn`'s own failure branch already
+    /// sent `ready_tx` itself; nothing left to start).
+    StartSpawned { local_id: usize },
 }
 
 /// A cross-thread-sendable "where to deliver a message" descriptor for
@@ -540,6 +558,13 @@ struct PooledActor {
     /// semantics instead of being silently dispatched-and-dropped by a
     /// `send()` call that finds no handler for a receive-only port.
     receive_ports: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Async-shutdown-timing fix (`WorkerCmd::StartSpawned`'s own doc
+    /// comment): stashed here by `Spawn`'s now construct-only handling,
+    /// consumed by the LATER `StartSpawned` command that actually runs
+    /// `on start`/timers and reports readiness -- the same channel
+    /// `instantiate_concurrent`'s own `(ready_tx, ready_rx)` pair always
+    /// used, just no longer sent from inside `Spawn` itself.
+    ready_tx: std::sync::mpsc::Sender<Option<(String, Span)>>,
 }
 
 /// Selective receive: collects every port name any `receive` arm inside
@@ -679,7 +704,13 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                     .into_iter()
                     .map(|(name, pv)| (name, crate::parallel::from_portable(&pv)))
                     .collect();
-                let startup = (|| -> Result<(), Flow> {
+                // Async-shutdown-timing fix (`WorkerCmd::StartSpawned`'s
+                // own doc comment): CONSTRUCT only here -- `start_all`/
+                // `run_timers` (this actor's own `on start`) are now
+                // deferred to a separate, later `StartSpawned` command,
+                // so a `RegisterRemoteWire` this actor's own wires depend
+                // on has a chance to arrive first.
+                let construct = (|| -> Result<(), Flow> {
                     actor.instantiate_local(comp, &args, span)?;
                     // Apply the PARENT's `supervise ... restart on_failure`
                     // to THIS actor's own root instance BEFORE `start_all`
@@ -691,28 +722,33 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                         actor.instances[0].unwrap_local_mut().restart_on_failure = true;
                         actor.instances[0].unwrap_local_mut().max_restarts = max_restarts;
                     }
-                    actor.start_all()?;
-                    actor.run_timers(100)?;
                     Ok(())
                 })();
-                let startup_panic = match &startup {
-                    Err(Flow::Panic { msg, span, .. }) => Some((msg.clone(), *span)),
-                    Err(_) => None,
-                    Ok(()) => None,
-                };
-                let _ = ready_tx.send(startup_panic);
-                actors[local_id] = if startup.is_ok() {
-                    Some(PooledActor {
-                        interp: actor,
-                        shutdown_panic,
-                        suspended: None,
-                        pending: std::collections::VecDeque::new(),
-                        pending_stop: None,
-                        receive_ports,
-                    })
-                } else {
-                    None
-                };
+                match construct {
+                    Ok(()) => {
+                        actors[local_id] = Some(PooledActor {
+                            interp: actor,
+                            shutdown_panic,
+                            suspended: None,
+                            pending: std::collections::VecDeque::new(),
+                            pending_stop: None,
+                            receive_ports,
+                            ready_tx,
+                        });
+                        // `StartSpawned` (sent either immediately by
+                        // `instantiate_concurrent` itself, or later by a
+                        // PARENT's `instantiate_local` once wires are
+                        // registered) is what actually runs `on start`
+                        // and sends `ready_tx` -- construction succeeding
+                        // is NOT readiness.
+                    }
+                    Err(Flow::Panic { msg, span, .. }) => {
+                        let _ = ready_tx.send(Some((msg, span)));
+                    }
+                    Err(_) => {
+                        let _ = ready_tx.send(None);
+                    }
+                }
             }
             WorkerCmd::Msg(local_id, msg) => {
                 let state = actors.get(local_id).and_then(|s| s.as_ref()).map(|s| s.suspended.is_some());
@@ -1062,6 +1098,30 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                 // completed has no observable effect either way).
                 if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
                     slot.interp.remote_wires.entry(port).or_default().push((target, dst_port));
+                }
+            }
+            WorkerCmd::StartSpawned { local_id } => {
+                // See this variant's own doc comment. A no-op if the slot
+                // is empty -- `Spawn`'s own construction-failure branch
+                // already sent `ready_tx` itself, so there is genuinely
+                // nothing left to do here for that case.
+                let mut failed = false;
+                if let Some(slot) = actors.get_mut(local_id).and_then(|s| s.as_mut()) {
+                    let result = (|| -> Result<(), Flow> {
+                        slot.interp.start_all()?;
+                        slot.interp.run_timers(100)?;
+                        Ok(())
+                    })();
+                    let startup_panic = match &result {
+                        Err(Flow::Panic { msg, span, .. }) => Some((msg.clone(), *span)),
+                        Err(_) => None,
+                        Ok(()) => None,
+                    };
+                    let _ = slot.ready_tx.send(startup_panic);
+                    failed = result.is_err();
+                }
+                if failed {
+                    actors[local_id] = None;
                 }
             }
         }
@@ -1960,11 +2020,20 @@ impl Interp {
     /// (it114), so the two stay consistent by construction rather than by
     /// convention — a bug fixed in one would otherwise need remembering to
     /// fix in the other.
+    /// `defer_start`: `true` for `instantiate_local`'s own children loop
+    /// (which sends every `Pooled` remote child its `StartSpawned` itself,
+    /// AFTER this whole level's wires -- including cross-actor
+    /// `RegisterRemoteWire`s -- are registered; see that loop's own
+    /// post-wires-loop doc comment). `repl.rs`'s `:upgrade` path passes
+    /// `false` instead: it has no equivalent "send `StartSpawned` once
+    /// wiring is done" step of its own, so a deferred child spawned there
+    /// would construct and then never actually start.
     pub(crate) fn instantiate_child(
         &mut self,
         supervises: &[SuperviseDecl],
         child: &ChildDecl,
         parent_env: &Env,
+        defer_start: bool,
     ) -> EvalResult {
         let mut child_args = Vec::new();
         for a in &child.args {
@@ -1981,7 +2050,7 @@ impl Interp {
         // `Remote` (concurrent/agent) child's own restart policy is
         // applied INSIDE its own spawn, before its own `on start` runs --
         // see that function's own doc comment for the crash this fixes.
-        let v = self.instantiate_supervised(&child.component, &child_args, child.span, restart_on_failure, max_restarts)?;
+        let v = self.instantiate_supervised(&child.component, &child_args, child.span, restart_on_failure, max_restarts, defer_start)?;
         if restart_on_failure {
             if let Value::Component(cid) = v {
                 // `Local`: apply here, same as before (a `Remote` child's
@@ -2087,7 +2156,7 @@ impl Interp {
         args: &[(Option<String>, Value)],
         span: Span,
     ) -> EvalResult {
-        self.instantiate_supervised(comp_name, args, span, false, None)
+        self.instantiate_supervised(comp_name, args, span, false, None, false)
     }
 
     /// Like `instantiate`, plus an OPTIONAL `supervise ... restart on_failure
@@ -2128,12 +2197,13 @@ impl Interp {
         span: Span,
         restart_on_failure: bool,
         max_restarts: Option<(u32, i64)>,
+        defer_start: bool,
     ) -> EvalResult {
         let Some(comp) = self.db.components.get(comp_name).cloned() else {
             return Err(Self::panic_flow(format!("unknown component `{comp_name}`"), span));
         };
         if comp.concurrent {
-            return self.instantiate_concurrent(comp, args, span, restart_on_failure, max_restarts);
+            return self.instantiate_concurrent(comp, args, span, restart_on_failure, max_restarts, defer_start);
         }
         self.instantiate_local(comp, args, span)
     }
@@ -2229,7 +2299,7 @@ impl Interp {
         // children (constructed after the parent exists, in declaration order)
         let mut child_ids: HashMap<String, usize> = HashMap::new();
         for child in &comp.children {
-            let v = self.instantiate_child(&comp.supervises, child, &env)?;
+            let v = self.instantiate_child(&comp.supervises, child, &env, true)?;
             if let Value::Component(cid) = v {
                 child_ids.insert(child.name.clone(), cid);
             }
@@ -2313,6 +2383,29 @@ impl Interp {
                 .push((dst, to_port.clone()));
         }
 
+        // Async-shutdown-timing fix, "Bug A" half (`docs/design/ASYNC.md`
+        // §9.4, `WorkerCmd::StartSpawned`'s own doc comment): every
+        // `Pooled` remote child was constructed above via `instantiate_
+        // child`'s `defer_start = true` -- it exists and its own root
+        // instance is fully built, but its `on start`/timers have NOT
+        // run yet. Now that every wire touching this whole sibling group
+        // (both ordinary local wires and cross-actor `RegisterRemoteWire`s
+        // just above) is registered, it's finally safe to let each one
+        // actually start: any `emit` during ITS OWN `on start` will now
+        // see a fully-populated `remote_wires` table, deterministically,
+        // not by accident. A `Dedicated` or `Local` child needs nothing
+        // here (`Dedicated` already started immediately inside its own
+        // spawn -- it can't be a `RegisterRemoteWire` endpoint anyway;
+        // `Local` startup is governed entirely by this level's own later,
+        // separate `start_all()` pass).
+        for &cid in child_ids.values() {
+            if let InstanceSlot::Remote(handle) = &self.instances[cid] {
+                if let ActorRoute::Pooled { worker_tx, local_id, .. } = &handle.route {
+                    let _ = worker_tx.send(WorkerCmd::StartSpawned { local_id: *local_id });
+                }
+            }
+        }
+
         Ok(Value::Component(id))
     }
 
@@ -2339,6 +2432,7 @@ impl Interp {
         span: Span,
         restart_on_failure: bool,
         max_restarts: Option<(u32, i64)>,
+        defer_start: bool,
     ) -> EvalResult {
         reserve_actor_slot(span)?;
         let mut portable_args: Vec<(Option<String>, crate::parallel::PortableValue)> =
@@ -2405,6 +2499,20 @@ impl Interp {
             let local_id = local_id_rx.recv().expect(
                 "actor-pool worker thread ended unexpectedly while spawning a new actor -- this is a bug in KUPL, not your program",
             );
+            // Async-shutdown-timing fix (`WorkerCmd::StartSpawned`'s own
+            // doc comment): `Spawn` above only CONSTRUCTS now. Every
+            // caller except `instantiate_child` (a PARENT's own declared
+            // children, which may still need `RegisterRemoteWire`s sent
+            // in between construction and starting) wants the old
+            // "construct then immediately start" behavior back -- send
+            // `StartSpawned` right away for those. `instantiate_child`
+            // passes `defer_start = true` and sends this itself, later,
+            // from `instantiate_local`'s own post-wires-loop pass, once
+            // every sibling's wires (including cross-actor
+            // `RegisterRemoteWire`s) are registered.
+            if !defer_start {
+                let _ = worker_tx.send(WorkerCmd::StartSpawned { local_id });
+            }
             ActorRoute::Pooled { worker_tx, local_id, stopped_rx: None, stop_sent: false }
         } else {
             let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
@@ -9660,6 +9768,7 @@ mod mailbox_cap_tests {
             pending: std::collections::VecDeque::new(),
             pending_stop: None,
             receive_ports: std::rc::Rc::new(std::collections::HashSet::new()),
+            ready_tx: std::sync::mpsc::channel().0,
         })]
     }
 
