@@ -2902,6 +2902,39 @@ impl Checker {
                     s.span,
                 );
             }
+            // A REAL, live-confirmed internal-compiler-error crash found+
+            // fixed (production-hardening): `supervise <child> restart
+            // on_failure` on a `concurrent component`/`agent` child used to
+            // crash `kupl run` at spawn time (`interp.rs::instantiate_
+            // supervised`'s own doc comment has the full writeup) --
+            // `Local`-only supervision is now correctly restored for the
+            // single-child case, but a GROUP-cascade strategy
+            // (`one_for_all`/`rest_for_one`) naming a concurrent sibling
+            // would need genuine cross-actor-thread coordination (one
+            // actor's own worker thread restarting a DIFFERENT actor
+            // living on a different thread) -- a materially larger,
+            // separate feature, deliberately NOT attempted alongside this
+            // fix. Rejected cleanly here instead of silently not
+            // cascading (which would be a real, silent correctness gap,
+            // worse than a clear compile-time refusal).
+            if s.policy == SupervisePolicy::RestartOnFailure && s.strategy != RestartStrategy::OneForOne {
+                if let Some(comp_name) = child_types.get(&s.child) {
+                    let concurrent =
+                        self.checked.components.get(comp_name).map(|sig| sig.concurrent).unwrap_or(false);
+                    if concurrent {
+                        self.err(
+                            "K0318",
+                            format!(
+                                "`supervise {}` uses a group-restart strategy (`one_for_all`/`rest_for_one`), \
+                                 but `{}` is a `concurrent component`/`agent` — cross-actor-thread group \
+                                 restart is not yet supported; use the default (one-for-one) strategy instead",
+                                s.child, s.child
+                            ),
+                            s.span,
+                        );
+                    }
+                }
+            }
         }
 
         // handlers

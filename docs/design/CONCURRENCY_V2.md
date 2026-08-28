@@ -228,6 +228,44 @@ Erlang's own three-strategy vocabulary (§2.2.6). Concretely:
   concern, unrelated to the actor-thread machinery). Lowest-risk item in
   this whole document; a good first PR-cv2 entry.
 
+**UPDATE, 2026-08-28 — a REAL, LIVE-CONFIRMED severity correction to this
+section's own scoping claim.** "No interaction with `concurrent
+component` at all" turned out to be only HALF true: `one_for_all`/
+`rest_for_one` group-cascade restart across actor threads genuinely IS
+out of scope (now enforced cleanly, K0318, rather than left unconsidered
+— see below) — but the plain, DEFAULT single-child `supervise child
+restart on_failure` case (`one_for_one`, no strategy keyword at all) was
+NOT a "Local-only concern" as this section assumed; it was simply
+BROKEN for a `concurrent component`/`agent` child, in the worst possible
+way. Live-confirmed: `supervise <concurrent-or-agent child> restart
+on_failure` passed `kupl check` cleanly but crashed `kupl run`
+IMMEDIATELY at spawn time with an internal compiler error (`instantiate_
+child`'s own unconditional `.unwrap_local_mut()` on a freshly spawned
+`Remote` instance) — deterministically, even when the child never
+actually panicked. Fixed (`interp.rs::instantiate_supervised`): the
+restart policy is now threaded THROUGH the spawn call (`WorkerCmd::
+Spawn`/`spawn_dedicated_actor`) and applied to the actor's own internal
+root instance BEFORE its own `on start` runs — the same ordering
+guarantee a `Local` child's own supervision already had, now correctly
+extended to `Remote` instead of crashing on it. A SECOND, related crash
+site (`wire_supervision_groups`, computing `restart_group` for EVERY
+`RestartOnFailure` declaration regardless of strategy) had the identical
+bug — fixed the same way (skip for `Remote`, since `one_for_one`'s own
+group is always empty and a non-empty group naming a `Remote` sibling is
+now rejected at check time, K0318, rather than reachable at all). Zero
+existing tests exercised `supervise` + `concurrent component` in any
+form before this fix (confirmed via a targeted grep sweep) — this whole
+combination was simply never tried, not deliberately deferred with a
+clean rejection the way `weight distributed` (K0316) or `at <placement>`
+(K0309) were for their own still-unbuilt pieces. `docs/design/AGENTS.md`
+§5 ("identity & memory") ALSO piggybacks on this fix: an `agent`'s own
+`state` now survives a supervised restart (unlike an ordinary
+`concurrent component`, which still resets, unchanged) — a small,
+`is_agent`-gated addition to `restart`'s own existing logic, made safe
+by this same fix (supervision for a concurrent/agent child now actually
+WORKS, so "does its state survive" became a real, testable question for
+the first time).
+
 ### 4.2 v1b — A movable/owned value fast path for cross-actor sends
 
 **The idea** (from Pony, §2.2.3, adapted to KUPL's existing `Rc`-based

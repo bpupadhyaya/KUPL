@@ -429,6 +429,20 @@ enum WorkerCmd {
         ready_tx: std::sync::mpsc::Sender<Option<(String, Span)>>,
         shutdown_panic: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
         local_id_tx: std::sync::mpsc::Sender<usize>,
+        /// `supervise <this child> restart on_failure [max N in <duration>]`
+        /// on the PARENT that's spawning this actor -- fixes a REAL,
+        /// live-confirmed internal-compiler-error crash (`instantiate_
+        /// child` used to call `.unwrap_local_mut()` unconditionally on a
+        /// freshly spawned Remote instance, which always panics; see
+        /// `instantiate_supervised`'s own doc comment for the full
+        /// writeup). Applied to the actor's OWN internal `instances[0]`
+        /// BEFORE its own `on start` runs (mirroring exactly when a
+        /// LOCAL supervised child's `restart_on_failure` is set relative
+        /// to its own `on start`, in `start_all`'s later, separate pass)
+        /// -- so a panic during THIS actor's own startup is supervised
+        /// too, not just later on-port-handler panics.
+        restart_on_failure: bool,
+        max_restarts: Option<(u32, i64)>,
     },
     Msg(usize, ActorMsg),
     Stop {
@@ -598,7 +612,17 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
     let mut cached_db: Option<(std::sync::Arc<crate::parallel::ProgramImage>, std::rc::Rc<ProgramDb>)> = None;
     while let Ok(cmd) = rx.recv() {
         match cmd {
-            WorkerCmd::Spawn { comp_name, portable_args, span, image, ready_tx, shutdown_panic, local_id_tx } => {
+            WorkerCmd::Spawn {
+                comp_name,
+                portable_args,
+                span,
+                image,
+                ready_tx,
+                shutdown_panic,
+                local_id_tx,
+                restart_on_failure,
+                max_restarts,
+            } => {
                 // Reserve this actor's own slot and reply with its
                 // `local_id` BEFORE running its actual startup sequence
                 // below -- this is what lets `instantiate_concurrent`'s
@@ -657,6 +681,16 @@ fn worker_loop(rx: std::sync::mpsc::Receiver<WorkerCmd>, tx: std::sync::mpsc::Se
                     .collect();
                 let startup = (|| -> Result<(), Flow> {
                     actor.instantiate_local(comp, &args, span)?;
+                    // Apply the PARENT's `supervise ... restart on_failure`
+                    // to THIS actor's own root instance BEFORE `start_all`
+                    // runs its `on start` -- mirrors exactly when a LOCAL
+                    // supervised child's flag is set relative to its own
+                    // `on start` (`instantiate_child`, before `start_all`'s
+                    // own later, separate pass over every instance).
+                    if restart_on_failure {
+                        actor.instances[0].unwrap_local_mut().restart_on_failure = true;
+                        actor.instances[0].unwrap_local_mut().max_restarts = max_restarts;
+                    }
                     actor.start_all()?;
                     actor.run_timers(100)?;
                     Ok(())
@@ -1883,14 +1917,28 @@ impl Interp {
             let v = self.eval(&a.value, parent_env)?;
             child_args.push((a.name.clone(), v));
         }
-        let v = self.instantiate(&child.component, &child_args, child.span)?;
-        if let Value::Component(cid) = v {
-            let supervise = supervises
-                .iter()
-                .find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
-            if let Some(s) = supervise {
-                self.instances[cid].unwrap_local_mut().restart_on_failure = true;
-                self.instances[cid].unwrap_local_mut().max_restarts = s.max_restarts;
+        let supervise =
+            supervises.iter().find(|s| s.child == child.name && s.policy == SupervisePolicy::RestartOnFailure);
+        let (restart_on_failure, max_restarts) = match supervise {
+            Some(s) => (true, s.max_restarts),
+            None => (false, None),
+        };
+        // `instantiate_supervised` (not plain `instantiate`) so a
+        // `Remote` (concurrent/agent) child's own restart policy is
+        // applied INSIDE its own spawn, before its own `on start` runs --
+        // see that function's own doc comment for the crash this fixes.
+        let v = self.instantiate_supervised(&child.component, &child_args, child.span, restart_on_failure, max_restarts)?;
+        if restart_on_failure {
+            if let Value::Component(cid) = v {
+                // `Local`: apply here, same as before (a `Remote` child's
+                // own policy was ALREADY applied, inside its own spawn --
+                // `self.instances[cid]` for a `Remote` child is just a
+                // thin `ActorHandle`, with no `restart_on_failure`/
+                // `max_restarts` fields of its own to set).
+                if let InstanceSlot::Local(_) = &self.instances[cid] {
+                    self.instances[cid].unwrap_local_mut().restart_on_failure = true;
+                    self.instances[cid].unwrap_local_mut().max_restarts = max_restarts;
+                }
             }
         }
         Ok(v)
@@ -1947,7 +1995,28 @@ impl Interp {
                     .filter_map(|s| child_ids.get(&s.child).copied())
                     .collect(),
             };
-            self.instances[this_id].unwrap_local_mut().restart_group = group;
+            // A REAL, LIVE-CONFIRMED bug found+fixed (production-
+            // hardening, the SECOND instance of the same crash class
+            // `instantiate_supervised`'s own doc comment describes): this
+            // used to call `.unwrap_local_mut()` unconditionally, crashing
+            // with an internal compiler error for ANY `Remote` (concurrent/
+            // agent) supervised child -- even the common `supervise child
+            // restart on_failure` case with no group strategy at all (every
+            // `RestartOnFailure` entry reaches this line, regardless of
+            // `OneForOne` always computing an empty `group`). `group` for a
+            // `Remote` child is guaranteed empty here: K0xxx (check.rs)
+            // rejects `one_for_all`/`rest_for_one` naming a `concurrent`
+            // sibling at check time (genuine cross-actor-thread group-
+            // cascade restart is a materially larger, separate feature,
+            // deliberately out of scope for this fix) -- so skipping this
+            // assignment for a `Remote` child is always correct: there is
+            // nothing to cascade, and `restart_group`'s own consumer
+            // (`restart_with_group`) only ever reads it for `Local`
+            // instances via the SAME `self.instances[id].unwrap_local_mut()`
+            // pattern anyway.
+            if let InstanceSlot::Local(_) = &self.instances[this_id] {
+                self.instances[this_id].unwrap_local_mut().restart_group = group;
+            }
         }
     }
 
@@ -1964,11 +2033,53 @@ impl Interp {
         args: &[(Option<String>, Value)],
         span: Span,
     ) -> EvalResult {
+        self.instantiate_supervised(comp_name, args, span, false, None)
+    }
+
+    /// Like `instantiate`, plus an OPTIONAL `supervise ... restart on_failure
+    /// [max N in <duration>]` policy from the PARENT declaring this child --
+    /// `instantiate` itself is a thin wrapper passing `(false, None)`, so
+    /// every OTHER caller (ordinary `let x = Component()` construction,
+    /// `repl.rs`, etc.) is unaffected.
+    ///
+    /// A REAL, LIVE-CONFIRMED bug found+fixed (production-hardening): before
+    /// this existed, `instantiate_child` called plain `instantiate` for
+    /// EVERY child, THEN separately set `restart_on_failure`/`max_restarts`
+    /// directly on `self.instances[cid]` via `.unwrap_local_mut()` --
+    /// correct for a `Local` child (whose `on start` doesn't run until
+    /// `start_all`'s own LATER, separate pass, so the flag is already set in
+    /// time), but `.unwrap_local_mut()` unconditionally PANICS (an internal-
+    /// compiler-error, not a KUPL-level diagnostic) if the child is
+    /// `Remote` (any `concurrent component`, and therefore every `agent`,
+    /// which is always concurrent) -- confirmed live: `supervise <concurrent
+    /// child> restart on_failure` passed `kupl check` cleanly but crashed
+    /// `kupl run` immediately at spawn time (exit 101, `internal compiler
+    /// error [src/interp.rs:1586]`), deterministically, EVEN when the child
+    /// never actually panicked -- the crash was in the SUPERVISION WIRING
+    /// itself, not the restart mechanism. Fixed by threading the policy
+    /// THROUGH the spawn call instead of setting it after the fact: for a
+    /// `Remote` child, `instantiate_concurrent` passes it into the actor's
+    /// own spawn command (`WorkerCmd::Spawn`/`spawn_dedicated_actor`), which
+    /// applies it to the actor's OWN internal `instances[0]` BEFORE that
+    /// actor's own `on start` runs -- the exact same ordering guarantee the
+    /// `Local` path already had, now extended to `Remote` instead of
+    /// crashing on it. Zero effect on `Local` children (`instantiate_local`
+    /// doesn't consume these two parameters at all; `instantiate_child`
+    /// still sets its own `self.instances[cid]` fields directly for that
+    /// case, unchanged).
+    fn instantiate_supervised(
+        &mut self,
+        comp_name: &str,
+        args: &[(Option<String>, Value)],
+        span: Span,
+        restart_on_failure: bool,
+        max_restarts: Option<(u32, i64)>,
+    ) -> EvalResult {
         let Some(comp) = self.db.components.get(comp_name).cloned() else {
             return Err(Self::panic_flow(format!("unknown component `{comp_name}`"), span));
         };
         if comp.concurrent {
-            return self.instantiate_concurrent(comp, args, span);
+            return self.instantiate_concurrent(comp, args, span, restart_on_failure, max_restarts);
         }
         self.instantiate_local(comp, args, span)
     }
@@ -2172,6 +2283,8 @@ impl Interp {
         comp: Rc<ComponentDecl>,
         args: &[(Option<String>, Value)],
         span: Span,
+        restart_on_failure: bool,
+        max_restarts: Option<(u32, i64)>,
     ) -> EvalResult {
         let mut portable_args: Vec<(Option<String>, crate::parallel::PortableValue)> =
             Vec::with_capacity(args.len());
@@ -2230,6 +2343,8 @@ impl Interp {
                     ready_tx,
                     shutdown_panic: shutdown_panic.clone(),
                     local_id_tx,
+                    restart_on_failure,
+                    max_restarts,
                 })
                 .expect("actor-pool worker thread ended unexpectedly -- this is a bug in KUPL, not your program");
             let local_id = local_id_rx.recv().expect(
@@ -2239,7 +2354,17 @@ impl Interp {
         } else {
             let (inbox_tx, inbox_rx) = std::sync::mpsc::sync_channel::<ActorMsg>(MAILBOX_CAP);
             let shutdown_panic_writer = shutdown_panic.clone();
-            let join = Self::spawn_dedicated_actor(comp_name, portable_args, span, image, ready_tx, shutdown_panic_writer, inbox_rx);
+            let join = Self::spawn_dedicated_actor(
+                comp_name,
+                portable_args,
+                span,
+                image,
+                ready_tx,
+                shutdown_panic_writer,
+                inbox_rx,
+                restart_on_failure,
+                max_restarts,
+            );
             ActorRoute::Dedicated { join: Some(join), inbox: Some(inbox_tx) }
         };
         let id = self.instances.len();
@@ -2282,6 +2407,8 @@ impl Interp {
         ready_tx: std::sync::mpsc::Sender<Option<(String, Span)>>,
         shutdown_panic_writer: std::sync::Arc<std::sync::Mutex<Option<(String, Span)>>>,
         inbox_rx: std::sync::mpsc::Receiver<ActorMsg>,
+        restart_on_failure: bool,
+        max_restarts: Option<(u32, i64)>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::Builder::new()
             .stack_size(crate::parallel::WORKER_STACK_SIZE)
@@ -2309,6 +2436,12 @@ impl Interp {
             };
             let startup = (|| -> Result<(), Flow> {
                 actor.instantiate_local(comp, &args, span)?;
+                // See `WorkerCmd::Spawn`'s own identical step for the full
+                // "why before `start_all`" rationale.
+                if restart_on_failure {
+                    actor.instances[0].unwrap_local_mut().restart_on_failure = true;
+                    actor.instances[0].unwrap_local_mut().max_restarts = max_restarts;
+                }
                 actor.start_all()?;
                 actor.run_timers(100)?;
                 Ok(())
@@ -2976,7 +3109,19 @@ impl Interp {
         }
         let comp = self.instances[id].unwrap_local_mut().comp.clone();
         eprintln!("[supervise] {} restarted after panic: {panic_msg}", comp.name);
-        self.reset_instance_state(id)?;
+        // `docs/design/AGENTS.md` §5 ("identity & memory"): an `agent` is
+        // designed to mimic a human worker, and a human recovering from a
+        // mistake doesn't lose their accumulated knowledge -- so, UNLIKE an
+        // ordinary `concurrent component` (which resets to fresh/just-
+        // instantiated `state` on every supervised restart, preserved
+        // behavior, unchanged), an agent's own `state` survives a restart.
+        // The existing restart-intensity limit above (`max N in <duration>`)
+        // is the SAME safety net this already relies on if an agent's own
+        // (now-preserved) state is itself what's causing repeated panics --
+        // no new escalation mechanism needed for this to be safe.
+        if !comp.is_agent {
+            self.reset_instance_state(id)?;
+        }
         for h in &comp.handlers {
             if matches!(h.trigger, Trigger::Start) {
                 self.run_handler(id, h, Value::Unit)?;
@@ -10026,5 +10171,61 @@ mod concurrent_tests {
 
         let result = interp.start_all();
         assert!(result.is_ok(), "a cleanly-started actor must not be reported as a panic");
+    }
+
+    /// `docs/design/AGENTS.md` §5 ("identity & memory"): an `agent` mimics
+    /// a human worker recovering from a mistake, not losing its own
+    /// accumulated state on a supervised restart -- UNLIKE an ordinary
+    /// `concurrent component`, which still resets to fresh/just-
+    /// instantiated `state` on every restart, exactly as before. Tests
+    /// `restart()` directly (bypassing the whole cross-thread actor
+    /// machinery -- irrelevant to THIS specific behavior, already
+    /// verified live via the CLI for the supervise+concurrent-child crash
+    /// fix itself) against two REAL instantiated components differing
+    /// only in `is_agent`, mutating `state` by hand (simulating whatever
+    /// a real handler would have done right before panicking) to prove
+    /// the branch in `restart` fires correctly for each.
+    #[test]
+    fn agent_restart_preserves_state_but_plain_concurrent_component_still_resets_it() {
+        let compiled = crate::run::compile(
+            "agent Counter {\n    intent \"test fixture\"\n    state count: Int = 0\n}\n\
+             concurrent component PlainWorker {\n    intent \"test fixture\"\n    state count: Int = 0\n}\n\
+             fun main() {}\n",
+        )
+        .expect("must compile");
+        let db = ProgramDb::build(&compiled.program, &compiled.checked);
+        let mut interp = Interp::new(db);
+
+        let as_int = |v: Option<super::Value>| match v {
+            Some(super::Value::Int(n)) => Some(n),
+            _ => None,
+        };
+
+        let agent_comp = interp.db.components.get("Counter").cloned().expect("Counter must be registered");
+        let v = interp
+            .instantiate_local(agent_comp, &[], super::Span::default())
+            .unwrap_or_else(|_| panic!("must instantiate"));
+        let super::Value::Component(agent_id) = v else { panic!("expected a component instance") };
+        interp.instances[agent_id].unwrap_local_mut().env.define("count", super::Value::Int(42));
+        interp.restart(agent_id, "boom").unwrap_or_else(|_| panic!("restart must succeed"));
+        assert_eq!(
+            as_int(interp.instances[agent_id].unwrap_local_mut().env.get("count")),
+            Some(42),
+            "an agent's own state must survive a supervised restart"
+        );
+
+        let plain_comp = interp.db.components.get("PlainWorker").cloned().expect("PlainWorker must be registered");
+        let v2 = interp
+            .instantiate_local(plain_comp, &[], super::Span::default())
+            .unwrap_or_else(|_| panic!("must instantiate"));
+        let super::Value::Component(plain_id) = v2 else { panic!("expected a component instance") };
+        interp.instances[plain_id].unwrap_local_mut().env.define("count", super::Value::Int(42));
+        interp.restart(plain_id, "boom").unwrap_or_else(|_| panic!("restart must succeed"));
+        assert_eq!(
+            as_int(interp.instances[plain_id].unwrap_local_mut().env.get("count")),
+            Some(0),
+            "a plain concurrent component's own state must still reset to its initializer on restart -- \
+             confirms this is a deliberate is_agent-only differentiation, not a universal behavior change"
+        );
     }
 }

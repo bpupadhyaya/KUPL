@@ -937,3 +937,35 @@ wire correctly registered. Fixing this properly would mean threading
 wire info into `WorkerCmd::Spawn` itself, ahead of knowing the
 destination's own route at spawn time — left as a documented future
 increment rather than rushed into this slice.
+
+**A SEPARATE, newly-discovered limitation (2026-08-28, found while
+verifying the `supervise`+`concurrent` child fix in §4.1 of `docs/
+design/CONCURRENCY_V2.md`, unrelated to supervision itself), documented
+here rather than fixed in that same pass:** the coordinator's own
+top-level program lifecycle does NOT wait for an in-flight cross-actor
+`emit`/`Deliver` chain to fully settle before shutting down. Live-
+confirmed with a MINIMAL repro (no panic, no supervision, no agent
+involved at all — two plain `concurrent component`s, `A` emits on its
+own `on start`, wired directly to `B`, whose own handler `print`s): the
+program consistently exits 0 with ZERO output, 3/3 runs. Root cause
+(by inspection, not yet fixed): `start_all` only waits for each LOCAL/
+Remote instance's own INITIAL `on start` + `run_timers(100)` to settle
+(`ready_rx.recv()`) — it has no way to know that `A`'s own `on start`
+triggered a cross-actor `Deliver` to `B` that `B`'s own worker thread
+hasn't processed yet, so `stop_all` can run (dropping every actor's own
+channel `Sender`, ending their `recv()` loops) before that delivery is
+even picked up. This is why the earlier actor-to-actor channels test
+(`concurrent_actor_to_concurrent_actor_direct_wire_delivers_without_a_
+coordinator_round_trip`, §9.4 above) deliberately observes its own
+result via a LATER, SEPARATE BLOCKING `Call` (which inherently waits for
+a reply) rather than a fire-and-forget `print` inside the destination's
+own handler — a pattern that, in hindsight, was quietly sidestepping
+this exact gap rather than proving it doesn't exist. Not fixed here:
+this is a genuinely separate, likely nontrivial architecture question
+(what does "the async work triggered by startup is done" even mean in
+general, for an arbitrarily deep/cyclic cross-actor emit graph?) — left
+as a documented, real limitation for a future increment, matching this
+whole file's own "known limitation, not silently ignored" discipline.
+Any test or example relying on a `concurrent`/`agent` handler's own
+`print`/side-effect being observable before process exit should use a
+blocking `Call` to synchronize instead, until this is addressed.
