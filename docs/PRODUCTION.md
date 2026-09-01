@@ -275,6 +275,28 @@ Being honest about what is not yet production-grade:
 - **Alpha stability.** The language and `.kx` binary format are versioned (a `.kx`
   built by a different compiler version is rejected with a clear message), but no
   long-term source or ABI stability is promised yet.
+- **`weight distributed`/`kupl node` is AUTHENTICATED, NOT ENCRYPTED —
+  do not run it across an untrusted network.** `docs/design/AGENTS.md`
+  §4/`docs/design/DISTRIBUTION.md`: a `concurrent` actor can now be
+  spawned on a separate `kupl node` process over a real TCP connection
+  (`interp.rs::ActorRoute::Distributed`). A shared-secret token (constant-
+  time compared, `distribution.rs::tokens_match`) gates who may connect,
+  spawn actors, or exchange messages at all — closing the "any host on
+  the network can silently spawn arbitrary components" failure mode a
+  fully open listener would have. But the token itself, and every
+  message after it (including full `PortableValue` payloads), travels in
+  PLAINTEXT — there is no TLS/mTLS in this slice. Put a `kupl node`
+  behind a VPN, SSH tunnel, or service mesh if the link crosses anything
+  you don't already trust; hand-rolling real TLS from scratch, under
+  time pressure, without expert review, was deliberately judged too
+  risky to attempt alongside this feature (matching this project's own
+  "never roll your own crypto for a security-critical primitive without
+  expert review" discipline elsewhere). This is also a NARROW slice of
+  the full `docs/design/DISTRIBUTION.md` vision: one statically-
+  configured node per connection (`KUPL_DISTRIBUTED_NODE` env var), no
+  `cap.Cluster` capability, no dynamic cluster membership, no deployment
+  manifest, no `at node(...)` placement syntax (still K0309-rejected) —
+  those remain "Phase 6+," not implemented by this slice.
 
 For the full design-vs-implemented audit, see [`GAPS.md`](GAPS.md). For the language
 itself, see [`reference/LANGUAGE-REFERENCE.md`](reference/LANGUAGE-REFERENCE.md); for

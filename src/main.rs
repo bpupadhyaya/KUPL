@@ -47,6 +47,9 @@ Usage:
   kupl context <file.kupl> <name> --json  Same, as machine-readable JSON
   kupl patch <f> <name> <repl> [--write]  Replace one item with repl's content
   kupl manifest <file.kupl>         Emit component manifests as JSON (visual tools)
+  kupl node <file.kupl> --listen <addr> --token <token>
+                                    Serve `weight distributed` actors over TCP
+                                    (shared-secret auth, PLAINTEXT -- see docs/design/DISTRIBUTION.md)
   kupl repl                         Start an interactive session
   kupl lsp                          Start the Language Server (stdio, for editors)
   kupl version                      Print version
@@ -319,6 +322,24 @@ fn run_cli() -> ExitCode {
             }
         },
         Some("manifest") => with_path(&args, run::emit_manifest),
+        // `--listen`/`--token` both take a value, unlike every OTHER
+        // subcommand's own bare `--flag`s -- `find_path_arg` (built for
+        // "skip bare flags, find the one path") doesn't fit this shape,
+        // so `node` parses its own args directly, matching `pkg publish`'s
+        // own precedent for a subcommand whose flags don't reduce to a
+        // single positional path.
+        Some("node") => {
+            let path = args.iter().skip(1).find(|a| !a.starts_with("--")).cloned();
+            let listen = find_flag_value(&args, "--listen");
+            let token = find_flag_value(&args, "--token");
+            match (path, listen, token) {
+                (Some(path), Some(listen), Some(token)) => run::run_node(&path, &listen, &token),
+                _ => {
+                    eprintln!("usage: kupl node <file.kupl> --listen <addr> --token <token>");
+                    2
+                }
+            }
+        }
         // A REAL usability bug found+fixed (production-hardening PR-it782, an
         // Explore survey finding, independently re-verified live before
         // implementing): `pkg`'s path argument was a raw `args.get(2)`, unlike
@@ -943,6 +964,15 @@ fn find_path_arg(args: &[String]) -> Result<&str, String> {
         i += 1;
     }
     path.ok_or_else(|| "missing <file.kupl> argument".to_string())
+}
+
+/// Finds `--flag <value>` (two separate tokens, matching `-o <value>`'s
+/// own established convention in this file rather than a `--flag=value`
+/// single-token form) anywhere in `args`. Used by `node`, whose
+/// `--listen`/`--token` flags don't fit `find_path_arg`'s "skip bare
+/// flags" shape.
+fn find_flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
 }
 
 fn with_path(args: &[String], f: impl Fn(&str) -> i32) -> i32 {
@@ -3695,9 +3725,79 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `weight distributed` (`docs/design/AGENTS.md` §4, `docs/design/
+    /// DISTRIBUTION.md`): a genuine end-to-end test involving a REAL
+    /// SECOND `kupl` OS process, not just a single-process assertion --
+    /// spawns `kupl node` as a real child process (a live TCP listener,
+    /// shared-secret authenticated), then runs a SEPARATE `kupl run`
+    /// invocation whose `agent Echo { weight distributed }` connects to
+    /// it via `KUPL_DISTRIBUTED_NODE`, calls `Echo`'s own exposed fun
+    /// (exercising `ActorRoute::Distributed`'s blocking-`Call` path, the
+    /// harder of the two message shapes -- `Deliver`'s fire-and-forget
+    /// path is already covered by `distribution.rs`'s own mock-server
+    /// unit tests), and confirms the reply round-tripped correctly.
+    #[test]
+    fn distributed_weight_actor_reaches_a_real_second_kupl_node_process() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-distributed-e2e-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dist.kupl");
+        std::fs::write(
+            &file,
+            "agent Echo {\n    intent \"replies over a real distributed connection\"\n    \
+                 weight distributed\n    \
+                 expose fun ping() -> Str { \"pong\" }\n}\n\
+             app Main {\n    intent \"distributed weight end-to-end test\"\n    \
+                 let e = Echo()\n    \
+                 on start { print(e.ping()) }\n}\n",
+        )
+        .unwrap();
+
+        let addr = "127.0.0.1:38199";
+        let token = "e2e-test-token";
+        let mut node = std::process::Command::new(&bin)
+            .args(["node", file.to_str().unwrap(), "--listen", addr, "--token", token])
+            .spawn()
+            .expect("spawn `kupl node` child process");
+
+        // Wait for the node to actually be listening (bounded retry, not a
+        // guessed fixed sleep) before running the client -- a connection
+        // attempt before the listener is up would fail with a real, if
+        // misleading, "connection refused" rather than proving anything
+        // about the feature itself.
+        let mut ready = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(ready, "`kupl node` never started listening on {addr}");
+
+        let out = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .env("KUPL_DISTRIBUTED_NODE", format!("{token}@{addr}"))
+            .output()
+            .unwrap();
+
+        let _ = node.kill();
+        let _ = node.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "pong\n", "{out:?}");
+    }
+
     /// KUPL Agents v1 (`docs/design/AGENTS.md` §4/§7): `agent` + `weight`
-    /// dispatch onto the two currently-implemented concurrency tiers
-    /// (`weight distributed` is checker-rejected, K0316, separately).
+    /// dispatch onto the pooled/dedicated concurrency tiers (`weight
+    /// distributed`, a THIRD tier, has its own dedicated end-to-end test
+    /// below, `distributed_weight_actor_reaches_a_real_second_kupl_node_
+    /// process`, since it needs a real second OS process rather than
+    /// just asserting on `kupl run`'s own single-process output).
     /// Runs the SAME functional scenario (state accumulates correctly
     /// across two calls) under `weight lightweight` (pooled, the
     /// default) and `weight heavyweight` (forced dedicated thread, even

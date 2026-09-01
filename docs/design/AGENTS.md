@@ -353,7 +353,7 @@ directly:
 |---|---|---|
 | `lightweight` (default) | `ActorPool`-multiplexed pooled actor (`interp.rs`'s own `PooledActor`/`ActorRoute::Pooled`) — many agents share few OS threads | Go goroutines |
 | `heavyweight` | Dedicated OS thread (`ActorRoute::Dedicated`) — one real thread, always resident | Java platform threads |
-| `distributed` | A remote node, via `docs/design/DISTRIBUTION.md`'s own `at node(...)` placement syntax (parses today; K0309 rejects it pending real transport — see that doc's own Phase 6+ note) | Erlang distributed processes |
+| `distributed` | **UPDATE, 2026-09-01 — IMPLEMENTED**, via a real TCP transport (`ActorRoute::Distributed`, `kupl node`, `docs/design/DISTRIBUTION.md`'s own "wire format: kser" section) — NOT `at node(...)` placement (that remains a SEPARATE, still-unimplemented syntax, K0309, its own future increment) | Erlang distributed processes |
 
 This table is the single most important insight this proposal makes: **an
 `agent` is not a fourth concurrency primitive that needs its own runtime.**
@@ -372,15 +372,21 @@ implementation (KUPL commit history, 2026-08-26):
   `concurrent component`. `is_agent` always forces `concurrent: true` at
   parse time (an agent IS inherently its own actor). A `weight <value>`
   clause is a new contextual keyword inside the body (`parser.rs`, same
-  style as `state`), agent-only (K0317), with `distributed` parsing but
-  checker-rejected (K0316, mirroring K0309's own precedent exactly) since
-  real transport doesn't exist yet.
-- **Runtime**: `interp.rs::instantiate_concurrent` gained ONE new
-  condition — `weight heavyweight` forces the dedicated-thread path
+  style as `state`), agent-only (K0317). `distributed` originally parsed
+  but was checker-rejected (K0316, mirroring K0309's own precedent) since
+  real transport didn't exist yet — **UPDATE, 2026-09-01: K0316 is now
+  RETIRED, `distributed` is genuinely implemented.** See §7's own updated
+  entry for the full writeup.
+- **Runtime**: `interp.rs::instantiate_concurrent` gained TWO new
+  conditions — `weight heavyweight` forces the dedicated-thread path
   (`ActorRoute::Dedicated`) even at the TOP level (not just the pre-
-  existing nested-spawn case); `lightweight`/unset are a complete no-op,
-  identical to `concurrent component`'s existing pooled-by-default
-  behavior. No new `ActorRoute` variant, no new dispatch machinery.
+  existing nested-spawn case); `weight distributed` (checked FIRST,
+  entirely separate from the Pooled-vs-Dedicated choice) connects out to
+  a `kupl node` over TCP instead. `lightweight`/unset are a complete
+  no-op, identical to `concurrent component`'s existing pooled-by-default
+  behavior. A new THIRD `ActorRoute::Distributed` variant backs
+  `distributed`; `heavyweight`/`lightweight` needed no new dispatch
+  machinery beyond the existing `Pooled`/`Dedicated` split.
 - **VM/native**: needed ZERO changes — `compile.rs`/`cgen.rs` never read
   `is_agent`/`weight` at all, confirmed live (`kupl run --vm`/`kupl
   native` both execute an `agent` exactly like an ordinary `concurrent
@@ -480,10 +486,31 @@ specific answer yet, only to naming the axes:
   `kupl native` all agree; a real end-to-end test proves BOTH
   `lightweight` and `heavyweight` produce correct results on every
   engine; K0125 (malformed `weight` value)/K0316 (`distributed` not
-  implemented)/K0317 (`weight` is agent-only) diagnostics; `kupl fmt`
-  round-trips `agent`/`weight` losslessly; full `cargo test --bin kupl`
-  (90/90) and `cargo test --lib` (1790/1790, green twice); revert-and-
-  verify on both the checker restriction and the interp.rs dispatch.
+  implemented, since RETIRED — see below)/K0317 (`weight` is agent-only)
+  diagnostics; `kupl fmt` round-trips `agent`/`weight` losslessly; full
+  `cargo test --bin kupl` (90/90) and `cargo test --lib` (1790/1790,
+  green twice); revert-and-verify on both the checker restriction and
+  the interp.rs dispatch.
+- **DONE, 2026-09-01:** `weight distributed` itself — real, node-to-node
+  actor transport (`interp.rs::ActorRoute::Distributed`, `kupl node`
+  server subcommand, `src/kser.rs` hand-rolled binary wire encoding for
+  `PortableValue`, `src/distribution.rs`'s `DistMsg` protocol + shared-
+  secret-authenticated TCP). K0316 retired. Security posture stated
+  plainly: AUTHENTICATED (a shared-secret token, constant-time compared)
+  but NOT ENCRYPTED — run behind a VPN/SSH tunnel for anything crossing
+  an untrusted network; see `docs/design/DISTRIBUTION.md`'s own updated
+  status and `docs/PRODUCTION.md`'s Known Limitations for the full
+  writeup. Verified: `kser`/`distribution` unit tests (binary round-trip
+  including NaN bit-pattern preservation, frame boundaries, auth/spawn/
+  deliver/call protocol shapes, all against real TCP loopback mock
+  servers); a genuine end-to-end test spawning a REAL second `kupl node`
+  OS process and round-tripping a message through it; full `cargo test
+  --lib` green twice and `cargo test --bin kupl` green; revert-and-verify
+  on the `ActorRoute` wiring. NOT implemented: `at node(...)` placement
+  syntax (a separate, still-unimplemented mechanism, K0309) and the
+  broader `cap.Cluster`/dynamic-membership/mTLS vision `DISTRIBUTION.md`
+  itself scopes as "Phase 6+" — this ships the single-static-node,
+  authenticated-but-plaintext slice specifically, not the full spec.
 - **DONE:** §3's structural slice — `protocol Name { intent "..." forbids
   <effect>... }` + `agent Foo follows Protocol1, Protocol2 { .. }`,
   checker-enforced via K1000/K1001/K1002/K1003 (§3's own updated section

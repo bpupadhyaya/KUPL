@@ -1631,6 +1631,24 @@ enum ActorRoute {
         /// mirrors `Dedicated`'s `inbox: None` check exactly.
         stop_sent: bool,
     },
+    /// `weight distributed` (`docs/design/AGENTS.md` §4, `docs/design/
+    /// DISTRIBUTION.md`): this actor runs in a SEPARATE `kupl node`
+    /// process, reached over a plain, shared-secret-AUTHENTICATED (never
+    /// ENCRYPTED -- see `distribution.rs`'s own module doc comment for
+    /// the full security posture) TCP connection. One connection hosts
+    /// exactly ONE actor (unlike `Pooled`'s worker-sharing or a `kupl
+    /// node`'s own per-connection design allowing more) -- the simplest
+    /// correct v1, at the cost of one OS socket per distributed actor
+    /// instead of connection reuse; a real optimization opportunity left
+    /// for later, not a correctness concern (deliberately named here so
+    /// it isn't mistaken for an oversight).
+    Distributed {
+        /// `None` once the connection has failed or `stop_all` has closed
+        /// it -- mirrors `Dedicated`'s own `inbox: Option<...>` "already
+        /// shut down" sentinel exactly, including the same "message
+        /// dropped, not panicked" handling at every send site.
+        stream: Option<std::net::TcpStream>,
+    },
 }
 
 /// A handle to a `concurrent`-marked instance running on its own actor
@@ -2343,7 +2361,7 @@ impl Interp {
                 let src_route = match &self.instances[src] {
                     InstanceSlot::Remote(h) => match &h.route {
                         ActorRoute::Pooled { worker_tx, local_id, .. } => Some((worker_tx.clone(), *local_id)),
-                        ActorRoute::Dedicated { .. } => None,
+                        ActorRoute::Dedicated { .. } | ActorRoute::Distributed { .. } => None,
                     },
                     InstanceSlot::Local(_) => unreachable!("just confirmed Remote above"),
                 };
@@ -2352,7 +2370,7 @@ impl Interp {
                         ActorRoute::Pooled { worker_tx, local_id, .. } => {
                             Some(RemoteWireTarget::Pooled { worker_tx: worker_tx.clone(), local_id: *local_id })
                         }
-                        ActorRoute::Dedicated { .. } => None,
+                        ActorRoute::Dedicated { .. } | ActorRoute::Distributed { .. } => None,
                     },
                     InstanceSlot::Local(_) => None,
                 };
@@ -2479,6 +2497,49 @@ impl Interp {
         // lightweight`/unset both mean "use the ordinary pooled-unless-
         // nested logic," i.e. no behavior change for anything that isn't
         // `weight heavyweight`.
+        // `weight distributed` (`docs/design/AGENTS.md` §4, `docs/design/
+        // DISTRIBUTION.md`): a THIRD route, checked first and entirely
+        // separate from the Pooled-vs-Dedicated choice below -- this
+        // actor doesn't run in THIS process at all. Fully synchronous
+        // (connect, authenticate, spawn, all block right here) unlike the
+        // async Pooled/Dedicated paths below, so a connection/auth/spawn
+        // failure is reported DIRECTLY as this call's own `Err`, with an
+        // accurate span pointing at the actual `Component()` call site --
+        // more useful than deferring to `start_all`'s own generic later
+        // panic the way Pooled/Dedicated's own construction failures do,
+        // and correct here specifically BECAUSE nothing async is possible
+        // to race against: the outcome is already fully known before this
+        // function can return at all.
+        if comp.weight == Some(AgentWeight::Distributed) {
+            let raw = std::env::var(crate::distribution::KUPL_DISTRIBUTED_NODE_ENV).map_err(|_| {
+                Self::panic_flow(
+                    format!(
+                        "`weight distributed` needs the {} environment variable (format: `<token>@<host:port>`) to know which `kupl node` to spawn `{}` on -- see `docs/design/DISTRIBUTION.md`",
+                        crate::distribution::KUPL_DISTRIBUTED_NODE_ENV,
+                        comp.name
+                    ),
+                    span,
+                )
+            })?;
+            let (token, addr) = crate::distribution::parse_node_env(&raw).map_err(|e| Self::panic_flow(e, span))?;
+            let mut stream = crate::distribution::connect_and_authenticate(&addr, &token)
+                .map_err(|e| Self::panic_flow(e, span))?;
+            crate::distribution::spawn_remote(&mut stream, &comp_name, portable_args)
+                .map_err(|e| Self::panic_flow(e, span))?;
+            // Already fully started (the remote node's own Spawn handler
+            // runs `on start`/timers synchronously before replying) --
+            // `ready_tx` still needs exactly one send, unconditionally,
+            // since `start_all`'s second pass always does one
+            // `ready.recv()` per `Remote` instance regardless of route.
+            let _ = ready_tx.send(None);
+            let id = self.instances.len();
+            self.instances.push(InstanceSlot::Remote(ActorHandle {
+                route: ActorRoute::Distributed { stream: Some(stream) },
+                ready: Some(ready_rx),
+                shutdown_panic,
+            }));
+            return Ok(Value::Component(id));
+        }
         let force_dedicated = matches!(comp.weight, Some(AgentWeight::Heavyweight));
         let route = if POOL_WORKER_ID.with(|c| c.get()).is_none() && !force_dedicated {
             let worker_tx = ActorPool::get().assign();
@@ -2749,6 +2810,134 @@ impl Interp {
         .expect("failed to spawn a concurrent component's actor thread (OS refused a 2GB stack reservation)")
     }
 
+    /// The `kupl node` server side of `weight distributed` -- the CALLER
+    /// (`main.rs`'s own `kupl node` subcommand) accepts a `TcpStream` from
+    /// its `TcpListener` and hands it here, one call per connection, each
+    /// meant to run on its OWN thread (mirrors `spawn_dedicated_actor`'s
+    /// own "one OS thread per actor" shape, just reached over a socket
+    /// instead of an in-process channel).
+    ///
+    /// Per `ActorRoute::Distributed`'s own doc comment, this v1 design
+    /// hosts exactly ONE actor per connection: authenticate, wait for
+    /// exactly one `Spawn`, construct+start that actor EXACTLY like
+    /// `spawn_dedicated_actor` does (`instantiate_local` + `start_all` +
+    /// `run_timers(100)`), then service `Deliver`/`Call` frames — reusing
+    /// `Interp::send`/`Interp::eval_method` directly, the SAME calls
+    /// `spawn_dedicated_actor`'s own message loop makes for `ActorMsg::
+    /// Deliver`/`ActorMsg::Call` — until the connection closes (a clean
+    /// EOF, a malformed frame, or a genuine KUPL panic during delivery),
+    /// at which point the actor's own `stop_all` runs, exactly mirroring
+    /// `spawn_dedicated_actor`'s own end-of-life shutdown.
+    ///
+    /// Best-effort throughout: any protocol violation (a message sent out
+    /// of order, e.g. `Deliver` before `Spawn`) or I/O failure just ends
+    /// this ONE connection early -- there is no coordinator on the other
+    /// end of a TCP connection to report a Rust-level bug to the way
+    /// `shutdown_panic` does for Pooled/Dedicated, so the failure is
+    /// simply observed by the CLIENT side as a closed/failed connection
+    /// (`ActorRoute::Distributed`'s own "poison the stream on error"
+    /// handling already covers that).
+    pub fn serve_distributed_connection(
+        mut stream: std::net::TcpStream,
+        token: &str,
+        db: std::rc::Rc<ProgramDb>,
+        image: std::sync::Arc<crate::parallel::ProgramImage>,
+    ) {
+        let Ok(first) = crate::kser::read_value_frame(&mut stream) else { return };
+        let Ok(crate::distribution::DistMsg::Auth { token: got }) = crate::distribution::DistMsg::from_wire(first) else {
+            return;
+        };
+        if !crate::distribution::tokens_match(&got, token) {
+            let _ = crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::AuthFailed.to_wire());
+            return;
+        }
+        if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::AuthOk.to_wire()).is_err() {
+            return;
+        }
+
+        let Ok(second) = crate::kser::read_value_frame(&mut stream) else { return };
+        let Ok(crate::distribution::DistMsg::Spawn { comp_name, args }) = crate::distribution::DistMsg::from_wire(second)
+        else {
+            return;
+        };
+        let Some(comp) = db.components.get(&comp_name).cloned() else {
+            let _ = crate::kser::write_value_frame(
+                &mut stream,
+                &crate::distribution::DistMsg::SpawnErr { msg: format!("unknown component `{comp_name}`") }.to_wire(),
+            );
+            return;
+        };
+        let mut actor = Interp::new_with_image(db, image);
+        let args: Vec<(Option<String>, Value)> =
+            args.into_iter().map(|(name, pv)| (name, crate::parallel::from_portable(&pv))).collect();
+        let startup = (|| -> Result<(), Flow> {
+            actor.instantiate_local(comp, &args, Span::default())?;
+            actor.start_all()?;
+            actor.run_timers(100)?;
+            Ok(())
+        })();
+        match startup {
+            Ok(()) => {
+                if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::SpawnOk { remote_id: 0 }.to_wire()).is_err() {
+                    return;
+                }
+            }
+            Err(Flow::Panic { msg, .. }) => {
+                let _ = crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::SpawnErr { msg }.to_wire());
+                return;
+            }
+            Err(_) => {
+                let _ = crate::kser::write_value_frame(
+                    &mut stream,
+                    &crate::distribution::DistMsg::SpawnErr {
+                        msg: "internal error: unexpected control flow escaped a distributed actor's own startup".to_string(),
+                    }
+                    .to_wire(),
+                );
+                return;
+            }
+        }
+
+        loop {
+            let Ok(frame) = crate::kser::read_value_frame(&mut stream) else { break };
+            let Ok(msg) = crate::distribution::DistMsg::from_wire(frame) else { break };
+            match msg {
+                crate::distribution::DistMsg::Deliver { port, value, .. } => {
+                    let v = crate::parallel::from_portable(&value);
+                    if actor.send(0, &port, v).is_err() {
+                        break;
+                    }
+                }
+                crate::distribution::DistMsg::Call { fn_name, args, call_id, .. } => {
+                    let args: Vec<Value> = args.iter().map(crate::parallel::from_portable).collect();
+                    let result = actor.eval_method(Value::Component(0), &fn_name, args, Span::default());
+                    let reply = match result {
+                        Ok(v) => match crate::parallel::to_portable(&v) {
+                            Some(pv) => Ok(pv),
+                            None => Err(format!(
+                                "internal error: `{fn_name}`'s return value is not portable -- K0306 should have rejected this at check time"
+                            )),
+                        },
+                        Err(Flow::Panic { msg, .. }) => Err(msg),
+                        Err(_) => Err("internal error: unexpected control flow escaped a distributed expose call".to_string()),
+                    };
+                    if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::CallReply { call_id, result: reply }.to_wire())
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                // Every other variant (`Auth`/`AuthOk`/`AuthFailed`/`Spawn`/
+                // `SpawnOk`/`SpawnErr`/`CallReply`) is either already
+                // consumed above or is a reply-only shape this server side
+                // never expects to RECEIVE -- ending the connection is the
+                // correct, safe response to a protocol violation.
+                _ => break,
+            }
+        }
+        let _ = actor.stop_all(actor.instances.len());
+    }
+
     /// Deliver `on start` to instance `id` and all its descendants (creation order).
     ///
     /// A `Remote` (`concurrent`) instance's own `on start` already ran, on
@@ -2869,6 +3058,23 @@ impl Interp {
                             *stop_sent = true;
                         }
                     }
+                    ActorRoute::Distributed { stream } => {
+                        // Dropping the `TcpStream` closes the connection
+                        // (a TCP FIN), which is what the server-side
+                        // `serve_distributed_connection`'s own `read_frame`
+                        // observes as `UnexpectedEof` -- the SAME "closing
+                        // the channel ends the recv loop" signal
+                        // `Dedicated`'s `inbox.take()` sends above, just
+                        // over a socket instead of an `mpsc::Sender`. No
+                        // second-pass "wait for confirmation" exists for
+                        // this route (see `ActorRoute::Distributed`'s own
+                        // doc comment) -- an accepted v1 simplification,
+                        // not silently different: the SERVER still runs
+                        // the remote actor's own `on stop` after seeing
+                        // the close, this coordinator just doesn't block
+                        // on that finishing first.
+                        stream.take();
+                    }
                 }
                 continue;
             }
@@ -2922,6 +3128,10 @@ impl Interp {
                     ActorRoute::Pooled { stopped_rx, .. } => {
                         stopped_rx.take().map(|rx| rx.recv().is_err()).unwrap_or(false)
                     }
+                    // No OS thread on this side of a `Distributed` route to
+                    // panic -- the first pass above already closed the
+                    // connection; nothing further to check here.
+                    ActorRoute::Distributed { .. } => false,
                 };
                 {
                     if thread_panicked {
@@ -3143,7 +3353,7 @@ impl Interp {
         // a different thread entirely). A conversion failure here would
         // mean K0306 failed to reject a non-portable port type, a compiler
         // bug, not a reachable user-facing case.
-        if let InstanceSlot::Remote(handle) = &self.instances[id] {
+        if let InstanceSlot::Remote(handle) = &mut self.instances[id] {
             let Some(pv) = crate::parallel::to_portable(&value) else {
                 return Err(Self::panic_flow(
                     format!("internal error: message to concurrent instance {id} on port `{port}` is not portable -- K0306 should have rejected this at check time"),
@@ -3158,7 +3368,7 @@ impl Interp {
             // `enqueue_pending`'s own overflow behavior for Pooled actors)
             // this is a clean, diagnosed panic instead of silent unbounded
             // growth or a silent drop.
-            match &handle.route {
+            match &mut handle.route {
                 ActorRoute::Dedicated { inbox: Some(inbox), .. } => {
                     if let Err(std::sync::mpsc::TrySendError::Full(_)) =
                         try_send_with_backoff(inbox, ActorMsg::Deliver(port.to_string(), pv))
@@ -3175,6 +3385,27 @@ impl Interp {
                 ActorRoute::Pooled { worker_tx, local_id, stop_sent, .. } => {
                     if !*stop_sent {
                         let _ = worker_tx.send(WorkerCmd::Msg(*local_id, ActorMsg::Deliver(port.to_string(), pv)));
+                    }
+                }
+                // A `Deliver` over a closed/failed connection is dropped,
+                // same as `Dedicated { inbox: None, .. }` above -- no
+                // panic, matching "an ordinary message arriving after the
+                // program has already finished has no observable effect."
+                // A genuine I/O error mid-write (as opposed to the
+                // connection already being known-closed) is treated the
+                // SAME way -- this is fire-and-forget `emit`, which has
+                // never had a way to report a delivery failure back to its
+                // OWN caller (the sender doesn't block on a Pooled/
+                // Dedicated `Deliver` succeeding either); poisoning the
+                // stream (setting it to `None`) so every LATER send/call
+                // on this same route also cleanly treats it as shut down,
+                // instead of re-attempting a write on a socket already
+                // known to be broken.
+                ActorRoute::Distributed { stream } => {
+                    if let Some(s) = stream {
+                        if crate::distribution::deliver_remote(s, 0, port, pv).is_err() {
+                            *stream = None;
+                        }
                     }
                 }
             }
@@ -5313,18 +5544,56 @@ impl Interp {
             };
             portable_args.push(pv);
         }
-        let InstanceSlot::Remote(handle) = &self.instances[id] else {
+        let InstanceSlot::Remote(handle) = &mut self.instances[id] else {
             unreachable!("caller already confirmed this slot is Remote");
         };
         let already_shutdown = match &handle.route {
             ActorRoute::Dedicated { inbox, .. } => inbox.is_none(),
             ActorRoute::Pooled { stop_sent, .. } => *stop_sent,
+            ActorRoute::Distributed { stream } => stream.is_none(),
         };
         if already_shutdown {
             return Err(Self::panic_flow(
                 format!("concurrent instance {id} has already shut down; cannot call `{name}`"),
                 span,
             ));
+        }
+        // `Distributed` is handled entirely separately, before any of the
+        // `reply_tx`/`reply_rx` machinery below: over a single-actor TCP
+        // connection, a `Call` is a plain synchronous request/reply (send
+        // the frame, block reading exactly one reply frame back -- see
+        // `distribution::call_remote_over_wire`'s own doc comment for why
+        // no call-id matching against OTHER in-flight calls is needed),
+        // not an async message needing a reply channel at all. Kept as an
+        // early return specifically so the Dedicated/Pooled logic below
+        // stays byte-for-byte untouched.
+        if let ActorRoute::Distributed { stream } = &mut handle.route {
+            self.pending_remote_calls.insert(id);
+            let outcome = match stream {
+                Some(s) => {
+                    let _ = s.set_read_timeout(timeout);
+                    let _ = s.set_write_timeout(timeout);
+                    match crate::distribution::call_remote_over_wire(s, 0, name, portable_args, 0) {
+                        Ok(result) => Some(result.map_err(|msg| (msg, span))),
+                        Err(_transport_err) => {
+                            *stream = None;
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            self.pending_remote_calls.remove(&id);
+            return match outcome {
+                Some(Ok(pv)) => Ok(crate::parallel::from_portable(&pv)),
+                Some(Err((msg, panic_span))) => Err(Self::panic_flow(msg, panic_span)),
+                None => Err(Self::panic_flow(
+                    format!(
+                        "concurrent instance {id} did not respond to `{name}` (the distributed connection timed out, failed, or had already shut down)"
+                    ),
+                    span,
+                )),
+            };
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let call_msg = ActorMsg::Call { fn_name: name.to_string(), args: portable_args, chain: vec![id], reply: reply_tx };
@@ -5340,6 +5609,12 @@ impl Interp {
             },
             ActorRoute::Dedicated { inbox: None, .. } => false,
             ActorRoute::Pooled { worker_tx, local_id, .. } => worker_tx.send(WorkerCmd::Msg(*local_id, call_msg)).is_ok(),
+            // Unreachable in practice -- `Distributed` always returns
+            // early above, before this match is ever reached. Kept only
+            // for exhaustiveness; `unreachable!()` rather than silently
+            // treating it as "not sent" so a future refactor that removes
+            // the early return can't silently regress into this dead arm.
+            ActorRoute::Distributed { .. } => unreachable!("Distributed always returns early, before this match"),
         };
         self.pending_remote_calls.insert(id);
         let mut timed_out = false;

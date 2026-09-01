@@ -749,6 +749,62 @@ pub fn run_program(path: &str) -> i32 {
     }
 }
 
+/// `kupl node <file.kupl> --listen <addr> --token <token>` -- the SERVER
+/// side of `weight distributed` (`docs/design/DISTRIBUTION.md`,
+/// `docs/design/AGENTS.md` §4). Compiles the SAME program a client-side
+/// `weight distributed` spawn expects to find components in, then accepts
+/// connections forever, one OS thread per connection -- mirrors
+/// `ActorRoute::Dedicated`'s own "one real resource per actor" shape
+/// rather than `ActorPool`'s worker-sharing, since a node's own
+/// connection count is bounded by how many DISTINCT client processes
+/// deploy against it, not by a single program's own actor count (what
+/// `ActorPool` was built to amortize).
+///
+/// `Rc<ProgramDb>` is deliberately NOT built here and handed to each
+/// connection thread -- `Rc` isn't `Send`, the same constraint
+/// `worker_loop`'s own per-actor `ProgramDb` construction is already
+/// built around (see that function's own doc comment). Only the
+/// `Send + Sync` `Arc<ProgramImage>` crosses the `std::thread::spawn`
+/// boundary; each connection's own thread calls `image.actor_db()`
+/// itself to build a fresh, thread-local `Rc<ProgramDb>`, exactly
+/// mirroring `worker_loop`'s own per-actor construction (just without
+/// that function's OWN per-worker caching, since a `kupl node` connection
+/// is expected to be far longer-lived than one pooled actor, making the
+/// one-time `actor_db()` cost per CONNECTION, not per actor, negligible
+/// by comparison).
+///
+/// Never returns under normal operation (an infinite `accept()` loop) --
+/// only an unrecoverable bind failure, or the process being killed/
+/// signaled externally, ends it (matching how a long-running server
+/// process is expected to be managed; there is no in-band "shut down
+/// gracefully" message in this v1 protocol).
+pub fn run_node(path: &str, listen_addr: &str, token: &str) -> i32 {
+    let (compiled, _map) = match load_compile(path) {
+        Ok(ok) => ok,
+        Err(code) => return code,
+    };
+    let db = ProgramDb::build(&compiled.program, &compiled.checked);
+    let image = crate::parallel::ProgramImage::from_db(&db);
+    let listener = match std::net::TcpListener::bind(listen_addr) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("error: could not bind {listen_addr}: {e}");
+            return 1;
+        }
+    };
+    eprintln!("kupl node: listening on {listen_addr} (serving `{path}`)");
+    for conn in listener.incoming() {
+        let Ok(stream) = conn else { continue };
+        let image = image.clone();
+        let token = token.to_string();
+        std::thread::spawn(move || {
+            let db = std::rc::Rc::new(image.actor_db());
+            Interp::serve_distributed_connection(stream, &token, db, image);
+        });
+    }
+    0
+}
+
 /// `kupl run --vm`: compile to KVM bytecode and execute on the register VM.
 pub fn run_program_vm(path: &str) -> i32 {
     let Ok((compiled, map)) = load_compile(path) else { return 1 };

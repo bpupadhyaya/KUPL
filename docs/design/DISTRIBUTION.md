@@ -3,11 +3,42 @@
 Proposal v0.1 — 2026-07-03.
 Status: Spec v1.0's placement-syntax slice is **implemented** (`at node(...)`
 parses; the checker rejects it with K0309 on every runtime — see
-`docs/reference/DIAGNOSTICS.md`). Everything past that — the wire format,
-`cap.Cluster`, real remote wiring — remains **design now, implement later**
-(toolchain Phase 6+). The wire format and "what may cross a network port" rules
-must be fixed in spec v1.0, because they constrain the type system and cannot be
-retrofitted.
+`docs/reference/DIAGNOSTICS.md`).
+
+**UPDATE, 2026-09-01: real remote wiring now EXISTS, via a DIFFERENT
+mechanism than this doc originally sequenced.** `docs/design/AGENTS.md`
+§4's `weight distributed` (not `at node(...)` — that placement syntax
+remains unimplemented, still K0309) now genuinely connects a `concurrent`
+actor to a separate `kupl node` process over a real TCP transport:
+`interp.rs::ActorRoute::Distributed`, a hand-rolled binary wire encoding
+for `PortableValue` (`src/kser.rs`, this doc's own "kser" name below,
+built ahead of schedule specifically to back this), and a small
+request/reply protocol (`src/distribution.rs::DistMsg` — Auth/Spawn/
+Deliver/Call, all just tagged `kser`-encoded values, no second wire
+format needed). This is deliberately a NARROWER slice than the full
+vision below: ONE statically-configured node per connection (the
+`KUPL_DISTRIBUTED_NODE` env var, `<token>@<host:port>`), no `cap.Cluster`
+capability, no dynamic membership, no deployment manifest. **Security
+posture, stated plainly:** the connection is SHARED-SECRET
+AUTHENTICATED (a token, constant-time compared, gates who may spawn
+actors or send messages at all) but NOT ENCRYPTED — every message,
+including the token itself, travels in plaintext. Do not run a
+`kupl node` across any network you don't already trust; put it behind a
+VPN/SSH tunnel/service mesh. Hand-rolling real TLS from scratch, under
+time pressure, without expert review, is exactly the class of risk this
+doc's own ORIGINAL sequencing reasoning (below) was written to avoid —
+this update does not attempt it either; see `docs/PRODUCTION.md`'s
+Known Limitations for the same caveat in the production-readiness
+context.
+
+Everything past THIS slice — `cap.Cluster`, dynamic membership,
+deployment manifests, port references, the full "what may cross a
+network port" portability rules, and real transport-layer encryption —
+remains **design now, implement later** (toolchain Phase 6+, per this
+doc's own original sequencing below, still accurate for everything
+except the one slice just described). The wire format and "what may
+cross a network port" rules must be fixed in spec v1.0, because they
+constrain the type system and cannot be retrofitted.
 
 **Why this doc exists:** "any software application" includes the most common shape
 of all — client + server + database across a network. KUPL's component model
@@ -117,3 +148,13 @@ Explicitly **not portable**:
   membership later), remote wiring in KVM/native runtimes, deployment manifests.
 - Visual tools benefit immediately at spec level: an architecture canvas can show
   node boundaries as real, typed facts of the program rather than documentation.
+- **DONE, 2026-09-01 (a NARROWER slice, out of sequence relative to the
+  above):** `weight distributed` (`docs/design/AGENTS.md` §4) shipped
+  real remote wiring WITHOUT waiting for `cap.Cluster`/deployment
+  manifests/`at node(...)` — a static, single-node-per-connection,
+  shared-secret-authenticated (not encrypted) TCP transport, `kupl node`.
+  See this doc's own top-of-file status update for the full writeup and
+  the explicit security caveat. This does NOT retire the Phase 6+ items
+  above — they cover genuinely different ground (cluster membership,
+  deployment-manifest-driven placement, `at node(...)` syntax, real
+  transport encryption) this slice deliberately left alone.

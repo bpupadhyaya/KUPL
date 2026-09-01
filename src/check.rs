@@ -2099,18 +2099,22 @@ impl Checker {
             );
         }
         // `docs/design/AGENTS.md` §4: `weight` picks which of KUPL's
-        // existing concurrency tiers backs an `agent` -- `distributed`
-        // parses (mirrors K0309's own "syntax now, real transport later"
-        // precedent for `at node(...)`) but has no real transport yet, so
-        // it's rejected here rather than silently falling back to a
-        // different tier than the one written.
-        if c.weight == Some(AgentWeight::Distributed) {
-            self.err(
-                "K0316",
-                "`weight distributed` is not yet supported by any KUPL runtime -- see docs/design/DISTRIBUTION.md for the design and current status".to_string(),
-                c.span,
-            );
-        }
+        // existing concurrency tiers backs an `agent`. `distributed` USED
+        // to be unconditionally rejected here (K0316, "syntax now, real
+        // transport later," mirroring K0309's own precedent for `at
+        // node(...)`) -- retired 2026-09-01, now that `interp.rs::
+        // ActorRoute::Distributed` (a real, shared-secret-authenticated
+        // TCP transport, `kupl node`) genuinely exists. What remains
+        // checker-UNENFORCEABLE is whether a NODE to connect to is
+        // actually configured -- that's deployment configuration (the
+        // `KUPL_DISTRIBUTED_NODE` env var), not a static program property,
+        // so it's a clean RUNTIME panic at the `Component()` call site
+        // (`instantiate_concurrent`) if unset, the same "env-gated
+        // runtime behavior, not a compile-time concern" posture
+        // `KUPL_AI_MOCK` and friends already have elsewhere in this
+        // codebase. K0316 itself is RETIRED, not reused for anything else
+        // (diagnostic codes are never recycled once shipped) -- see
+        // `docs/reference/DIAGNOSTICS.md`.
         // `docs/design/ASYNC.md` §8.7: `example { }` bodies are checked and
         // RUN against a component's own instantiation (`run.rs`'s example
         // runner calls `interp.instantiate` then reads the resulting
@@ -6762,12 +6766,14 @@ mod generic_tests {
     }
 
     /// KUPL Agents (`docs/design/AGENTS.md`): a well-formed `agent` with a
-    /// `weight` clause must check completely clean, on all three
-    /// currently-legal weight values (`distributed` is checker-rejected
-    /// separately, K0316).
+    /// `weight` clause must check completely clean, on all three legal
+    /// weight values -- `distributed` included since K0316's retirement
+    /// (2026-09-01, `interp.rs::ActorRoute::Distributed` now genuinely
+    /// implements it; see this file's own comment at the former K0316
+    /// call site for the full retirement writeup).
     #[test]
     fn well_formed_agent_checks_clean() {
-        for weight in ["lightweight", "heavyweight"] {
+        for weight in ["lightweight", "heavyweight", "distributed"] {
             let src = format!(
                 "agent Rep {{\n    intent \"a\"\n    weight {weight}\n    expose fun f() -> Int {{ 1 }}\n}}\n\
                  app Main {{\n    intent \"m\"\n}}\n"
@@ -6780,15 +6786,6 @@ mod generic_tests {
                     app Main {\n    intent \"m\"\n}\n";
         let errs = errors(src);
         assert!(errs.is_empty(), "an agent with no `weight` clause must check clean: {errs:?}");
-    }
-
-    /// K0316: `weight distributed` parses but has no real transport yet.
-    #[test]
-    fn weight_distributed_is_k0316() {
-        let src = "agent Rep {\n    intent \"a\"\n    weight distributed\n    expose fun f() -> Int { 1 }\n}\n\
-                    app Main {\n    intent \"m\"\n}\n";
-        let errs = errors(src);
-        assert!(errs.iter().any(|d| d.code == "K0316"), "`weight distributed` must be K0316: {errs:?}");
     }
 
     /// K0317: `weight` is agent-only -- rejected on a plain `component`

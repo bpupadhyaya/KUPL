@@ -171,7 +171,7 @@ Severity: **E** = error, **W** = warning.
 | K0312 | E | `receive { .. }` used outside a `concurrent component`'s own handler/exposed-fun body |
 | K0313 | E | `<call> timeout <duration>` (`docs/design/ASYNC.md`) wraps a call whose receiver is not a `concurrent` component — the call can never actually block long enough to time out |
 | K0314 | E | `timeout <duration>` — duration must be positive |
-| K0316 | E | `weight distributed` (`docs/design/AGENTS.md`) — the syntax parses but no KUPL runtime supports real distributed transport yet |
+| K0316 | — | **RETIRED 2026-09-01.** Was: `weight distributed` unconditionally rejected (the syntax parsed but no runtime supported it). `interp.rs::ActorRoute::Distributed` (a real, shared-secret-authenticated TCP transport, `kupl node`) now implements it — see `docs/design/DISTRIBUTION.md`. Code retired, not reused. |
 | K0317 | E | `weight` is only valid on an `agent`, not a plain `component`/`concurrent component` |
 | K0318 | E | `supervise <child> restart on_failure one_for_all`/`rest_for_one` names a `concurrent component`/`agent` child — cross-actor-thread group restart is not yet supported; use the default one-for-one strategy |
 
