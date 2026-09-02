@@ -49,9 +49,10 @@ are isolated, so two dependencies may define the same name without colliding.
 ### Keywords (reserved)
 
 ```
-app async await break component contract continue else emit example expect
-expose false fn for fun if in intent let match module new on par prop pub
-requires return send supervise test true type use uses var while wire
+agent app async await break component contract continue else emit example
+expect expose false fn for fun if in intent let match module new on par
+prop protocol pub requires return send supervise test true type use uses
+var while wire
 ```
 
 ### Contextual keywords
@@ -60,8 +61,10 @@ Valid identifiers everywhere except in their clause:
 `out` `state` `start` `stop` (component ports / state / lifecycle handlers)
 `fulfills` `law` `restart` `on_failure` `never` `forall` `every` `after`
 `advance` `ai` `tools` `model` `concurrent` (only special directly before
-`component`/`app` — see §7.2). `in` stays fully reserved (it also
-introduces a `for … in …` loop).
+`component`/`app` — see §7.2); `follows` `weight` `lightweight`
+`heavyweight` `distributed` `durable` `deterministic` `guard` `guards`
+`forbids` (only special on/inside an `agent` or `protocol` — see §7.3).
+`in` stays fully reserved (it also introduces a `for … in …` loop).
 
 ### Identifiers
 
@@ -743,6 +746,95 @@ See `examples/concurrent.kupl`.
   language's own byte-identical cross-engine guarantee is unaffected for
   every program that doesn't use it, and even for one that does, those
   two engines' own output is always fully deterministic on their own.
+
+### 7.3 Agents (`agent`, `protocol`, `weight`, `durable`, `deterministic`)
+
+An `agent` is a higher-level actor: always its own concurrent instance
+(like `concurrent component`, and subject to the same portability
+restriction, K0306), but purpose-built to represent a human-like
+co-worker rather than a low-level concurrency primitive. `agent` is a
+hard reserved keyword; everything below it (`follows`, `weight`,
+`durable`, `deterministic`, `guards`, `forbids`, `guard`) is a
+contextual keyword, valid only in these clauses.
+
+```kupl
+protocol SpendingLimit {
+    intent "No single decision commits more than $10,000."
+    guard CommitAmount: Int {
+        expect result <= 10000
+    }
+}
+
+protocol NoNetwork {
+    intent "This agent may never reach the network directly."
+    forbids io.net
+}
+
+agent Approver follows SpendingLimit, NoNetwork {
+    intent "Approves requests within its own spending limit."
+
+    weight lightweight
+    durable
+    deterministic
+
+    state handled: Int = 0
+
+    expose fun approve(amount: Int) -> Int guards CommitAmount {
+        handled += 1
+        amount
+    }
+}
+```
+
+See `examples/agent_keyword.kupl` and `docs/design/AGENTS.md` for the
+full design rationale.
+
+**`protocol`** — a free-standing, top-level declaration (a rule set an
+agent commits to via `follows`), structurally similar to `contract` but
+distinct from it:
+
+| Clause | Meaning |
+|---|---|
+| `intent "…"` | natural-language purpose, same as everywhere else |
+| `forbids <effect>` | this protocol's followers may never transitively perform `<effect>` (the same dotted effect vocabulary as `uses`, e.g. `io`, `io.net`, `ai`) in any exposed fun — checked **statically** (K1002) |
+| `guard Name: T { expect result … }` | a named, concretely-typed runtime postcondition; `result` is bound to the guarded fun's own return value inside the `expect` |
+
+- `follows Protocol1, Protocol2` — after the agent's name, same position
+  as `fulfills` on a `component`. Agent-only (K1003); naming a
+  nonexistent protocol is K1001; redeclaring a protocol name is K1000.
+- `guards Name1, Name2` on an `expose fun` (right before the body, same
+  slot as `ai fun`'s own `tools […]` clause) opts that fun's return
+  value into runtime checking against the named guard(s), which must
+  exist on some protocol the agent follows (K1005) — `guards` outside an
+  `agent`'s own `expose fun` is K1004. A guard failing its `expect`
+  panics before the value returns to the caller.
+
+**`weight lightweight|heavyweight|distributed`** — agent-only (K0317;
+plain value error is K0125); picks which of KUPL's own concurrency
+tiers backs this agent, mirroring Go goroutines / Java platform threads
+/ Erlang distributed processes. Default (no clause) is `lightweight`.
+
+| Value | Backing |
+|---|---|
+| `lightweight` (default) | multiplexed onto a shared worker-pool thread, like a plain `concurrent component` |
+| `heavyweight` | a dedicated, always-resident OS thread |
+| `distributed` | a real, shared-secret-authenticated TCP connection to a separate `kupl node <file> --listen <addr> --token <token>` process — see `docs/reference/CLI.md` and `docs/design/DISTRIBUTION.md`. **Authenticated, not encrypted** — do not run across an untrusted network. |
+
+**`durable`** — agent-only (K1006). This agent's own `state` fields
+survive not just an in-process supervised restart (which every agent
+already gets for free) but a **separate, later `kupl run` of the same
+program** — state is persisted to `.kupl/agent-state/<AgentName>`
+(override with `KUPL_AGENT_STATE_DIR`) keyed by field name, so it
+tolerates a schema change that only adds/removes fields. Works with
+every `weight` value, `distributed` included. `kupl agent inspect
+<AgentName>` / `kupl agent clear <AgentName>` (§CLI) read or reset an
+agent's persisted state without running the program.
+
+**`deterministic`** — agent-only (K1008). A checker-enforced guarantee,
+structurally identical to a followed protocol's own `forbids`
+enforcement, that none of this agent's exposed funs transitively
+perform the `ai` effect (K1009) — equivalent to implicitly following a
+protocol that `forbids ai`, without declaring one.
 
 ## 8. Contracts and laws
 

@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # 1,448 tests, includes interpreter-vs-VM differential suite
+cargo test                   # ~1,965 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -203,6 +203,7 @@ vim.filetype.add({ extension = { kupl = "kupl" } })
 | `examples/ai.kupl` | `ai fun` typed prompt functions: text, structured records, lists, `Result` capture |
 | `examples/agent.kupl` | agentic `ai fun`: the model calls KUPL functions as tools (`tools [add, weather]`) |
 | `examples/agent_component.kupl` | agent component: conversation state persisted across turns, interpolated intent, tool use |
+| `examples/agent_keyword.kupl` | the `agent` keyword itself: `protocol`/`follows`/`guard`, `weight`, `durable` state persisted ACROSS separate `kupl run`s, `deterministic` |
 | `examples/shapes.kupl` | functional core: ADTs, `match`, records, `Option`/`Result` + `?`, lambdas |
 | `examples/todo.kupl` | a small app: store + reporter, expose functions, message flow |
 | `examples/contracts.kupl` | contracts with executable `law`s (`kupl test` runs them) |
@@ -284,6 +285,31 @@ pure functions with **inferred + enforced effects** (`pub`/`expose` must declare
 multi-file modules; `par` structured fork-join concurrency; `ai fun` typed prompt functions with structured output and a provider-agnostic runtime (Anthropic, OpenAI-compatible, Ollama, deterministic mock), tool use (model calls KUPL functions), interpolated intents, agent components (stateful, multi-turn); the canonical formatter; semantic diff; JSON diagnostics;
 component manifests; an LSP server; and four verified execution modes.
 
+### Agents
+
+`agent` (see `examples/agent_keyword.kupl`) is a higher-level actor,
+explicitly designed to simulate/represent a human co-worker — every agent
+is its own concurrent actor, with four things a plain component doesn't have:
+
+- **`weight lightweight | heavyweight | distributed`** — which of Go's
+  goroutines, Java's platform threads, or Erlang's distributed processes
+  backs this agent. `distributed` is real network transport (`kupl node`,
+  a shared-secret-authenticated TCP server), not just syntax — see
+  `docs/reference/CLI.md`. Default: `lightweight`.
+- **`protocol` / `follows` / `guard`** — rules an agent commits to, like a
+  human following workplace policy: `forbids <effect>` is checked
+  statically (an agent's own exposed funs may never transitively perform
+  that effect); `guard Name: Type { expect result … }` is checked at
+  runtime against a `guards Name`-tagged fun's own return value.
+- **`durable`** — an agent's own `state` survives not just a crash
+  (supervised restart already preserves it) but a **separate later `kupl
+  run` of the same program**, persisted to disk. `kupl agent inspect
+  <Name>` / `kupl agent clear <Name>` inspect or reset it.
+- **`deterministic`** — a checker-enforced guarantee that every one of an
+  agent's own exposed funs never reaches an `ai fun`, transitively —
+  stronger than the per-function `uses ai` tracking every KUPL function
+  already gets for free from the effect system.
+
 ## Documentation
 
 Start at the **[documentation home](docs/index.md)** — a docs.python.org-style
@@ -297,7 +323,7 @@ language, every example verified against the toolchain).
 - [`docs/reference/LANGUAGE-REFERENCE.md`](docs/reference/LANGUAGE-REFERENCE.md) — the language reference manual (as implemented): lexical structure, types, expressions, statements, functions & effects, components, contracts, supervision, semantics
 - [`docs/reference/STDLIB.md`](docs/reference/STDLIB.md) — built-in functions, constructors, and every method on List/Str/Int/Float/Option/Result/Tensor
 - [`docs/reference/CLI.md`](docs/reference/CLI.md) — every `kupl` command, flags, exit codes, artifact formats
-- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (124 diagnostics, grouped by phase)
+- [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (172 active diagnostics + 2 retired, grouped by phase)
 - [`docs/PRODUCTION.md`](docs/PRODUCTION.md) — running KUPL in production: security model, resource limits, threat model (it is **not** a sandbox), operations, and an honest list of known limitations
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — an honest audit of KUPL vs Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift, and Kotlin (as-implemented vs designed)
 
@@ -310,10 +336,14 @@ language, every example verified against the toolchain).
 
 ## Status & roadmap
 
-**v1.0-alpha**: the founding vision is implemented end to end — ~90,900 lines
-of dependency-free Rust, 1,448 tests, all engines differentially verified.
-The package registry (`kupl pkg tree/lock/fetch`) and LSP hover/completion
-are already implemented. Next arc (per `docs/design/TOOLCHAIN.md`): KIR
+**v1.0-alpha**: the founding vision is implemented end to end — ~130,000 lines
+of dependency-free Rust, ~1,965 tests, all engines differentially verified.
+The package registry (`kupl pkg tree/lock/fetch`), LSP hover/completion, the
+full `agent`/`protocol`/`guard` system (all three `weight` classes,
+`durable` state persistence, `deterministic`), and production infrastructure
+(CI, `SECURITY.md`, resource limits, crypto/logging stdlib) are already
+implemented — see `docs/PRODUCTION.md` for the honest list of what's still
+alpha-stage. Next arc (per `docs/design/TOOLCHAIN.md`): KIR
 (typed SSA) with GPU lowering (Metal first), a genuine per-component
 generational GC in the native backend (native already supports components,
 supervision, and timers — this arc is specifically about the GC), and

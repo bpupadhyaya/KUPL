@@ -776,6 +776,24 @@ completion (3). Everything stays byte-identical across engines.
       in the parameter scope (`intent "Reply to {msg}"`). `echo` debug provider.
       (Known limitation: effects don't propagate across expose/method calls —
       candidate for a future type-aware effect pass.)
+      **Not to be confused with** the real `agent` keyword shipped later
+      (below) — that's a distinct, higher-level actor construct
+      (`protocol`/`follows`, `weight`, `durable`, `deterministic`); this
+      entry is about the older pattern of building a conversational,
+      tool-using loop out of a *plain* `component`.
+- [x] **The `agent` keyword** (`docs/design/AGENTS.md`) — a first-class,
+      higher-level actor distinct from `concurrent component`: `protocol`
+      +`follows`/`forbids`/`guard`/`guards` (statically-checked effect
+      rules plus runtime-checked postconditions on a return value),
+      `weight lightweight|heavyweight|distributed` (the last backed by a
+      real, shared-secret-authenticated — not encrypted — TCP transport to
+      a separate `kupl node` process), `durable` (state persisted to disk
+      across separate `kupl run` invocations, not just supervised
+      restarts; `kupl agent inspect`/`clear` CLI), and `deterministic`
+      (checker-enforced: the agent's own exposed funs may never
+      transitively reach an `ai fun`). Full spec:
+      `../reference/LANGUAGE-REFERENCE.md` §7.3, diagnostics K1000-K1009.
+      Example: `examples/agent_keyword.kupl`.
 - [x] **Prompt-context builders (it109)** — `kupl context --json` emits
       the same dependency-closed target+direct-dependency data as plain-
       text `kupl context`, structured for a program to consume (mirrors

@@ -15,6 +15,16 @@ implicitly async") were never implemented — confirmed live at it120's fresh
 software claim" this campaign's own docs have repeatedly, honestly named but
 never scoped into an actual plan.
 
+**UPDATE — no longer just a sketch: §8's plan shipped as `concurrent
+component`** (real OS-thread-per-instance actors; normative spec
+`docs/reference/LANGUAGE-REFERENCE.md` §7.2), and the `agent` keyword
+(`docs/design/AGENTS.md`) is built directly on top of it. §9 onward in
+this file tracks what was actually implemented and fixed along the way.
+Still open, honestly: the FULL vision this doc's title references
+(implicit M:N scheduling for every ordinary component, not just the
+opt-in `concurrent`/`agent` tier) remains unimplemented — see §5's Open
+Questions, most of which are still real.
+
 ## 1. What exists today (verified live, not assumed)
 
 Read in full for this sketch: `src/interp.rs`'s `Interp` struct and its

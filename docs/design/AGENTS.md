@@ -1,21 +1,28 @@
 # KUPL Agents
 
 Proposal v0.1 — 2026-08-26.
-Status: **All three originally-scoped slices are now IMPLEMENTED.** §4's
-weight-class slice (`agent` + `weight lightweight/heavyweight/
-distributed`) — see §4's own updated note (K0125/K0316/K0317). §3's
+Status: **All three originally-scoped slices, PLUS both of §5's own
+follow-on questions, are now IMPLEMENTED.** §4's weight-class slice
+(`agent` + `weight lightweight/heavyweight/distributed`, the last a
+real, shared-secret-authenticated — not encrypted — TCP transport via
+`kupl node`) — see §4's own updated note (K0125/K0316/K0317). §3's
 structural slice (`protocol` + `agent ... follows Protocol` + `forbids
 <effect>`) — see §3's own updated note (K1000/K1001/K1002/K1003). §3's
 behavioral slice (`guard Name: Type { .. }` + `guards Name`, desugared to
 plain `expect` checks with zero new interp/vm/cgen work) — see §3's own
-"Behavioral rules: `guard`/`guards`" section (K1004/K1005). Remaining
-open work is §5's own open questions (agent identity/persistence,
-judgment-vs-determinism, "infinite agents" bounding) and the
-deliberately-deferred multi-protocol composition/conflict question — see
-§7's own updated Sequencing note. This file exists to capture the concept
-precisely enough that a fresh session, on any machine, can pick up
-detailed design and implementation without needing the conversation that
-produced it.
+"Behavioral rules: `guard`/`guards`" section (K1004/K1005). §5's
+"identity & memory" question — `durable` (K1006, persisted via
+`agent_persist.rs`, `kupl agent inspect`/`clear` CLI). §5's
+"judgment vs. determinism" question — `deterministic` (K1008/K1009).
+Full normative spec for everything above: `../reference/LANGUAGE-
+REFERENCE.md` §7.3. §5's "infinite agents" bounding is DONE in the
+narrower sense of an actual resource cap (`MAX_ACTOR_INSTANCES`,
+`MAX_NODE_CONNECTIONS`) — the ONLY remaining fully-open item in this
+whole initiative's original question set is the deliberately-deferred
+multi-protocol composition/conflict question — see §7's own updated
+Sequencing note. This file exists to capture the concept precisely
+enough that a fresh session, on any machine, can pick up detailed design
+and implementation without needing the conversation that produced it.
 
 **Why this doc exists:** the user's own framing (verbatim, lightly trimmed):
 

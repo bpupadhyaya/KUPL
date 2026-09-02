@@ -156,6 +156,8 @@ find-references, and rename. See the [CLI reference](../reference/CLI.md#kupl-ls
 ## Where to go next
 
 - Work through **[The KUPL Tutorial](tutorial.md)** — the guided tour of the whole
-  language.
+  language, including [agents](tutorial.md#16a-agents) (§16a) — a
+  higher-level actor with commitments (`protocol`), memory that outlives a
+  run (`durable`), and judgment boundaries (`deterministic`).
 - Keep the **[Language Reference](../reference/LANGUAGE-REFERENCE.md)** and
   **[Standard Library](../reference/STDLIB.md)** open as you write.

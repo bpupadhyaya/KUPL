@@ -1,0 +1,70 @@
+// The `agent` keyword (docs/design/AGENTS.md): a higher-level actor,
+// explicitly designed to simulate/represent a human co-worker rather
+// than a low-level concurrency primitive. An agent is always its own
+// actor (like `concurrent component`), plus features a plain component
+// doesn't have:
+//
+//   - `weight lightweight|heavyweight|distributed` -- which of Go's
+//     goroutines / Java's platform threads / Erlang's distributed
+//     processes backs this agent (default: lightweight). `distributed`
+//     needs a running `kupl node` server, so it isn't shown in this
+//     self-contained example -- see `docs/reference/CLI.md`'s own
+//     `kupl node` entry.
+//   - `protocol` + `follows`: rules an agent commits to. `forbids
+//     <effect>` is checked STATICALLY (the agent's own exposed funs may
+//     never transitively perform that effect). `guard Name: Type { .. }`
+//     is checked at RUNTIME against a `guards Name`-tagged fun's own
+//     RETURN value (bound as `result` inside the guard body) -- here,
+//     `approve`'s own return is checked against `CommitAmount` on every
+//     call; `approve(20000)` (never called below, to keep this example's
+//     own output clean) would panic before returning.
+//   - `durable`: this agent's own `state` survives not just a crash
+//     (supervised restart) but a SEPARATE later `kupl run` of the same
+//     program -- run this example twice in a row and watch `handled`
+//     keep climbing. `kupl agent inspect Approver` / `kupl agent clear
+//     Approver` inspect or reset that persisted state.
+//   - `deterministic`: a checker-enforced guarantee that this agent's
+//     exposed funs never reach an `ai fun` -- stronger than the
+//     per-function `uses ai` tracking every KUPL function already has.
+
+protocol SpendingLimit {
+    intent "No single decision commits more than $10,000."
+    guard CommitAmount: Int {
+        expect result <= 10000
+    }
+}
+
+protocol NoNetwork {
+    intent "This agent may never reach the network directly."
+    forbids io.net
+}
+
+agent Approver follows SpendingLimit, NoNetwork {
+    intent "Approves requests within its own spending limit."
+
+    durable
+    deterministic
+
+    state handled: Int = 0
+
+    expose fun approve(amount: Int) -> Int guards CommitAmount {
+        handled += 1
+        amount
+    }
+
+    expose fun total_handled() -> Int {
+        handled
+    }
+}
+
+app Main {
+    intent "One agent, reviewing a small queue of requests."
+
+    let approver = Approver()
+
+    on start {
+        print(approver.approve(500))
+        print(approver.approve(9000))
+        print("total handled (persists across separate `kupl run`s): {approver.total_handled()}")
+    }
+}

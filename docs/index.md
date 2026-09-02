@@ -18,7 +18,7 @@ KUPL is open source and **free forever**.
 | | |
 |---|---|
 | **[Getting Started](guide/getting-started.md)** | Install/build the toolchain, run the REPL, and write your first program. Start here. |
-| **[The KUPL Tutorial](guide/tutorial.md)** | A hands-on, progressive walkthrough of the whole language — values, functions, types, pattern matching, **generics** (functions *and* types), **operator overloading**, collections, error handling with **`Option`/`Result` combinators**, effects, components, the AI-native core, packages, concurrency, the **exact numeric tower** (`BigInt`/`Rational`), a **web server**, and native compilation. The best way to learn KUPL. |
+| **[The KUPL Tutorial](guide/tutorial.md)** | A hands-on, progressive walkthrough of the whole language — values, functions, types, pattern matching, **generics** (functions *and* types), **operator overloading**, collections, error handling with **`Option`/`Result` combinators**, effects, components, the AI-native core, packages, concurrency, **agents** (`protocol`/`weight`/`durable`/`deterministic`), the **exact numeric tower** (`BigInt`/`Rational`), a **web server**, and native compilation. The best way to learn KUPL. |
 | **[Language Reference](reference/LANGUAGE-REFERENCE.md)** | The normative description of the language *as implemented*: lexical structure, types, expressions, statements, declarations, components, effects, and semantics. |
 | **[Standard Library](reference/STDLIB.md)** | Every built-in type and method — `Int`, `Float`, sized integers, `Str`, `List`, `Map`, `Set`, `Option`, `Result`, `Json`, `Tensor` — plus the free functions (file I/O, JSON, HTTP, regex, CSV, URL, time, encoding, random). |
 | **[Command-Line Interface](reference/CLI.md)** | Every `kupl` subcommand: `run`, `build`, `bundle`, `native`, `test`, `check`, `fmt`, `diff`, `repl`, `lsp`, `pkg`, and more. |
@@ -40,8 +40,14 @@ KUPL is open source and **free forever**.
   private state, message handlers, timers, supervision, and `example` blocks that
   are tests you write inline. Contracts give interfaces with dynamic dispatch.
 - **AI as a language feature.** `ai fun` declares a typed prompt function whose
-  return type drives structured output; tool use and agent components are
-  first-class; a deterministic mock provider makes AI-driven code unit-testable.
+  return type drives structured output, and tool use is first-class; a
+  deterministic mock provider makes AI-driven code unit-testable.
+- **`agent` as a language feature.** A higher-level actor for representing a
+  human-like co-worker: `protocol`/`follows` (statically-enforced effect
+  rules plus runtime-checked guards), `weight` (which concurrency tier backs
+  it, up to a real distributed `kupl node` process), `durable` (state that
+  survives across separate runs, not just restarts), and `deterministic`
+  (checker-enforced: never reaches an `ai fun`).
 - **An effect system.** Functions are pure by default; side effects are declared
   (`uses io`, `uses io.fs`, …) and checked at boundaries.
 - **Batteries included, zero dependencies.** File I/O, JSON, HTTP, regex, CSV,

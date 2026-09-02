@@ -247,10 +247,11 @@ pub struct ComponentDecl {
 }
 
 /// `docs/design/AGENTS.md` §4's own table: which existing KUPL
-/// concurrency tier backs an `agent`. `Distributed` parses (K0316
-/// rejects it at check time, mirroring K0309's own "distributed
-/// placement parses but isn't implemented yet" precedent) -- real
-/// transport doesn't exist yet, see `docs/design/DISTRIBUTION.md`.
+/// concurrency tier backs an `agent`. `Distributed` parses and is fully
+/// implemented via a real, shared-secret-authenticated TCP transport
+/// (`kupl node`, `interp.rs::ActorRoute::Distributed`) -- the checker
+/// rejection that once blocked it (K0316) is retired, see
+/// `docs/design/DISTRIBUTION.md`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentWeight {
     /// Go-goroutine-style: multiplexed onto a shared `ActorPool` worker

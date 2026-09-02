@@ -823,6 +823,67 @@ coroutines are **[design]**.
 
 ---
 
+## 16a. Agents
+
+An **`agent`** is a component built specifically to represent a human-like
+co-worker: always its own real actor, plus rules it commits to, memory that
+outlives a single run, and (optionally) a guarantee it never makes a
+judgment call.
+
+```kupl
+protocol SpendingLimit {
+    intent "No single decision commits more than $10,000."
+    guard CommitAmount: Int {
+        expect result <= 10000       // checked against the guarded fun's return
+    }
+}
+
+agent Approver follows SpendingLimit {
+    intent "Approves requests within its own spending limit."
+
+    durable                          // state survives separate `kupl run`s
+    deterministic                    // may never reach an `ai fun`
+
+    state handled: Int = 0
+
+    expose fun approve(amount: Int) -> Int guards CommitAmount {
+        handled += 1
+        amount
+    }
+}
+
+app Main {
+    intent "Approves a couple of requests."
+    let approver = Approver()
+    on start {
+        print(approver.approve(500))
+        print(approver.approve(9000))
+    }
+}
+```
+
+- **`protocol`** declares rules an agent opts into with `follows`:
+  `forbids <effect>` is checked statically (the agent's exposed functions
+  may never transitively perform that effect); `guard Name: T { expect
+  result … }` is checked at runtime against a `guards Name`-tagged
+  exposed function's own return value.
+- **`weight lightweight|heavyweight|distributed`** picks the concurrency
+  tier backing the agent (default `lightweight`) — `distributed` connects
+  to a separate `kupl node` process over an authenticated (not encrypted)
+  TCP connection; see the [CLI reference](../reference/CLI.md).
+- **`durable`** persists this agent's `state` to disk across separate
+  `kupl run` invocations, not just supervised restarts. Run
+  `examples/agent_keyword.kupl` twice in a row and watch its counter keep
+  climbing; `kupl agent inspect <Name>` / `kupl agent clear <Name>`
+  inspect or reset that persisted state without running the program.
+- **`deterministic`** is checker-enforced: none of the agent's exposed
+  functions may transitively perform the `ai` effect (§13).
+
+Full syntax and every diagnostic code: [Language
+Reference §7.3](../reference/LANGUAGE-REFERENCE.md#73-agents-agent-protocol-weight-durable-deterministic).
+
+---
+
 ## 17. Sized numerics
 
 Beyond the default 64-bit `Int`, KUPL has fixed-width integers `i8`…`i64` /

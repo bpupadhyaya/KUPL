@@ -217,6 +217,49 @@ let result = await store.get(id)            // expose-call to another component
 - No bare threads in the app tier; the runtime multiplexes components on an M:N
   work-stealing scheduler.
 
+### 4.1 Agents — **Implemented, beyond this proposal's original scope**
+
+`agent` was not in this document's original v0.1 sketch; it shipped as a
+real, additive layer on top of `concurrent component` and is now part of
+the implemented language (full normative spec: `../reference/LANGUAGE-
+REFERENCE.md` §7.3; full design rationale: `AGENTS.md`).
+
+```kupl
+protocol NoNetwork {
+    intent "This agent may never reach the network directly."
+    forbids io.net
+}
+
+agent Reviewer follows NoNetwork {
+    intent "Reviews a queue of items within its own rules."
+    weight lightweight     // lightweight | heavyweight | distributed
+    durable                // state survives across separate `kupl run`s
+    deterministic           // may never transitively perform `uses ai`
+
+    state reviewed: Int = 0
+
+    expose fun review(item: Str) -> Bool {
+        reviewed += 1
+        true
+    }
+}
+```
+
+- An `agent` is always its own actor (like `concurrent component`), with
+  four agent-only additions a plain component doesn't have:
+  `protocol`/`follows` (static effect rules a followed protocol
+  `forbids`, plus `guard`/`guards` runtime postconditions on an exposed
+  fun's own return value), `weight` (which concurrency tier backs it —
+  goroutine-style pooled thread, Java-style dedicated OS thread, or a
+  real authenticated-but-unencrypted TCP connection to a separate `kupl
+  node` process), `durable` (state persisted to disk across separate
+  process runs, not just supervised restarts), and `deterministic` (a
+  checker-enforced guarantee the agent never reaches an `ai fun`).
+- The name is deliberate: an `agent` models a human-like co-worker with
+  its own commitments (`protocol`), memory (`durable`), and judgment
+  boundaries (`deterministic`) — not just a lower-level concurrency
+  primitive.
+
 ---
 
 ## 5. Hardware tier: tensors, kernels, placement
@@ -325,6 +368,12 @@ low fun rdtsc() -> u64 uses unsafe {
 
 **System/low tier:** `low` `asm` `unsafe`
 
+**Shipped after this v0.1 proposal, not in the count above:** `agent`
+`protocol` (hard keywords) plus the contextual `follows` `weight`
+`lightweight` `heavyweight` `distributed` `durable` `deterministic`
+`guard` `guards` `forbids` (§4.1, `../reference/LANGUAGE-REFERENCE.md`
+§2/§7.3).
+
 **Literals/misc:** `true` `false` `self` `as`
 
 (`Option`/`Result`/`Some`/`None`/`Ok`/`Err` are std types, not keywords.
@@ -347,11 +396,19 @@ same AST).
 file        = module_decl? use_decl* item* ;
 module_decl = "module" path NEWLINE ;
 use_decl    = "use" path ("as" IDENT)? NEWLINE ;
-item        = component | contract | type_decl | fun_decl | const_decl ;
+item        = component | agent | protocol | contract | type_decl | fun_decl | const_decl ;
 
 component   = ("system" | "low")? ("component" | "app") IDENT generics? body ;
 body        = "{" intent fulfills* requires* port* prop* state* handler*
               expose* fun_decl* example_or_test* "}" ;
+
+agent       = "agent" IDENT ("follows" IDENT ("," IDENT)*)? agent_body ;
+agent_body  = "{" intent ("weight" weight_val)? "durable"? "deterministic"?
+              port* prop* state* handler* expose* fun_decl* "}" ;
+weight_val  = "lightweight" | "heavyweight" | "distributed" ;
+protocol    = "protocol" IDENT "{" intent (forbids | guard)* "}" ;
+forbids     = "forbids" effect NEWLINE ;
+guard       = "guard" IDENT ":" type block ;         (* `result` bound inside *)
 
 intent      = "intent" STRING NEWLINE ;
 fulfills    = "fulfills" type_ref ("," type_ref)* NEWLINE ;
@@ -364,7 +421,8 @@ handler     = "on" (IDENT pattern? | "start" | "stop"
 expose      = "expose" fun_decl ;
 
 fun_decl    = "pub"? ("fun" | "kernel" "fun" | "low" "fun" | "async" "fun")
-              IDENT generics? "(" params? ")" effects? ("->" type)? block ;
+              IDENT generics? "(" params? ")" effects? ("->" type)?
+              ("guards" IDENT ("," IDENT)*)? block ;
 effects     = "uses" effect ("," effect)* ;
 
 stmt        = let | var_assign | expr_stmt | if | match | for | while

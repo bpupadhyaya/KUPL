@@ -95,6 +95,35 @@ change and the release process.
   changed. The existing default behavior (redefinition without
   `:upgrade` leaves live instances frozen to their original shape) is
   unchanged — this is purely additive, opt-in.
+- `concurrent component`: every instance gets its own real OS thread.
+  `expose fun` calls block for a real reply; a wire whose destination is
+  a `concurrent` instance delivers non-blocking. Portability restriction
+  on props/ports/exposed signatures (K0306); no wire-source, `example`
+  block (K0307), or `law`/`forall` reference (K0308) support yet. See
+  `docs/reference/LANGUAGE-REFERENCE.md` §7.2.
+- `agent`: a higher-level actor built on `concurrent component`,
+  purpose-built to represent a human-like co-worker. `protocol { forbids
+  <effect> / guard Name: T { expect result … } }` + `agent Foo follows
+  Protocol1, Protocol2` — statically-checked effect rules (K1002) plus
+  runtime-checked postconditions on a `guards Name`-tagged exposed fun's
+  own return value (K1004/K1005). `weight lightweight|heavyweight|
+  distributed` — which concurrency tier backs the agent (K0317/K0125),
+  the last a real, shared-secret-authenticated (not encrypted) TCP
+  transport to a separate node process. `durable` — this agent's `state`
+  persists to disk across separate `kupl run` invocations, not just
+  supervised restarts (K1006). `deterministic` — checker-enforced
+  guarantee the agent's exposed funs never transitively reach an `ai
+  fun` (K1008/K1009). Full spec: `docs/reference/LANGUAGE-REFERENCE.md`
+  §7.3; diagnostics K1000-K1009; design rationale: `docs/design/
+  AGENTS.md`; example: `examples/agent_keyword.kupl`.
+- `kupl node <file.kupl> --listen <addr> --token <token>`: runs a
+  program as a server accepting `weight distributed` agent connections
+  authenticated by a shared secret token. See `docs/reference/CLI.md`
+  and `docs/design/DISTRIBUTION.md` for the (deliberate) authenticated-
+  not-encrypted security posture.
+- `kupl agent inspect <AgentName>` / `kupl agent clear <AgentName>`:
+  read or reset a `durable` agent's persisted state without running the
+  program.
 
 ## [1.0.0-alpha]
 

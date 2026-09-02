@@ -404,6 +404,13 @@ LLMs as an external SDK. KUPL has, shipped and tested:
   with the runtime driving the model↔tool loop and converting both directions.
 - **Agent components** — conversation state persisted in component state across
   turns, with intent interpolation.
+- The **`agent` keyword** — a first-class actor for a human-like co-worker:
+  `protocol`/`follows` (statically-checked effect rules + runtime-checked
+  guards on a return value), `weight` (up to a real distributed transport),
+  `durable` (state surviving separate process runs), and `deterministic`
+  (checker-enforced: never reaches an `ai fun`). No other language on this
+  list has this as a *checked, built-in* construct rather than a library
+  convention.
 - A **provider-agnostic runtime** (Anthropic, OpenAI-compatible, Ollama) plus a
   deterministic **mock provider** that makes AI-driven code unit-testable and
   reproducible — something even Python's LLM ecosystem does not give you for
