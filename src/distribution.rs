@@ -355,14 +355,38 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// How long the CLIENT side waits for the initial TCP connect PLUS the
+/// whole Auth+Spawn handshake before giving up -- the client-side mirror
+/// of `AUTH_HANDSHAKE_TIMEOUT` above. Without this, `TcpStream::connect`
+/// has NO timeout of its own (it inherits the OS's own TCP connect
+/// timeout, often 60-120s) -- a misconfigured `KUPL_DISTRIBUTED_NODE`
+/// pointing at an unreachable/black-holed address would otherwise hang
+/// `kupl run` for that long before ever reporting a clean error. Cleared
+/// (`set_read_timeout(None)`) by `instantiate_concurrent` once `Spawn`
+/// itself succeeds, before the connection is stored in `ActorRoute::
+/// Distributed` -- a long-lived actor's own legitimately idle gap
+/// between `Deliver`/`Call` messages must never be bounded by this.
+pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Connect to a `kupl node` listener and complete the auth handshake.
 /// Pure transport -- no `Interp` dependency at all, which is exactly what
 /// makes this independently testable against a hand-rolled mock listener
 /// (see `tests` below) rather than needing a full actor runtime just to
 /// exercise the wire protocol.
 pub fn connect_and_authenticate(addr: &str, token: &str) -> Result<std::net::TcpStream, String> {
-    let mut stream = std::net::TcpStream::connect(addr)
+    use std::net::ToSocketAddrs;
+    let socket_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("distributed spawn: could not resolve {addr}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("distributed spawn: {addr} resolved to no addresses"))?;
+    let mut stream = std::net::TcpStream::connect_timeout(&socket_addr, CONNECT_TIMEOUT)
         .map_err(|e| format!("distributed spawn: could not connect to {addr}: {e}"))?;
+    // Covers the REST of the handshake too (this Auth round-trip AND the
+    // later Spawn round-trip in `spawn_remote`, since both happen before
+    // the caller ever gets a usable `ActorRoute::Distributed` back) --
+    // `connect_timeout` above only bounds the TCP-level connect itself.
+    let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
     crate::kser::write_value_frame(&mut stream, &DistMsg::Auth { token: token.to_string() }.to_wire())
         .map_err(|e| format!("distributed spawn: sending Auth to {addr} failed: {e}"))?;
     let reply = crate::kser::read_value_frame(&mut stream)

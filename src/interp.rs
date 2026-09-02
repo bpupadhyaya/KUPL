@@ -2526,6 +2526,12 @@ impl Interp {
                 .map_err(|e| Self::panic_flow(e, span))?;
             crate::distribution::spawn_remote(&mut stream, &comp_name, portable_args)
                 .map_err(|e| Self::panic_flow(e, span))?;
+            // Handshake complete -- `connect_and_authenticate`'s own
+            // `CONNECT_TIMEOUT` read timeout must NOT keep bounding reads
+            // once this becomes a long-lived actor connection (an idle
+            // gap between `Deliver`/`Call` messages is completely normal
+            // and must never be mistaken for a stuck server).
+            let _ = stream.set_read_timeout(None);
             // Already fully started (the remote node's own Spawn handler
             // runs `on start`/timers synchronously before replying) --
             // `ready_tx` still needs exactly one send, unconditionally,
