@@ -565,6 +565,46 @@ pub fn check_effects(program: &Program) -> Vec<Diag> {
     }
 
     diags.extend(check_protocols(program));
+    diags.extend(check_deterministic_agents(program));
+    diags
+}
+
+/// K1009: `agent Foo { deterministic }` (`docs/design/AGENTS.md` §5,
+/// "judgment vs. determinism" -- a coarser, AGENT-level guarantee on top
+/// of the per-FUNCTION `uses ai` tracking the effect system already gives
+/// for free). Structurally IDENTICAL to `check_protocols`'s own `forbids`
+/// enforcement just above -- `deterministic` is exactly "this agent
+/// implicitly follows a protocol that forbids `ai`, without needing to
+/// declare a named `protocol` for it." K1008 (`check.rs`) already rejects
+/// `deterministic` on a non-`agent`, so every component reaching this
+/// function with `c.deterministic == true` is confirmed to be an `agent`.
+fn check_deterministic_agents(program: &Program) -> Vec<Diag> {
+    let mut diags = Vec::new();
+    let any_deterministic = program.items.iter().any(|item| matches!(item, Item::Component(c) if c.deterministic));
+    if !any_deterministic {
+        return diags;
+    }
+    let inferred = infer_effects(program);
+    for item in &program.items {
+        let Item::Component(c) = item else { continue };
+        if !c.deterministic {
+            continue;
+        }
+        for f in &c.exposes {
+            let key = fun_key(Some(&c.name), &f.name);
+            let Some((used, _)) = inferred.get(&key) else { continue };
+            if used.iter().any(|u| covers("ai", u)) {
+                diags.push(Diag::error(
+                    "K1009",
+                    format!(
+                        "agent `{}`'s `{}` performs the `ai` effect, but `{}` is declared `deterministic`",
+                        c.name, f.name, c.name
+                    ),
+                    f.span,
+                ));
+            }
+        }
+    }
     diags
 }
 
@@ -2647,5 +2687,50 @@ mod tests {
         );
         assert!(d.iter().any(|d| d.code == "K0301"), "ordinary K0301 enforcement must still fire: {d:?}");
         assert!(!d.iter().any(|d| d.code == "K1002"), "no `follows` clause means K1002 cannot apply: {d:?}");
+    }
+
+    /// K1009 (`docs/design/AGENTS.md` §5, "judgment vs. determinism" --
+    /// the coarser AGENT-level guarantee): a `deterministic` agent's own
+    /// exposed fun that transitively reaches an `ai fun` is rejected --
+    /// caught even when the `ai` effect flows in through a private
+    /// helper, exercising the SAME `infer_effects` fixpoint K1002's own
+    /// `forbids` enforcement already relies on, not a separate mechanism.
+    #[test]
+    fn deterministic_agent_reaching_an_ai_fun_transitively_is_k1009() {
+        let d = diags_for(
+            "ai fun summarize(text: Str) -> Str {\n    intent \"Summarize: {text}\"\n}\n\
+             fun helper(t: Str) uses ai -> Str {\n    summarize(t)\n}\n\
+             agent Rep {\n    intent \"a\"\n    deterministic\n    \
+             expose fun f(t: Str) uses ai -> Str {\n        helper(t)\n    }\n}\n\
+             app Main {\n    intent \"m\"\n}\n",
+        );
+        assert!(d.iter().any(|d| d.code == "K1009"), "a `deterministic` agent reaching an `ai fun` transitively must be K1009: {d:?}");
+    }
+
+    /// The positive control: a `deterministic` agent that never reaches
+    /// an `ai fun` at all must check clean -- confirms `deterministic`
+    /// alone doesn't spuriously trigger K1009.
+    #[test]
+    fn deterministic_agent_never_reaching_ai_is_clean() {
+        let d = diags_for(
+            "agent Rep {\n    intent \"a\"\n    deterministic\n    \
+             expose fun f() uses io -> Str {\n        read_file(\"x\")\n    }\n}\n\
+             app Main {\n    intent \"m\"\n}\n",
+        );
+        assert!(!d.iter().any(|d| d.code == "K1009"), "a `deterministic` agent that never reaches `ai` must not be K1009: {d:?}");
+    }
+
+    /// An agent with no `deterministic` clause at all must never pay for
+    /// (or trigger) `check_deterministic_agents`'s own `infer_effects`
+    /// fixpoint -- an ordinary agent freely using `ai fun`s is unaffected.
+    #[test]
+    fn agent_without_deterministic_is_unaffected_by_the_check() {
+        let d = diags_for(
+            "ai fun summarize(text: Str) -> Str {\n    intent \"Summarize: {text}\"\n}\n\
+             agent Rep {\n    intent \"a\"\n    \
+             expose fun f(t: Str) uses ai -> Str {\n        summarize(t)\n    }\n}\n\
+             app Main {\n    intent \"m\"\n}\n",
+        );
+        assert!(!d.iter().any(|d| d.code == "K1009"), "no `deterministic` clause means K1009 cannot apply: {d:?}");
     }
 }

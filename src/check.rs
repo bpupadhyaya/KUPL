@@ -2620,6 +2620,21 @@ impl Checker {
                 c.span,
             );
         }
+        // `docs/design/AGENTS.md` §5 ("judgment vs. determinism"):
+        // `deterministic` is `agent`-only (K1008, same "parser accepts
+        // broadly, checker narrows" shape as `durable`/`weight`). The
+        // actual enforcement -- no exposed fun may transitively perform
+        // the `ai` effect -- happens in `effects.rs::check_
+        // deterministic_agents`, which needs `infer_effects`'s own
+        // whole-program fixpoint and so runs as a separate later pass,
+        // exactly like K1002's own `forbids`-list enforcement does.
+        if c.deterministic && !c.is_agent {
+            self.err(
+                "K1008",
+                "`deterministic` is only valid on an `agent` -- a plain `component`/`concurrent component` has no `ai fun` judgment calls to forbid in the first place".to_string(),
+                c.span,
+            );
+        }
         // K1007 ("`durable` + `weight distributed` not yet supported")
         // RETIRED 2026-09-01, hours after it was first added: it was
         // based on an incorrect assumption, corrected by direct live
@@ -6863,6 +6878,30 @@ mod generic_tests {
                            app Main {\n    intent \"m\"\n}\n";
         let errs2 = errors(concurrent);
         assert!(errs2.iter().any(|d| d.code == "K1006"), "`durable` on a concurrent component must be K1006: {errs2:?}");
+    }
+
+    /// K1008: `deterministic` is agent-only -- rejected on a plain
+    /// `component` AND on a `concurrent component`. A well-formed
+    /// `deterministic agent` (no `ai fun` anywhere) must check clean.
+    #[test]
+    fn deterministic_on_a_non_agent_is_k1008() {
+        let plain = "component P {\n    intent \"p\"\n    deterministic\n}\n\
+                      app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(plain);
+        assert!(errs.iter().any(|d| d.code == "K1008"), "`deterministic` on a plain component must be K1008: {errs:?}");
+
+        let concurrent = "concurrent component C {\n    intent \"c\"\n    deterministic\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n}\n";
+        let errs2 = errors(concurrent);
+        assert!(errs2.iter().any(|d| d.code == "K1008"), "`deterministic` on a concurrent component must be K1008: {errs2:?}");
+    }
+
+    #[test]
+    fn well_formed_deterministic_agent_checks_clean() {
+        let src = "agent Rep {\n    intent \"a\"\n    deterministic\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.is_empty(), "a well-formed `deterministic agent` (no `ai fun` anywhere) must check clean: {errs:?}");
     }
 
     /// KUPL Agents (`docs/design/AGENTS.md` §3): a well-formed `protocol` +

@@ -459,15 +459,31 @@ specific answer yet, only to naming the axes:
   declare `uses ai` is ALREADY statically GUARANTEED, by machinery this
   whole initiative never had to build, to be free of any AI judgment call
   anywhere in its transitive call graph — auditable/replayable by
-  construction, no new language feature needed. What remains genuinely
-  OPEN: this is a per-FUNCTION distinction, not a per-agent one (an agent
-  can freely mix `uses ai` and non-`uses ai` exposed funs, exactly as
-  §3's own `SupportRep` sketch already does) — whether a coarser,
-  agent-level "this agent is fully deterministic" declaration has
-  independent value (e.g. for a checker-enforced compliance guarantee
-  stronger than "each fun individually declares its own effects
-  correctly") is still unresolved, but is now a strictly SMALLER
-  question than the one originally posed.
+  construction, no new language feature needed. The per-function
+  distinction is real and unaffected by the update below: an agent can
+  still freely mix `uses ai` and non-`uses ai` exposed funs, exactly as
+  §3's own `SupportRep` sketch already does.
+
+  **UPDATE, 2026-09-02 — the coarser, agent-level declaration is now
+  DONE too.** `agent Foo { deterministic }` (a new bare contextual
+  keyword, same shape as `durable`) is a checker-enforced,
+  compliance-strength guarantee that EVERY one of an agent's own exposed
+  funs — not just the ones an author remembered to leave `ai`-free — has
+  a transitive effect set that never includes `ai`. Mechanism: K1008
+  (`check.rs`) rejects `deterministic` on a non-`agent`; the actual
+  enforcement is K1009 (`effects.rs::check_deterministic_agents`),
+  structurally IDENTICAL to how a followed `protocol`'s own `forbids`
+  list is already enforced (K1002) — `deterministic` is exactly
+  "implicitly follows a protocol that forbids `ai`, without declaring
+  one," reusing the SAME `infer_effects` fixpoint, not a new mechanism.
+  `kupl fmt` round-trips `deterministic` losslessly. Verified: 6 new
+  tests (agent-only rejection, a well-formed clean case, a violation
+  caught transitively through a private helper — mirroring K1002's own
+  transitivity test exactly — a genuine non-violating case, and
+  confirming an agent WITHOUT `deterministic` is completely unaffected);
+  full `cargo test --lib` green twice (1866/1866); `cargo test --bin
+  kupl` green (99/99, unchanged — this is a checker-only feature with
+  no runtime/CLI surface).
 - **"Infinite agents"**: does this mean elastic, demand-driven spawning (an
   agent POOL that grows/shrinks, closer to how `lightweight` already
   multiplexes), or literally unbounded concurrent instances (which the
@@ -588,14 +604,15 @@ specific answer yet, only to naming the axes:
 - **NOT STARTED:** multi-protocol composition/conflict resolution remains
   open but lower-urgency now that both shipped slices (`forbids`-only
   union, `guards`-only explicit-opt-in) sidestep it (see §3's own "Open"
-  note). §5's own "judgment vs. determinism" and "infinite agents"
-  bounding axes remain open in the narrower sense described in their own
-  entries above (both partially answered by existing machinery already).
-- **Recommended next slice:** now that identity/persistence has a real
-  (if narrow) v1, `weight distributed` is fully implemented, AND `durable`
-  already works with every weight value including `distributed`, the
-  remaining named-but-unstarted work is: multi-protocol composition/
-  conflict resolution (§3), or the coarser agent-level "fully
-  deterministic" declaration (§5's judgment-vs-determinism note) — both
-  smaller, more scoped questions than "identity & memory" was before this
-  slice landed.
+  note). This is now the LAST remaining fully-open item in this whole
+  initiative's own originally-scoped question set — §5's "judgment vs.
+  determinism" (DONE, 2026-09-02, `deterministic`/K1008/K1009) and
+  "infinite agents" bounding (the bounding half DONE,
+  `MAX_ACTOR_INSTANCES`) are both resolved in the narrower sense their
+  own entries describe.
+- **DONE, 2026-09-02:** §5's "judgment vs. determinism" axis, the
+  coarser agent-level declaration — `agent Foo { deterministic }`,
+  K1008/K1009. See §5's own updated entry above for the full mechanism.
+- **Recommended next slice:** multi-protocol composition/conflict
+  resolution (§3) is now the only remaining named-but-unstarted item
+  from this initiative's own original question set.

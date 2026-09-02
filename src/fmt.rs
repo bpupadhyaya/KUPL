@@ -434,6 +434,11 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         indent(out, 1);
         out.push_str("durable\n");
     }
+    if c.deterministic {
+        sep(out, true);
+        indent(out, 1);
+        out.push_str("deterministic\n");
+    }
     sep(out, !c.props.is_empty());
     for p in &c.props {
         indent(out, 1);
@@ -1251,6 +1256,28 @@ mod tests {
         assert!(d2.is_empty(), "{d2:?}");
         let formatted2 = super::format_program(&p2);
         assert!(!formatted2.contains("durable"), "an agent with no durable clause must not gain one: {formatted2:?}");
+    }
+
+    /// `docs/design/AGENTS.md` §5: `agent Foo { deterministic .. }` must
+    /// round-trip losslessly, and an agent with NO `deterministic` clause
+    /// must not gain one.
+    #[test]
+    fn fmt_preserves_deterministic_clause() {
+        let src = "agent Rep {\n    intent \"a\"\n    deterministic\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(formatted.contains("deterministic\n"), "the `deterministic` clause must survive formatting: {formatted:?}");
+
+        let no_deterministic = "agent Rep {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                                 app Main {\n    intent \"m\"\n}\n";
+        roundtrip(no_deterministic);
+        let (p2, d2) = parser::parse(no_deterministic);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains("deterministic"), "an agent with no deterministic clause must not gain one: {formatted2:?}");
     }
 
     /// KUPL Agents (`docs/design/AGENTS.md` §3): a `protocol` declaration

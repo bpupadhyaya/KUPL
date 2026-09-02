@@ -213,6 +213,17 @@ pub struct ComponentDecl {
     /// K1007 restriction assumed otherwise; retired the same day, after
     /// live testing proved the assumption wrong).
     pub durable: bool,
+    /// `agent`-only: `deterministic` (`docs/design/AGENTS.md` §5,
+    /// "judgment vs. determinism") -- a coarser, AGENT-level guarantee on
+    /// top of the per-FUNCTION `uses ai` tracking that already exists for
+    /// free in the effect system: every one of this agent's own EXPOSED
+    /// funs must have a transitive effect set that never includes `ai`
+    /// (K1008, `effects.rs::check_deterministic_agents`, structurally
+    /// identical to how a followed `protocol`'s own `forbids` list is
+    /// already enforced -- `deterministic` is exactly "implicitly follows
+    /// a protocol that forbids `ai`, without needing to declare one").
+    /// Always `false` when `is_agent` is `false` (K1006-style rejection).
+    pub deterministic: bool,
     /// `agent Foo follows Protocol1, Protocol2 { .. }` (`docs/design/
     /// AGENTS.md` §3) — protocol names this agent commits to. Parsed
     /// the SAME way as `fulfills` (right after the component name),

@@ -1011,6 +1011,7 @@ impl Parser {
             is_agent,
             weight: None,
             durable: false,
+            deterministic: false,
             follows,
             fulfills,
             intent: None,
@@ -1101,6 +1102,13 @@ impl Parser {
             Tok::Ident(s) if s == "durable" => {
                 self.bump();
                 c.durable = true;
+                self.expect_terminator()
+            }
+            // `deterministic` (`agent`-only, `docs/design/AGENTS.md` §5) --
+            // a bare contextual keyword, same shape as `durable`.
+            Tok::Ident(s) if s == "deterministic" => {
+                self.bump();
+                c.deterministic = true;
                 self.expect_terminator()
             }
             // `in`/`out` port declarations. `out` is a contextual keyword (a plain
