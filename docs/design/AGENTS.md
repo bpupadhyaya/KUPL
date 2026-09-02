@@ -409,7 +409,33 @@ specific answer yet, only to naming the axes:
   agent's own persistent identity may need something closer to durable
   storage, out of scope for THIS language-level proposal but worth flagging
   as a real gap (KUPL has no persistence/database layer today, per
-  `docs/GAPS.md`'s own existing assessment).
+  `docs/GAPS.md`'s own existing assessment). **UPDATE, 2026-09-01 — the
+  narrow, honest v1 slice of this is now DONE**: `durable` (a new
+  agent-only contextual keyword — `agent Foo { durable ... }`) persists an
+  agent's own `state` fields to disk (`src/agent_persist.rs`, reusing
+  `kser`'s existing binary encoding entirely — a `PortableValue::Map`
+  keyed by field name, no new serialization code) across SEPARATE `kupl
+  run` invocations of the same program, not just an in-process supervised
+  restart (which already preserved agent state before this, see the
+  `restart()` note just above this list). K1006 (`durable` on a non-agent)
+  / K1007 (`durable` + `weight distributed`, not yet supported — a `kupl
+  node` connection's own serving loop doesn't share the save hook this
+  relies on). Deliberately does NOT cover: crash-consistency (persistence
+  only happens on a SUCCESSFUL `kupl run`, inheriting `run.rs::
+  run_program`'s own pre-existing "no graceful shutdown on panic"
+  asymmetry), concurrent-writer safety across processes, schema migration
+  for a `state` field whose TYPE changes between versions (an added/
+  removed field degrades gracefully; a changed type does not), or
+  per-instance identity (one state file per agent DECLARATION name, not
+  per dynamically-spawned instance) — all explicitly named, not silently
+  glossed over, matching this whole session's "authenticated but not
+  encrypted"-style honesty discipline. Verified: `agent_persist.rs`'s own
+  unit tests (round-trip, corrupt-file tolerance, non-portable-field
+  handling); a genuine end-to-end test running the real `kupl` binary FOUR
+  separate times in a row and confirming a counter keeps incrementing
+  (`1, 2, 3, 4`), plus a negative control proving a non-`durable` agent
+  never accumulates (`1, 1, 1`); full `cargo test --lib`/`cargo test --bin
+  kupl` green.
 - **Judgment vs. determinism — PARTIALLY ANSWERED by existing machinery,
   2026-08-27**: `ai fun` is already non-deterministic (a live LLM call) —
   an agent leaning on it inherits that. The distinction this axis asks
@@ -540,15 +566,28 @@ specific answer yet, only to naming the axes:
   block ending in `return` as `Ty::Unit` for tail-type-unification
   purposes, spuriously rejecting valid `return`-terminated fun/closure
   bodies and mismatched `match` arms) — see §3's own writeup.
+- **DONE, 2026-09-01:** `weight distributed` itself, real node-to-node
+  actor transport (`interp.rs::ActorRoute::Distributed`, `kupl node`,
+  `src/kser.rs`, `src/distribution.rs`) — see §4's own updated table.
+  Shared-secret authenticated, NOT encrypted; a static single-node
+  slice, not the full `cap.Cluster` vision. K0316 retired.
+- **DONE, 2026-09-01:** §5's "identity & memory" axis, the narrow
+  in-process-crash-boundary slice — `durable agent` (`src/agent_persist.rs`,
+  see §5's own updated entry above for the full writeup). NOT the full
+  vision (crash-consistency, cross-process concurrent writers, schema
+  migration, per-instance identity all remain open, explicitly named
+  rather than silently deferred).
 - **NOT STARTED:** multi-protocol composition/conflict resolution remains
   open but lower-urgency now that both shipped slices (`forbids`-only
   union, `guards`-only explicit-opt-in) sidestep it (see §3's own "Open"
-  note). §5's open questions (identity/persistence, judgment-vs-
-  determinism, "infinite agents" bounding) remain fully open — the
-  natural next slice for whoever picks this up.
-- **Recommended next slice:** §5's open questions (agent identity/
-  persistence, judgment-vs-determinism, "infinite agents" bounding) —
-  all still fully open design work, no code written. Both of §3's own
-  enforcement models (structural `forbids`, behavioral `guard`/`guards`)
-  are now implemented; §3 itself has no remaining unstarted work besides
-  the deliberately-deferred composition/conflict question above.
+  note). §5's own "judgment vs. determinism" and "infinite agents"
+  bounding axes remain open in the narrower sense described in their own
+  entries above (both partially answered by existing machinery already).
+- **Recommended next slice:** now that identity/persistence has a real
+  (if narrow) v1 and `weight distributed` is fully implemented, the
+  remaining named-but-unstarted work is: multi-protocol composition/
+  conflict resolution (§3), the coarser agent-level "fully deterministic"
+  declaration (§5's judgment-vs-determinism note), or extending `durable`
+  to cover `weight distributed` (K1007's own current restriction) — all
+  smaller, more scoped questions than "identity & memory" was before this
+  slice landed.

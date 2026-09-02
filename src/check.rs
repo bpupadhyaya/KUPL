@@ -2610,6 +2610,28 @@ impl Checker {
                 c.span,
             );
         }
+        // `docs/design/AGENTS.md` §5: `durable` is `agent`-only (K1006,
+        // mirrors K0317's own "parser accepts broadly, checker narrows"
+        // shape exactly).
+        if c.durable && !c.is_agent {
+            self.err(
+                "K1006",
+                "`durable` is only valid on an `agent` -- a plain `component`/`concurrent component` has no persisted identity to make durable".to_string(),
+                c.span,
+            );
+        }
+        // `durable` + `weight distributed` together is K1007 for v1: a
+        // `kupl node`'s own connection-serving loop
+        // (`Interp::serve_distributed_connection`) doesn't share the
+        // `stop_all`-based save hook `durable` relies on -- genuine
+        // future work, not silently ignored.
+        if c.durable && c.weight == Some(AgentWeight::Distributed) {
+            self.err(
+                "K1007",
+                "`durable` is not yet supported together with `weight distributed` -- a `kupl node`'s own connection-serving loop doesn't run the save hook `durable` relies on yet".to_string(),
+                c.span,
+            );
+        }
         // `docs/design/AGENTS.md` §3: `follows` is `agent`-only (K1003 --
         // mirrors K0317's own "parser accepts broadly, checker narrows"
         // shape exactly), and each named protocol must actually exist
@@ -6801,6 +6823,50 @@ mod generic_tests {
                            app Main {\n    intent \"m\"\n}\n";
         let errs2 = errors(concurrent);
         assert!(errs2.iter().any(|d| d.code == "K0317"), "`weight` on a concurrent component must be K0317: {errs2:?}");
+    }
+
+    /// `docs/design/AGENTS.md` §5: a well-formed `durable agent` (alone,
+    /// and combined with each non-`distributed` weight) must check
+    /// completely clean.
+    #[test]
+    fn well_formed_durable_agent_checks_clean() {
+        let src = "agent Rep {\n    intent \"a\"\n    durable\n    state n: Int = 0\n    expose fun f() -> Int { n }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.is_empty(), "a well-formed `durable agent` must check clean: {errs:?}");
+
+        for weight in ["lightweight", "heavyweight"] {
+            let src = format!(
+                "agent Rep {{\n    intent \"a\"\n    durable\n    weight {weight}\n    state n: Int = 0\n    expose fun f() -> Int {{ n }}\n}}\n\
+                 app Main {{\n    intent \"m\"\n}}\n"
+            );
+            let errs = errors(&src);
+            assert!(errs.is_empty(), "`durable agent {{ weight {weight} }}` must check clean: {errs:?}");
+        }
+    }
+
+    /// K1006: `durable` is agent-only -- rejected on a plain `component`
+    /// AND on a `concurrent component`.
+    #[test]
+    fn durable_on_a_non_agent_is_k1006() {
+        let plain = "component P {\n    intent \"p\"\n    durable\n}\n\
+                      app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(plain);
+        assert!(errs.iter().any(|d| d.code == "K1006"), "`durable` on a plain component must be K1006: {errs:?}");
+
+        let concurrent = "concurrent component C {\n    intent \"c\"\n    durable\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n}\n";
+        let errs2 = errors(concurrent);
+        assert!(errs2.iter().any(|d| d.code == "K1006"), "`durable` on a concurrent component must be K1006: {errs2:?}");
+    }
+
+    /// K1007: `durable` + `weight distributed` together is rejected for v1.
+    #[test]
+    fn durable_with_weight_distributed_is_k1007() {
+        let src = "agent Rep {\n    intent \"a\"\n    durable\n    weight distributed\n    expose fun f() -> Int { 1 }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        let errs = errors(src);
+        assert!(errs.iter().any(|d| d.code == "K1007"), "`durable` + `weight distributed` must be K1007: {errs:?}");
     }
 
     /// KUPL Agents (`docs/design/AGENTS.md` §3): a well-formed `protocol` +

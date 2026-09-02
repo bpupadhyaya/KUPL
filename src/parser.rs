@@ -1010,6 +1010,7 @@ impl Parser {
             concurrent: concurrent || is_agent,
             is_agent,
             weight: None,
+            durable: false,
             follows,
             fulfills,
             intent: None,
@@ -1091,6 +1092,15 @@ impl Parser {
                     }
                 };
                 c.weight = Some(weight);
+                self.expect_terminator()
+            }
+            // `durable` (`agent`-only, `docs/design/AGENTS.md` §5) -- a
+            // bare contextual keyword (no value, unlike `weight`), same
+            // "parser accepts the shape uniformly, checker narrows"
+            // precedent (K1006 rejects it on a non-`agent`).
+            Tok::Ident(s) if s == "durable" => {
+                self.bump();
+                c.durable = true;
                 self.expect_terminator()
             }
             // `in`/`out` port declarations. `out` is a contextual keyword (a plain

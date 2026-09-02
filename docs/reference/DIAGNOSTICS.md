@@ -227,3 +227,5 @@ clean or violated, only `kupl run` can).
 | K1003 | E | `follows` is only valid on an `agent`, not a plain `component`/`concurrent component` |
 | K1004 | E | `guards` is only valid on an `agent`'s own `expose fun` |
 | K1005 | E | `guards` names a guard that doesn't exist on any protocol the agent follows |
+| K1006 | E | `durable` is only valid on an `agent`, not a plain `component`/`concurrent component` |
+| K1007 | E | `durable` is not yet supported together with `weight distributed` |

@@ -429,6 +429,11 @@ fn fmt_component(out: &mut String, c: &ComponentDecl) {
         };
         out.push_str(&format!("weight {w}\n"));
     }
+    if c.durable {
+        sep(out, true);
+        indent(out, 1);
+        out.push_str("durable\n");
+    }
     sep(out, !c.props.is_empty());
     for p in &c.props {
         indent(out, 1);
@@ -1224,6 +1229,28 @@ mod tests {
         assert!(d2.is_empty(), "{d2:?}");
         let formatted2 = super::format_program(&p2);
         assert!(!formatted2.contains("weight"), "an agent with no weight clause must not gain one: {formatted2:?}");
+    }
+
+    /// `docs/design/AGENTS.md` §5: `agent Foo { durable .. }` must
+    /// round-trip losslessly, and an agent with NO `durable` clause must
+    /// not gain one.
+    #[test]
+    fn fmt_preserves_durable_clause() {
+        let src = "agent Rep {\n    intent \"a\"\n    durable\n    state n: Int = 0\n    expose fun f() -> Int { n }\n}\n\
+                    app Main {\n    intent \"m\"\n}\n";
+        roundtrip(src);
+        let (p, d) = parser::parse(src);
+        assert!(d.is_empty(), "{d:?}");
+        let formatted = super::format_program(&p);
+        assert!(formatted.contains("durable\n"), "the `durable` clause must survive formatting: {formatted:?}");
+
+        let no_durable = "agent Rep {\n    intent \"a\"\n    expose fun f() -> Int { 1 }\n}\n\
+                           app Main {\n    intent \"m\"\n}\n";
+        roundtrip(no_durable);
+        let (p2, d2) = parser::parse(no_durable);
+        assert!(d2.is_empty(), "{d2:?}");
+        let formatted2 = super::format_program(&p2);
+        assert!(!formatted2.contains("durable"), "an agent with no durable clause must not gain one: {formatted2:?}");
     }
 
     /// KUPL Agents (`docs/design/AGENTS.md` §3): a `protocol` declaration

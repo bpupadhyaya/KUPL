@@ -199,6 +199,17 @@ pub struct ComponentDecl {
     /// component`) means `Lightweight`. Always `None` when `is_agent` is
     /// `false`.
     pub weight: Option<AgentWeight>,
+    /// `agent`-only: `durable` (`docs/design/AGENTS.md` §5, "identity &
+    /// memory") -- this agent's own `state` fields are persisted to disk
+    /// (`interp.rs::agent_persist`) across separate `kupl run` invocations
+    /// of the same program, not just across an in-process supervised
+    /// restart (which already preserves state for every agent, `durable`
+    /// or not -- see `restart`'s own `!comp.is_agent` check). Always
+    /// `false` when `is_agent` is `false` (K1006), and rejected together
+    /// with `weight distributed` for v1 (K1007) -- a `kupl node`'s own
+    /// connection-serving loop doesn't share the `stop_all`-based save
+    /// hook this relies on yet.
+    pub durable: bool,
     /// `agent Foo follows Protocol1, Protocol2 { .. }` (`docs/design/
     /// AGENTS.md` §3) — protocol names this agent commits to. Parsed
     /// the SAME way as `fulfills` (right after the component name),

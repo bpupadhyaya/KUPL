@@ -2297,6 +2297,22 @@ impl Interp {
             let v = self.eval(&s.init, &env)?;
             env.define(&s.name, v);
         }
+        // `durable agent` (`docs/design/AGENTS.md` §5): overwrite the
+        // just-computed `init` defaults with any previously-persisted
+        // values, for state fields still present in THIS declaration --
+        // a stale key from a since-removed field is simply never applied
+        // (see `agent_persist::load`'s own doc comment for why the
+        // filtering happens here, not inside `load` itself).
+        if comp.is_agent && comp.durable {
+            if let Some(loaded) = crate::agent_persist::load(&comp.name) {
+                let field_names: std::collections::HashSet<&str> = comp.state.iter().map(|s| s.name.as_str()).collect();
+                for (name, v) in loaded {
+                    if field_names.contains(name.as_str()) {
+                        env.define(&name, v);
+                    }
+                }
+            }
+        }
 
         let id = self.instances.len();
         // Every instance is `Local` until §8.10 step 3 gives `concurrent`
@@ -3096,6 +3112,19 @@ impl Interp {
                 continue;
             }
             self.run_lifecycle(id, &Trigger::Stop)?;
+            // `durable agent` (`docs/design/AGENTS.md` §5): persist state
+            // AFTER `on stop` has run (so an `on stop` handler that itself
+            // updates `state` is captured too), on every successful
+            // `stop_all` -- this is why persistence only covers a
+            // successful `kupl run`, not a panic/crash: `stop_all` is
+            // never reached at all in that case (see `run.rs::
+            // run_program`'s own "a panicking program doesn't get a
+            // graceful shutdown either" note).
+            if self.instances[id].unwrap_local_mut().comp.is_agent && self.instances[id].unwrap_local_mut().comp.durable {
+                let inst = self.instances[id].unwrap_local_mut();
+                let field_names: Vec<String> = inst.comp.state.iter().map(|s| s.name.clone()).collect();
+                crate::agent_persist::save(&inst.comp.name, &field_names, &inst.env);
+            }
         }
         self.drain()?;
         // Production-hardening 1218: a REAL, live-confirmed-by-code-reading
@@ -3532,6 +3561,15 @@ impl Interp {
         // no new escalation mechanism needed for this to be safe.
         if !comp.is_agent {
             self.reset_instance_state(id)?;
+        } else if comp.durable {
+            // `durable agent`: capture state-as-of-this-panic to disk too,
+            // not just in-memory (which the `!comp.is_agent` branch above
+            // already skips resetting) -- a bonus on top of the main
+            // `stop_all`-based save hook, using the SAME `agent_persist::
+            // save` function. Best-effort, same as every other call site.
+            let inst = self.instances[id].unwrap_local_mut();
+            let field_names: Vec<String> = inst.comp.state.iter().map(|s| s.name.clone()).collect();
+            crate::agent_persist::save(&inst.comp.name, &field_names, &inst.env);
         }
         for h in &comp.handlers {
             if matches!(h.trigger, Trigger::Start) {

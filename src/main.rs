@@ -3861,6 +3861,85 @@ mod tests {
         assert!(!stdout.contains("pong"), "the actor must never actually run on a rejected connection: {out:?}");
     }
 
+    /// `durable agent` (`docs/design/AGENTS.md` §5, `src/agent_persist.rs`):
+    /// a genuine end-to-end test running the REAL `kupl` binary multiple
+    /// times in a row (separate OS processes, not just separate `Interp`s
+    /// in one process) -- the only way to actually prove state survives
+    /// the boundary this feature exists for. `KUPL_AGENT_STATE_DIR` points
+    /// at an isolated temp dir so this test can never collide with another
+    /// concurrently-running test or a real deployment's own state files.
+    #[test]
+    fn durable_agent_state_survives_across_separate_kupl_run_invocations() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-durable-e2e-test-{}", std::process::id()));
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let file = dir.join("counter.kupl");
+        std::fs::write(
+            &file,
+            "agent Counter {\n    intent \"counts across separate process runs\"\n    \
+                 durable\n    state n: Int = 0\n    \
+                 on start { n = n + 1 }\n    expose fun current() -> Int { n }\n}\n\
+             app Main {\n    intent \"durable agent end-to-end test\"\n    \
+                 let c = Counter()\n    on start { print(c.current()) }\n}\n",
+        )
+        .unwrap();
+
+        for expected in 1..=4 {
+            let out = std::process::Command::new(&bin)
+                .args(["run", file.to_str().unwrap()])
+                .env("KUPL_AGENT_STATE_DIR", &state_dir)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{expected}\n"),
+                "run #{expected} must see the counter incremented by every PRIOR separate process, not reset: {out:?}"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Negative control for the test just above: an agent with NO
+    /// `durable` clause must NEVER persist, no matter how many times the
+    /// real binary runs -- proving the feature is opt-in, not ambient.
+    #[test]
+    fn non_durable_agent_never_persists_across_kupl_run_invocations() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-non-durable-e2e-test-{}", std::process::id()));
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let file = dir.join("counter.kupl");
+        std::fs::write(
+            &file,
+            "agent Counter {\n    intent \"does NOT persist -- no durable clause\"\n    \
+                 state n: Int = 0\n    on start { n = n + 1 }\n    expose fun current() -> Int { n }\n}\n\
+             app Main {\n    intent \"non-durable negative control\"\n    \
+                 let c = Counter()\n    on start { print(c.current()) }\n}\n",
+        )
+        .unwrap();
+
+        for _ in 0..3 {
+            let out = std::process::Command::new(&bin)
+                .args(["run", file.to_str().unwrap()])
+                .env("KUPL_AGENT_STATE_DIR", &state_dir)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(String::from_utf8_lossy(&out.stdout), "1\n", "a non-durable agent must never accumulate state across runs: {out:?}");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// KUPL Agents v1 (`docs/design/AGENTS.md` §4/§7): `agent` + `weight`
     /// dispatch onto the pooled/dedicated concurrency tiers (`weight
     /// distributed`, a THIRD tier, has its own dedicated end-to-end test
