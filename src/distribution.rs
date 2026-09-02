@@ -50,6 +50,84 @@ pub fn parse_node_env(raw: &str) -> Result<(String, String), String> {
     Ok((token.to_string(), addr.to_string()))
 }
 
+/// `kupl node` is thread-per-connection (`run::run_node`'s own accept
+/// loop) -- without a cap, a client that just opens connections without
+/// ever completing (or even starting) the auth handshake could exhaust
+/// OS threads, the SAME class of unbounded-growth-from-a-hostile-or-
+/// buggy-peer concern `interp.rs::MAILBOX_CAP`/`MAX_ACTOR_INSTANCES`
+/// already close elsewhere in this codebase, now extended to network
+/// input specifically. Deliberately generous (10,000 concurrent
+/// connections is already a large deployment) -- a backstop against
+/// genuine resource exhaustion, not a normal-operation limit.
+pub const MAX_NODE_CONNECTIONS: usize = 10_000;
+
+static LIVE_NODE_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// RAII handle for one live `kupl node` connection slot -- unlike
+/// `interp.rs::MAX_ACTOR_INSTANCES`'s own monotonic counter (no way to
+/// know when an ACTOR dies), a connection's own thread always knows
+/// exactly when it ends (falls off the end of `serve_distributed_
+/// connection`, including on an early return or a panic unwinding
+/// through this guard), so this can be a genuine LIVE gauge, decremented
+/// on `Drop` -- accurately reflecting concurrently-open connections, not
+/// just a lifetime total.
+pub struct ConnectionSlot {
+    counter: &'static std::sync::atomic::AtomicUsize,
+}
+
+impl ConnectionSlot {
+    /// `None` if `MAX_NODE_CONNECTIONS` is already reached -- the caller
+    /// (`run::run_node`'s accept loop) closes the connection immediately
+    /// without ever spawning a thread or reading a single byte from it.
+    pub fn try_acquire() -> Option<ConnectionSlot> {
+        Self::try_acquire_against(&LIVE_NODE_CONNECTIONS, MAX_NODE_CONNECTIONS)
+    }
+
+    /// Split from `try_acquire` so tests can drive the exact same
+    /// accounting logic against a small, LOCAL `static` counter/cap
+    /// instead of the real global one -- mirrors `interp.rs::
+    /// reserve_actor_slot_impl`'s own split for `MAX_ACTOR_INSTANCES`,
+    /// same rationale: a test-local `static` (declared inside the test
+    /// function itself, a genuinely fresh counter no other test can
+    /// touch) avoids both "acquire 10,000 real slots to test the real
+    /// cap" AND cross-test interference from sharing the real global
+    /// counter.
+    fn try_acquire_against(counter: &'static std::sync::atomic::AtomicUsize, cap: usize) -> Option<ConnectionSlot> {
+        loop {
+            let cur = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if cur >= cap {
+                return None;
+            }
+            if counter
+                .compare_exchange(cur, cur + 1, std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed)
+                .is_ok()
+            {
+                return Some(ConnectionSlot { counter });
+            }
+        }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// How long a connection may take to complete the initial `Auth`+`Spawn`
+/// handshake before the server gives up on it -- closes the "connect,
+/// then just sit there sending nothing" thread-exhaustion angle
+/// `MAX_NODE_CONNECTIONS` alone doesn't fully cover (a slow/hostile peer
+/// could otherwise still occupy `MAX_NODE_CONNECTIONS` slots FOREVER by
+/// never finishing the handshake, permanently starving every legitimate
+/// connection after it). Deliberately NOT applied once a connection's
+/// own actor is up and running (`serve_distributed_connection` clears
+/// the read timeout before entering its message-servicing loop) -- a
+/// legitimately idle `Deliver`/`Call` gap between messages is completely
+/// normal for a long-lived actor and must never be mistaken for a stuck
+/// client.
+pub const AUTH_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// One message in the `weight distributed` wire protocol. Every variant
 /// round-trips through `to_wire`/`from_wire` below as a `PortableValue::
 /// Ctor` tagged `"DistMsg"` -- reusing `kser`'s already-tested encoder
@@ -442,6 +520,46 @@ mod tests {
         assert!(!tokens_match("abc", "ab"));
         assert!(!tokens_match("", "a"));
         assert!(tokens_match("", ""));
+    }
+
+    /// `MAX_NODE_CONNECTIONS`/`ConnectionSlot` (production-hardening: a
+    /// `kupl node` accept loop with no cap and no per-connection thread
+    /// exhaustion protection). Drives `try_acquire_against` against a
+    /// small LOCAL `static` counter -- a genuinely fresh counter this
+    /// test owns exclusively, so it can safely fill it to its real cap
+    /// without touching the real global `LIVE_NODE_CONNECTIONS` (which
+    /// production code, and no other test, ever mutates for us to
+    /// interfere with either way).
+    #[test]
+    fn exactly_at_capacity_all_succeed_one_past_capacity_is_rejected() {
+        static TEST_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut slots = Vec::new();
+        for _ in 0..5 {
+            slots.push(ConnectionSlot::try_acquire_against(&TEST_COUNTER, 5).expect("must succeed up to exactly capacity"));
+        }
+        assert!(ConnectionSlot::try_acquire_against(&TEST_COUNTER, 5).is_none(), "the 6th acquire past a cap of 5 must be rejected");
+        assert_eq!(TEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed), 5);
+    }
+
+    /// A slot releases its place when dropped -- proving this is a LIVE
+    /// gauge (concurrently-open connections), not a monotonic lifetime
+    /// total: filling to capacity, releasing one, must free exactly one
+    /// new slot, not leave the counter stuck at the cap forever.
+    #[test]
+    fn dropping_a_slot_frees_it_for_a_later_acquire() {
+        static TEST_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let mut slots: Vec<_> = (0..3).map(|_| ConnectionSlot::try_acquire_against(&TEST_COUNTER, 3).unwrap()).collect();
+        assert!(ConnectionSlot::try_acquire_against(&TEST_COUNTER, 3).is_none());
+        // `Vec::remove`, not `into_iter().next()` -- the latter would drop
+        // the WHOLE remaining `IntoIter` (all 3 slots, since it's never
+        // bound to a variable and is dropped as a temporary at the end of
+        // the statement), not just the one element `.next()` returns. A
+        // real bug caught live: this test originally asserted the counter
+        // was `2` after "dropping one" and got `0` instead, confirming all
+        // three were dropped -- fixed here, not in `ConnectionSlot` itself.
+        drop(slots.remove(0));
+        assert_eq!(TEST_COUNTER.load(std::sync::atomic::Ordering::Relaxed), 2);
+        assert!(ConnectionSlot::try_acquire_against(&TEST_COUNTER, 3).is_some(), "freeing one slot must allow exactly one new acquire");
     }
 
     /// A hand-rolled mock server (a plain background thread speaking the

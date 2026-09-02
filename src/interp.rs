@@ -2843,6 +2843,14 @@ impl Interp {
         db: std::rc::Rc<ProgramDb>,
         image: std::sync::Arc<crate::parallel::ProgramImage>,
     ) {
+        // `distribution::AUTH_HANDSHAKE_TIMEOUT`'s own doc comment: bound
+        // how long a connection may take to complete Auth+Spawn, so a
+        // slow/hostile peer that never sends anything can't occupy this
+        // thread (and a `MAX_NODE_CONNECTIONS` slot) forever. Cleared
+        // below, before the message-servicing loop, since an idle gap
+        // between a long-lived actor's own messages is normal and must
+        // never be mistaken for a stuck client.
+        let _ = stream.set_read_timeout(Some(crate::distribution::AUTH_HANDSHAKE_TIMEOUT));
         let Ok(first) = crate::kser::read_value_frame(&mut stream) else { return };
         let Ok(crate::distribution::DistMsg::Auth { token: got }) = crate::distribution::DistMsg::from_wire(first) else {
             return;
@@ -2897,6 +2905,9 @@ impl Interp {
                 return;
             }
         }
+        // Handshake complete -- an idle gap between messages is normal
+        // for a long-lived actor, so no read timeout applies from here on.
+        let _ = stream.set_read_timeout(None);
 
         loop {
             let Ok(frame) = crate::kser::read_value_frame(&mut stream) else { break };

@@ -795,9 +795,18 @@ pub fn run_node(path: &str, listen_addr: &str, token: &str) -> i32 {
     eprintln!("kupl node: listening on {listen_addr} (serving `{path}`)");
     for conn in listener.incoming() {
         let Ok(stream) = conn else { continue };
+        // `distribution::MAX_NODE_CONNECTIONS`'s own doc comment: a
+        // resource-exhaustion backstop, not a normal-operation limit --
+        // a connection past the cap is closed immediately, before a
+        // thread is spawned or a single byte is read from it.
+        let Some(slot) = crate::distribution::ConnectionSlot::try_acquire() else {
+            drop(stream);
+            continue;
+        };
         let image = image.clone();
         let token = token.to_string();
         std::thread::spawn(move || {
+            let _slot = slot; // held for the connection's whole life; decrements MAX_NODE_CONNECTIONS on Drop
             let db = std::rc::Rc::new(image.actor_db());
             Interp::serve_distributed_connection(stream, &token, db, image);
         });
