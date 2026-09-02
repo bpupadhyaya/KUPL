@@ -7,8 +7,15 @@
 //! Deliberately narrow, matching this whole initiative's own "ship a
 //! real, honest v1 slice, name what's deferred" discipline (the same
 //! posture `weight distributed`'s security section took): this covers a
-//! `durable agent` running under an ordinary `kupl run` (`weight
-//! lightweight`/`heavyweight`) whose OWNING PROCESS exits cleanly.
+//! `durable agent` whose OWNING PROCESS exits cleanly, for every `weight`
+//! value INCLUDING `distributed` — `Interp::serve_distributed_connection`
+//! (the `kupl node` server side) calls the SAME `instantiate_local`/
+//! `stop_all` functions the load/save hooks below live inside, so the
+//! combination just works, no special-casing needed (an initial K1007
+//! checker restriction assumed otherwise; retired the same day, once
+//! live testing proved that assumption wrong). For `weight distributed`
+//! specifically, the state file lives on the NODE's own filesystem
+//! (wherever the agent actually runs), not the client's.
 //! Explicitly NOT covered, not silently glossed over:
 //!
 //! - **Crash-consistency.** `stop_all` (and therefore the save hook
@@ -17,9 +24,6 @@
 //!   successful save. This isn't a new gap this feature introduces; it
 //!   inherits `run.rs::run_program`'s own pre-existing "`on stop` (and
 //!   now persistence) only fires on success" asymmetry.
-//! - **`weight distributed`.** Checker-rejected (K1007) — a `kupl node`
-//!   connection's own serving loop doesn't share the `stop_all`-based
-//!   hook this relies on.
 //! - **Concurrent-writer safety.** Two processes (or two live instances
 //!   of the same durable agent TYPE in one process) racing on the same
 //!   file is undefined — last `rename` wins, no lock file.

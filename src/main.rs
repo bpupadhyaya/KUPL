@@ -3940,6 +3940,72 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// `durable` + `weight distributed` COMBINED (`docs/design/AGENTS.md`
+    /// §5/§4) -- a genuine end-to-end test proving the K1007 restriction's
+    /// own retirement was correct, not just asserted: a real `kupl node`
+    /// process hosts the durable agent; state must accumulate correctly
+    /// across THREE SEPARATE CLIENT `kupl run` invocations, all reaching
+    /// the SAME long-lived node -- proving persistence happens on the
+    /// node's own filesystem (where the agent actually runs), driven by
+    /// the exact same `instantiate_local`/`stop_all` hooks the
+    /// non-distributed test above already exercises, just reached over
+    /// `Interp::serve_distributed_connection` instead of directly.
+    #[test]
+    fn durable_agent_with_weight_distributed_accumulates_state_on_the_node() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-durable-distributed-e2e-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("counter.kupl");
+        std::fs::write(
+            &file,
+            "agent Counter {\n    intent \"durable + distributed combined\"\n    \
+                 durable\n    weight distributed\n    state n: Int = 0\n    \
+                 on start { n = n + 1 }\n    expose fun current() -> Int { n }\n}\n\
+             app Main {\n    intent \"durable+distributed end-to-end test\"\n    \
+                 let c = Counter()\n    on start { print(c.current()) }\n}\n",
+        )
+        .unwrap();
+
+        let addr = "127.0.0.1:38240";
+        let token = "durable-dist-token";
+        let mut node = std::process::Command::new(&bin)
+            .args(["node", file.to_str().unwrap(), "--listen", addr, "--token", token])
+            .current_dir(&dir) // so the node's own default `.kupl/agent-state/` lands inside our own cleaned-up temp dir
+            .spawn()
+            .expect("spawn `kupl node` child process");
+
+        let mut ready = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(ready, "`kupl node` never started listening on {addr}");
+
+        for expected in 1..=3 {
+            let out = std::process::Command::new(&bin)
+                .args(["run", file.to_str().unwrap()])
+                .env("KUPL_DISTRIBUTED_NODE", format!("{token}@{addr}"))
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("{expected}\n"),
+                "run #{expected}: durable state must accumulate on the NODE across separate client invocations: {out:?}"
+            );
+        }
+
+        let _ = node.kill();
+        let _ = node.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// KUPL Agents v1 (`docs/design/AGENTS.md` §4/§7): `agent` + `weight`
     /// dispatch onto the pooled/dedicated concurrency tiers (`weight
     /// distributed`, a THIRD tier, has its own dedicated end-to-end test

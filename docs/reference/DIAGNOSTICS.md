@@ -228,4 +228,4 @@ clean or violated, only `kupl run` can).
 | K1004 | E | `guards` is only valid on an `agent`'s own `expose fun` |
 | K1005 | E | `guards` names a guard that doesn't exist on any protocol the agent follows |
 | K1006 | E | `durable` is only valid on an `agent`, not a plain `component`/`concurrent component` |
-| K1007 | E | `durable` is not yet supported together with `weight distributed` |
+| K1007 | — | **RETIRED 2026-09-01 (same day it was added).** Was: `durable` + `weight distributed` rejected together, based on an assumption (a `kupl node`'s own serving loop doesn't share the save hook) that live testing proved WRONG — `Interp::serve_distributed_connection` calls the same `instantiate_local`/`stop_all` functions the hooks already live inside, so the combination genuinely works with no new code. Code retired, not reused. |

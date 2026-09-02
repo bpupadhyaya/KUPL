@@ -205,10 +205,13 @@ pub struct ComponentDecl {
     /// of the same program, not just across an in-process supervised
     /// restart (which already preserves state for every agent, `durable`
     /// or not -- see `restart`'s own `!comp.is_agent` check). Always
-    /// `false` when `is_agent` is `false` (K1006), and rejected together
-    /// with `weight distributed` for v1 (K1007) -- a `kupl node`'s own
-    /// connection-serving loop doesn't share the `stop_all`-based save
-    /// hook this relies on yet.
+    /// `false` when `is_agent` is `false` (K1006). Works with EVERY
+    /// `weight` value, including `distributed` -- `Interp::serve_
+    /// distributed_connection` (the `kupl node` server side) calls the
+    /// SAME `instantiate_local`/`stop_all` functions the load/save hooks
+    /// already live inside, so no special-casing was needed (an initial
+    /// K1007 restriction assumed otherwise; retired the same day, after
+    /// live testing proved the assumption wrong).
     pub durable: bool,
     /// `agent Foo follows Protocol1, Protocol2 { .. }` (`docs/design/
     /// AGENTS.md` §3) — protocol names this agent commits to. Parsed

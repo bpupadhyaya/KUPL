@@ -2620,18 +2620,21 @@ impl Checker {
                 c.span,
             );
         }
-        // `durable` + `weight distributed` together is K1007 for v1: a
-        // `kupl node`'s own connection-serving loop
-        // (`Interp::serve_distributed_connection`) doesn't share the
-        // `stop_all`-based save hook `durable` relies on -- genuine
-        // future work, not silently ignored.
-        if c.durable && c.weight == Some(AgentWeight::Distributed) {
-            self.err(
-                "K1007",
-                "`durable` is not yet supported together with `weight distributed` -- a `kupl node`'s own connection-serving loop doesn't run the save hook `durable` relies on yet".to_string(),
-                c.span,
-            );
-        }
+        // K1007 ("`durable` + `weight distributed` not yet supported")
+        // RETIRED 2026-09-01, hours after it was first added: it was
+        // based on an incorrect assumption, corrected by direct live
+        // testing rather than just re-reading the code -- `Interp::
+        // serve_distributed_connection` (the `kupl node` server side)
+        // calls the SAME `instantiate_local`/`stop_all` functions
+        // `durable`'s own load/save hooks already live inside, via the
+        // exact same code path every other spawn uses. No new code was
+        // needed; only this now-incorrect restriction had to be removed.
+        // Live-verified: a `durable agent { weight distributed }`
+        // correctly accumulated state (`1, 2, 3`) across three SEPARATE
+        // client `kupl run` invocations against one persistent `kupl
+        // node`, with the state file living on the NODE's own
+        // filesystem (where the agent actually runs), not the client's.
+        // `docs/design/AGENTS.md` §5 -- code retired, not reused.
         // `docs/design/AGENTS.md` §3: `follows` is `agent`-only (K1003 --
         // mirrors K0317's own "parser accepts broadly, checker narrows"
         // shape exactly), and each named protocol must actually exist
@@ -6826,8 +6829,10 @@ mod generic_tests {
     }
 
     /// `docs/design/AGENTS.md` §5: a well-formed `durable agent` (alone,
-    /// and combined with each non-`distributed` weight) must check
-    /// completely clean.
+    /// and combined with EVERY weight value, including `distributed` --
+    /// K1007's own retirement, `durable` + `weight distributed` genuinely
+    /// works, see this file's own comment at the former K1007 call site)
+    /// must check completely clean.
     #[test]
     fn well_formed_durable_agent_checks_clean() {
         let src = "agent Rep {\n    intent \"a\"\n    durable\n    state n: Int = 0\n    expose fun f() -> Int { n }\n}\n\
@@ -6835,7 +6840,7 @@ mod generic_tests {
         let errs = errors(src);
         assert!(errs.is_empty(), "a well-formed `durable agent` must check clean: {errs:?}");
 
-        for weight in ["lightweight", "heavyweight"] {
+        for weight in ["lightweight", "heavyweight", "distributed"] {
             let src = format!(
                 "agent Rep {{\n    intent \"a\"\n    durable\n    weight {weight}\n    state n: Int = 0\n    expose fun f() -> Int {{ n }}\n}}\n\
                  app Main {{\n    intent \"m\"\n}}\n"
@@ -6858,15 +6863,6 @@ mod generic_tests {
                            app Main {\n    intent \"m\"\n}\n";
         let errs2 = errors(concurrent);
         assert!(errs2.iter().any(|d| d.code == "K1006"), "`durable` on a concurrent component must be K1006: {errs2:?}");
-    }
-
-    /// K1007: `durable` + `weight distributed` together is rejected for v1.
-    #[test]
-    fn durable_with_weight_distributed_is_k1007() {
-        let src = "agent Rep {\n    intent \"a\"\n    durable\n    weight distributed\n    expose fun f() -> Int { 1 }\n}\n\
-                    app Main {\n    intent \"m\"\n}\n";
-        let errs = errors(src);
-        assert!(errs.iter().any(|d| d.code == "K1007"), "`durable` + `weight distributed` must be K1007: {errs:?}");
     }
 
     /// KUPL Agents (`docs/design/AGENTS.md` §3): a well-formed `protocol` +

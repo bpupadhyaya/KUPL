@@ -417,10 +417,18 @@ specific answer yet, only to naming the axes:
   keyed by field name, no new serialization code) across SEPARATE `kupl
   run` invocations of the same program, not just an in-process supervised
   restart (which already preserved agent state before this, see the
-  `restart()` note just above this list). K1006 (`durable` on a non-agent)
-  / K1007 (`durable` + `weight distributed`, not yet supported — a `kupl
-  node` connection's own serving loop doesn't share the save hook this
-  relies on). Deliberately does NOT cover: crash-consistency (persistence
+  `restart()` note just above this list). K1006 rejects `durable` on a
+  non-agent. Works with EVERY `weight` value, including `distributed` —
+  `Interp::serve_distributed_connection` (the `kupl node` server side)
+  calls the SAME `instantiate_local`/`stop_all` functions the load/save
+  hooks already live inside, so no special-casing was needed. (A K1007
+  restriction — "`durable` + `weight distributed` not yet supported" —
+  was added and then retired the SAME day, once live testing proved the
+  original "the server doesn't share the save hook" assumption wrong; a
+  `durable agent { weight distributed }` genuinely persists correctly,
+  on the NODE's own filesystem, verified across 3 separate client `kupl
+  run` invocations against one long-lived `kupl node`.) Deliberately
+  does NOT cover: crash-consistency (persistence
   only happens on a SUCCESSFUL `kupl run`, inheriting `run.rs::
   run_program`'s own pre-existing "no graceful shutdown on panic"
   asymmetry), concurrent-writer safety across processes, schema migration
@@ -584,10 +592,10 @@ specific answer yet, only to naming the axes:
   bounding axes remain open in the narrower sense described in their own
   entries above (both partially answered by existing machinery already).
 - **Recommended next slice:** now that identity/persistence has a real
-  (if narrow) v1 and `weight distributed` is fully implemented, the
+  (if narrow) v1, `weight distributed` is fully implemented, AND `durable`
+  already works with every weight value including `distributed`, the
   remaining named-but-unstarted work is: multi-protocol composition/
-  conflict resolution (§3), the coarser agent-level "fully deterministic"
-  declaration (§5's judgment-vs-determinism note), or extending `durable`
-  to cover `weight distributed` (K1007's own current restriction) — all
+  conflict resolution (§3), or the coarser agent-level "fully
+  deterministic" declaration (§5's judgment-vs-determinism note) — both
   smaller, more scoped questions than "identity & memory" was before this
   slice landed.
