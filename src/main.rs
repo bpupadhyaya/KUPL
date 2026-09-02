@@ -3792,6 +3792,75 @@ mod tests {
         assert_eq!(String::from_utf8_lossy(&out.stdout), "pong\n", "{out:?}");
     }
 
+    /// `weight distributed`'s shared-secret auth (`distribution.rs::
+    /// tokens_match`, `docs/PRODUCTION.md`'s own "AUTHENTICATED, NOT
+    /// ENCRYPTED" security posture) is unit-tested at the protocol level
+    /// against a mock server (`distribution.rs`'s own tests) -- this
+    /// closes the gap between "the protocol logic rejects a wrong token"
+    /// and "a REAL deployment actually enforces that": a genuine second
+    /// `kupl node` process, connected to with the WRONG token, must
+    /// refuse the connection cleanly (a diagnosed panic at the spawn
+    /// site, not a hang, not a silent bypass, not an internal-compiler-
+    /// error) -- and, crucially, must never actually construct/run the
+    /// `Echo` agent at all (checked via the node's own log line never
+    /// appearing on this actor's behalf, since a bypassed-auth bug could
+    /// otherwise silently spawn the actor anyway while merely reporting
+    /// an error to the client).
+    #[test]
+    fn distributed_weight_with_the_wrong_token_is_cleanly_rejected_by_a_real_node() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-distributed-wrong-token-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("dist_auth.kupl");
+        std::fs::write(
+            &file,
+            "agent Echo {\n    intent \"replies over a real distributed connection\"\n    \
+                 weight distributed\n    \
+                 expose fun ping() -> Str { \"pong\" }\n}\n\
+             app Main {\n    intent \"distributed weight wrong-token test\"\n    \
+                 let e = Echo()\n    \
+                 on start { print(e.ping()) }\n}\n",
+        )
+        .unwrap();
+
+        let addr = "127.0.0.1:38200";
+        let real_token = "the-real-token";
+        let mut node = std::process::Command::new(&bin)
+            .args(["node", file.to_str().unwrap(), "--listen", addr, "--token", real_token])
+            .spawn()
+            .expect("spawn `kupl node` child process");
+
+        let mut ready = false;
+        for _ in 0..100 {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(ready, "`kupl node` never started listening on {addr}");
+
+        let out = std::process::Command::new(&bin)
+            .args(["run", file.to_str().unwrap()])
+            .env("KUPL_DISTRIBUTED_NODE", format!("wrong-token@{addr}"))
+            .output()
+            .unwrap();
+
+        let _ = node.kill();
+        let _ = node.wait();
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert_eq!(out.status.code(), Some(101), "a wrong token must be a clean panic, not success: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("rejected the shared-secret token"), "{stderr}");
+        assert!(!stderr.contains("internal compiler error"), "must be a diagnosed panic, not a bug report: {stderr}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(!stdout.contains("pong"), "the actor must never actually run on a rejected connection: {out:?}");
+    }
+
     /// KUPL Agents v1 (`docs/design/AGENTS.md` §4/§7): `agent` + `weight`
     /// dispatch onto the pooled/dedicated concurrency tiers (`weight
     /// distributed`, a THIRD tier, has its own dedicated end-to-end test
