@@ -814,6 +814,52 @@ pub fn run_node(path: &str, listen_addr: &str, token: &str) -> i32 {
     0
 }
 
+/// `kupl agent inspect <AgentName>` -- prints a `durable agent`'s own
+/// currently-persisted state (`src/agent_persist.rs`), or a clean "no
+/// state persisted yet" message naming exactly where a file WOULD
+/// appear once one exists. Deliberately does NOT require a `.kupl` file
+/// argument (unlike every other subcommand) -- the state file's own
+/// location depends only on the agent's NAME and `KUPL_AGENT_STATE_DIR`,
+/// not on any particular program's source, so this can inspect a state
+/// file left behind by a program that's since changed or moved.
+pub fn agent_inspect(agent_name: &str) -> i32 {
+    let path = crate::agent_persist::state_path(agent_name);
+    match crate::agent_persist::load(agent_name) {
+        None => {
+            println!("no persisted state for `{agent_name}` (would be at {})", path.display());
+        }
+        Some(fields) => {
+            println!("persisted state for `{agent_name}` ({}):", path.display());
+            for (name, value) in fields {
+                println!("  {name} = {value}");
+            }
+        }
+    }
+    0
+}
+
+/// `kupl agent clear <AgentName>` -- deletes a `durable agent`'s own
+/// persisted state file, if any (the next `kupl run` for that agent
+/// starts fresh from its ordinary `state` field `init` values, exactly
+/// like an agent that was never `durable` in the first place).
+pub fn agent_clear(agent_name: &str) -> i32 {
+    let path = crate::agent_persist::state_path(agent_name);
+    match crate::agent_persist::clear(agent_name) {
+        Ok(true) => {
+            println!("cleared persisted state for `{agent_name}` ({})", path.display());
+            0
+        }
+        Ok(false) => {
+            println!("no persisted state for `{agent_name}` to clear ({})", path.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("error: could not clear {}: {e}", path.display());
+            1
+        }
+    }
+}
+
 /// `kupl run --vm`: compile to KVM bytecode and execute on the register VM.
 pub fn run_program_vm(path: &str) -> i32 {
     let Ok((compiled, map)) = load_compile(path) else { return 1 };

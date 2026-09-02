@@ -63,8 +63,24 @@ fn state_dir() -> std::path::PathBuf {
     }
 }
 
-fn state_path(agent_name: &str) -> std::path::PathBuf {
+/// `pub` (unlike `state_dir`) so `kupl agent inspect`/`kupl agent
+/// clear` (`main.rs`) can report exactly which file they're reading
+/// from/removing -- useful even for the common "nothing persisted yet"
+/// case, so the user can see WHERE a file would appear once it exists.
+pub fn state_path(agent_name: &str) -> std::path::PathBuf {
     state_dir().join(format!("{agent_name}.kstate"))
+}
+
+/// `kupl agent clear <AgentName>` -- deletes a persisted state file, if
+/// any. `Ok(true)` if a file existed and was removed; `Ok(false)` if
+/// there was nothing to clear (matches `load`'s own "no file yet is not
+/// an error" treatment, not a failure).
+pub fn clear(agent_name: &str) -> std::io::Result<bool> {
+    match std::fs::remove_file(state_path(agent_name)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Save `agent_name`'s own `state` fields (read from `env`, which the
@@ -247,6 +263,28 @@ mod tests {
             save("EnvDirAgent", &["x".to_string()], &env);
             let expected = state_dir().join("EnvDirAgent.kstate");
             assert!(expected.exists(), "save must write under KUPL_AGENT_STATE_DIR: {expected:?}");
+        });
+    }
+
+    #[test]
+    fn clear_removes_an_existing_state_file_and_reports_it_was_removed() {
+        with_isolated_state_dir(|| {
+            let env = Env::new();
+            env.define("x", Value::Int(1));
+            save("ToClear", &["x".to_string()], &env);
+            assert!(load("ToClear").is_some());
+
+            let removed = clear("ToClear").unwrap();
+            assert!(removed, "clear must report true when a file actually existed");
+            assert!(load("ToClear").is_none(), "clear must actually delete the file");
+        });
+    }
+
+    #[test]
+    fn clear_on_a_never_persisted_agent_reports_false_not_an_error() {
+        with_isolated_state_dir(|| {
+            let removed = clear("NeverPersisted").unwrap();
+            assert!(!removed, "clearing a never-persisted agent must report false, not error");
         });
     }
 }

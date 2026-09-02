@@ -50,6 +50,8 @@ Usage:
   kupl node <file.kupl> --listen <addr> --token <token>
                                     Serve `weight distributed` actors over TCP
                                     (shared-secret auth, PLAINTEXT -- see docs/design/DISTRIBUTION.md)
+  kupl agent inspect <AgentName>    Print a `durable agent`'s persisted state
+  kupl agent clear <AgentName>      Delete a `durable agent`'s persisted state
   kupl repl                         Start an interactive session
   kupl lsp                          Start the Language Server (stdio, for editors)
   kupl version                      Print version
@@ -340,6 +342,20 @@ fn run_cli() -> ExitCode {
                 }
             }
         }
+        // `kupl agent inspect|clear <AgentName>` -- mirrors `pkg`'s own
+        // nested-subcommand shape. Deliberately takes a bare AGENT NAME,
+        // not a `.kupl` file: a persisted state file's own location
+        // depends only on the name + `KUPL_AGENT_STATE_DIR`, so this can
+        // inspect/clear a file left behind by a program that's since
+        // changed or been removed.
+        Some("agent") => match (args.get(1).map(String::as_str), args.get(2)) {
+            (Some("inspect"), Some(name)) if args.get(3).is_none() => run::agent_inspect(name),
+            (Some("clear"), Some(name)) if args.get(3).is_none() => run::agent_clear(name),
+            _ => {
+                eprintln!("usage: kupl agent inspect <AgentName>  |  kupl agent clear <AgentName>");
+                2
+            }
+        },
         // A REAL usability bug found+fixed (production-hardening PR-it782, an
         // Explore survey finding, independently re-verified live before
         // implementing): `pkg`'s path argument was a raw `args.get(2)`, unlike
@@ -3859,6 +3875,70 @@ mod tests {
         assert!(!stderr.contains("internal compiler error"), "must be a diagnosed panic, not a bug report: {stderr}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!stdout.contains("pong"), "the actor must never actually run on a rejected connection: {out:?}");
+    }
+
+    /// `kupl agent inspect|clear <AgentName>` (`src/run.rs::agent_inspect`/
+    /// `agent_clear`) -- a real end-to-end test of the CLI itself: before
+    /// any run, after a run, after clearing, and after clearing again
+    /// (nothing left to clear). Uses the real binary + a real durable
+    /// agent's own `kupl run`, not a direct `agent_persist` call, so this
+    /// proves the CLI plumbing (arg parsing, `run::agent_inspect`/
+    /// `agent_clear`, `KUPL_AGENT_STATE_DIR`) end-to-end, not just the
+    /// underlying module (already covered by `agent_persist.rs`'s own
+    /// unit tests).
+    #[test]
+    fn kupl_agent_inspect_and_clear_cli_round_trips_against_a_real_run() {
+        let bin = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/kupl");
+        if !bin.exists() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("kupl-agent-cli-test-{}", std::process::id()));
+        let state_dir = dir.join("state");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let file = dir.join("counter.kupl");
+        std::fs::write(
+            &file,
+            "agent Counter {\n    intent \"cli test\"\n    durable\n    state n: Int = 0\n    \
+                 on start { n = n + 1 }\n    expose fun current() -> Int { n }\n}\n\
+             app Main {\n    intent \"m\"\n    let c = Counter()\n    on start { print(c.current()) }\n}\n",
+        )
+        .unwrap();
+
+        let run_agent = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new(&bin).args(args).env("KUPL_AGENT_STATE_DIR", &state_dir).output().unwrap()
+        };
+
+        let out = run_agent(&["agent", "inspect", "Counter"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("no persisted state"), "{out:?}");
+
+        for _ in 0..3 {
+            let out = std::process::Command::new(&bin)
+                .args(["run", file.to_str().unwrap()])
+                .env("KUPL_AGENT_STATE_DIR", &state_dir)
+                .output()
+                .unwrap();
+            assert_eq!(out.status.code(), Some(0), "{out:?}");
+        }
+
+        let out = run_agent(&["agent", "inspect", "Counter"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains("persisted state for `Counter`"), "{stdout}");
+        assert!(stdout.contains("n = 3"), "must show the field's current persisted value: {stdout}");
+
+        let out = run_agent(&["agent", "clear", "Counter"]);
+        assert_eq!(out.status.code(), Some(0), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("cleared persisted state"), "{out:?}");
+
+        let out = run_agent(&["agent", "inspect", "Counter"]);
+        assert!(String::from_utf8_lossy(&out.stdout).contains("no persisted state"), "clear must actually remove the file: {out:?}");
+
+        let out = run_agent(&["agent", "clear", "Counter"]);
+        assert_eq!(out.status.code(), Some(0), "clearing an already-clear agent must still exit 0: {out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("no persisted state"), "{out:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// `durable agent` (`docs/design/AGENTS.md` §5, `src/agent_persist.rs`):

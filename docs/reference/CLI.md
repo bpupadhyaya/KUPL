@@ -74,6 +74,36 @@ touched) only if: a new prop has no default; a pre-existing child's own
 component type changed; or a declared `migrate_<field>` fun has the wrong
 arity. Commands: `:help` `:defs` `:upgrade <Component>` `:quit`.
 
+### `kupl node <file.kupl> --listen <addr> --token <token>`
+The SERVER side of `weight distributed` (`docs/design/AGENTS.md` §4,
+`docs/design/DISTRIBUTION.md`) — compiles `<file.kupl>`, binds `<addr>`, and
+accepts connections forever (one OS thread per connection), each hosting one
+actor spawned by a remote `weight distributed` client. `<token>` is a
+shared secret every connecting client must present (`KUPL_DISTRIBUTED_NODE`
+on the client side, see Environment below); a wrong token is rejected
+immediately, before any actor is spawned. **Authenticated, NOT encrypted** —
+every message, including the token itself, travels in plaintext. Put a
+`kupl node` behind a VPN/SSH tunnel/service mesh for anything crossing a
+network you don't already trust. Bounded against basic resource exhaustion
+(a generous `MAX_NODE_CONNECTIONS` cap, a 10s timeout on the initial
+Auth+Spawn handshake so a silent/stalled client can't hold a connection slot
+forever) but this is still a v1 slice — no `cap.Cluster`, no dynamic cluster
+membership, no `at node(...)` placement syntax (still unimplemented, K0309).
+
+### `kupl agent inspect <AgentName>`
+Prints a `durable agent`'s currently-persisted `state` fields (`docs/design/
+AGENTS.md` §5), or a clean "no persisted state yet" message naming exactly
+where a file would appear once one exists. Takes a bare agent NAME, not a
+`.kupl` file — the state file's location depends only on the name and
+`KUPL_AGENT_STATE_DIR` (see Environment below), so this works even against a
+program that's since changed or been removed.
+
+### `kupl agent clear <AgentName>`
+Deletes a `durable agent`'s persisted state file, if any (`Ok` either way —
+clearing an agent with nothing persisted is not an error). The next `kupl
+run` for that agent starts fresh from its ordinary `state` field `init`
+values.
+
 ## Compiling & packaging
 
 ### `kupl build <file.kupl> [-o out.kx]`
@@ -280,6 +310,8 @@ Prints the toolchain version.
 | `KUPL_AI_BASE_URL` | `ai fun` calls | endpoint base override (e.g. a proxy, or a remote Ollama) |
 | `KUPL_AI_MOCK` | `ai fun` calls | canned response text — forces the deterministic mock provider (no network) |
 | `KUPL_AI_MOCK_<FUN>` | `ai fun` calls | per-function canned response (fun name upper-cased); wins over `KUPL_AI_MOCK`. For a `tools` ai fun, a JSON array of rounds (`{"tool":…,"input":…}` / `{"final":…}`) |
+| `KUPL_DISTRIBUTED_NODE` | `weight distributed` spawns | `<token>@<host:port>` — which `kupl node` to connect to and the shared secret to authenticate with |
+| `KUPL_AGENT_STATE_DIR` | `durable agent` load/save, `kupl agent inspect`/`clear` | overrides the default `.kupl/agent-state/` location for persisted agent state files |
 
 ## Artifact formats
 
