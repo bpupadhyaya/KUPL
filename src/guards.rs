@@ -95,19 +95,43 @@ pub fn desugar_guards(program: &mut Program) -> Vec<Diag> {
             continue;
         }
         // The union of every guard declared by any protocol this agent
-        // follows -- a name collision across two followed protocols
-        // (same guard name, different protocols) resolves to whichever
-        // is encountered last; genuinely ambiguous `guards` usage across
-        // colliding names is a real, deliberately out-of-scope edge case
-        // for this v1 (documented, not silently mishandled: both
-        // candidates are semantically about the SAME fun's own return
-        // value, so applying either is still a real, if possibly
-        // surprising, constraint -- not a soundness gap).
+        // follows. A name collision across two DIFFERENT followed
+        // protocols (same guard name, e.g. both declare `guard Approve`)
+        // is K1010 -- the "multi-protocol composition" question `docs/
+        // design/AGENTS.md` §3 once left deliberately open, resolved for
+        // its one genuinely dangerous shape by picking the doc's own
+        // third candidate answer ("a conflict is a compile-time error"):
+        // silently letting whichever protocol happens to be encountered
+        // last win would let a protocol author's LATER, unrelated
+        // addition of a same-named guard silently change what an
+        // EXISTING `guards Approve` clause enforces, with no diagnostic
+        // anywhere. Fires at agent-declaration time regardless of
+        // whether any exposed fun actually uses the colliding name (the
+        // same fail-fast precedent K1000 already sets for a duplicate
+        // `protocol` declaration). The SAME protocol appearing twice in
+        // one `follows` list is not a collision.
         let mut available: HashMap<String, GuardDecl> = HashMap::new();
+        let mut guard_origin: HashMap<String, String> = HashMap::new();
         for pname in &c.follows {
             if let Some(gs) = protocol_guards.get(pname.as_str()) {
                 for (gname, g) in gs {
-                    available.insert(gname.clone(), g.clone());
+                    match guard_origin.get(gname.as_str()) {
+                        Some(first) if first != pname => {
+                            diags.push(Diag::error(
+                                "K1010",
+                                format!(
+                                    "agent `{}` follows both `{first}` and `{pname}`, which both declare a guard named `{gname}` -- rename one of them so `guards {gname}` is unambiguous",
+                                    c.name
+                                ),
+                                g.span,
+                            ));
+                        }
+                        Some(_) => {}
+                        None => {
+                            guard_origin.insert(gname.clone(), pname.clone());
+                            available.insert(gname.clone(), g.clone());
+                        }
+                    }
                 }
             }
         }
@@ -562,5 +586,53 @@ mod tests {
                 Err(_) => "Err(<non-Panic Flow>)".to_string(),
             }),
         }
+    }
+
+    /// K1010: an agent following two DIFFERENT protocols that both declare
+    /// a guard named `Approve` must be rejected -- the multi-protocol
+    /// composition question `docs/design/AGENTS.md` §3 once left open,
+    /// resolved for this one genuinely dangerous shape (see this module's
+    /// own comment at the collision-detection site).
+    #[test]
+    fn two_followed_protocols_declaring_the_same_guard_name_is_k1010() {
+        let src = "protocol A {\n    intent \"a\"\n    guard Approve: Int {\n        expect result > 0\n    }\n}\nprotocol B {\n    intent \"b\"\n    guard Approve: Int {\n        expect result < 100\n    }\n}\nagent Ag follows A, B {\n    intent \"an agent following two colliding protocols\"\n    expose fun go(x: Int) -> Int {\n        x\n    }\n}\n";
+        let err = match crate::run::compile(src) {
+            Ok(_) => panic!("expected compile to fail with K1010"),
+            Err(diags) => diags,
+        };
+        assert!(err.iter().any(|d| d.code == "K1010"), "expected K1010: {err:?}");
+    }
+
+    /// The same collision check fires even when NO exposed fun actually
+    /// writes `guards Approve` -- it's about the `follows` set itself
+    /// being ambiguous, not about a specific usage site (mirrors K1000's
+    /// own fail-fast-on-declaration precedent for a duplicate `protocol`).
+    #[test]
+    fn the_collision_fires_even_when_no_fun_uses_the_colliding_guard_name() {
+        let src = "protocol A {\n    intent \"a\"\n    guard Approve: Int {\n        expect result > 0\n    }\n}\nprotocol B {\n    intent \"b\"\n    guard Approve: Int {\n        expect result < 100\n    }\n}\nagent Ag follows A, B {\n    intent \"an agent following two colliding protocols, unused\"\n    expose fun go() -> Int {\n        1\n    }\n}\n";
+        let err = match crate::run::compile(src) {
+            Ok(_) => panic!("expected compile to fail with K1010"),
+            Err(diags) => diags,
+        };
+        assert!(err.iter().any(|d| d.code == "K1010"), "expected K1010: {err:?}");
+    }
+
+    /// Two protocols that declare guards under DIFFERENT names produce no
+    /// collision -- the ordinary, expected case (`forbids`-only composition
+    /// already worked this way; this confirms `guard`-bearing protocols
+    /// compose just as cleanly when names don't collide).
+    #[test]
+    fn two_followed_protocols_with_distinctly_named_guards_is_clean() {
+        let src = "protocol A {\n    intent \"a\"\n    guard Positive: Int {\n        expect result > 0\n    }\n}\nprotocol B {\n    intent \"b\"\n    guard UnderLimit: Int {\n        expect result < 100\n    }\n}\nagent Ag follows A, B {\n    intent \"an agent following two non-colliding protocols\"\n    expose fun go(x: Int) -> Int guards Positive, UnderLimit {\n        x\n    }\n}\n";
+        assert!(crate::run::compile(src).is_ok(), "distinctly-named guards across two followed protocols must not collide");
+    }
+
+    /// A single protocol declaring one guard, followed once, is obviously
+    /// not a "collision with itself" -- guards against a degenerate
+    /// self-match in the detection loop.
+    #[test]
+    fn following_one_protocol_once_is_never_a_self_collision() {
+        let src = "protocol A {\n    intent \"a\"\n    guard Approve: Int {\n        expect result > 0\n    }\n}\nagent Ag follows A {\n    intent \"a single followed protocol\"\n    expose fun go(x: Int) -> Int guards Approve {\n        x\n    }\n}\n";
+        assert!(crate::run::compile(src).is_ok(), "a single followed protocol must never self-collide");
     }
 }

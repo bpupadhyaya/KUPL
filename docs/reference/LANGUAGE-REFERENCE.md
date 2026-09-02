@@ -802,6 +802,9 @@ distinct from it:
 - `follows Protocol1, Protocol2` — after the agent's name, same position
   as `fulfills` on a `component`. Agent-only (K1003); naming a
   nonexistent protocol is K1001; redeclaring a protocol name is K1000.
+  Two DIFFERENT followed protocols declaring a `guard` with the same
+  name is K1010 (a compile-time error — rename one of them), regardless
+  of whether any exposed fun actually uses the colliding name.
 - `guards Name1, Name2` on an `expose fun` (right before the body, same
   slot as `ai fun`'s own `tools […]` clause) opts that fun's return
   value into runtime checking against the named guard(s), which must

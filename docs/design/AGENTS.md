@@ -14,15 +14,18 @@ plain `expect` checks with zero new interp/vm/cgen work) — see §3's own
 "identity & memory" question — `durable` (K1006, persisted via
 `agent_persist.rs`, `kupl agent inspect`/`clear` CLI). §5's
 "judgment vs. determinism" question — `deterministic` (K1008/K1009).
-Full normative spec for everything above: `../reference/LANGUAGE-
-REFERENCE.md` §7.3. §5's "infinite agents" bounding is DONE in the
-narrower sense of an actual resource cap (`MAX_ACTOR_INSTANCES`,
-`MAX_NODE_CONNECTIONS`) — the ONLY remaining fully-open item in this
-whole initiative's original question set is the deliberately-deferred
-multi-protocol composition/conflict question — see §7's own updated
-Sequencing note. This file exists to capture the concept precisely
-enough that a fresh session, on any machine, can pick up detailed design
-and implementation without needing the conversation that produced it.
+Multi-protocol composition's one concretely dangerous shape — a
+same-named `guard` on two different followed protocols — is now K1010
+(compile-time error). Full normative spec for everything above:
+`../reference/LANGUAGE-REFERENCE.md` §7.3. §5's "infinite agents"
+bounding is DONE in the narrower sense of an actual resource cap
+(`MAX_ACTOR_INSTANCES`, `MAX_NODE_CONNECTIONS`) — the ONLY remaining
+fully-open item in this whole initiative's original question set is
+protocol inheritance across agent-spawns-agent trees — see §7's own
+updated Sequencing note. This file exists to capture the concept
+precisely enough that a fresh session, on any machine, can pick up
+detailed design and implementation without needing the conversation
+that produced it.
 
 **Why this doc exists:** the user's own framing (verbatim, lightly trimmed):
 
@@ -333,17 +336,31 @@ agent Rep follows NoNetwork {
   narrowing it is `[INTERFACE — breaking]`, matching the precedent
   `contract`'s own effect-budget fingerprint already established).
 
-**Open, deliberately unresolved in this doc (applies to the deferred
-behavioral/rule-text slice, not the shipped structural one above):** how
-MULTIPLE protocols compose when an agent `follows` more than one
-(strictest-wins? explicit priority? a conflict is a compile-time error? —
-note the SHIPPED `forbids`-only slice sidesteps this entirely: multiple
-`forbids` lists just union, no real composition question arises yet);
-whether a rule can be partially statically checked and partially
-runtime-checked; whether protocols are inherited (an agent spawned BY
-another agent automatically follows its parent's protocols, mirroring how a
-child process inherits capabilities in most sandboxing models) or must be
-declared explicitly every time.
+**UPDATE, 2026-09-02 — the concrete part of this is now RESOLVED (K1010).**
+How multiple protocols compose when an agent `follows` more than one had
+three candidate answers (strictest-wins? explicit priority? a conflict is
+a compile-time error?). `forbids` never actually needed one (multiple
+`forbids` lists just union — no two forbidden-effect lists can
+meaningfully "conflict," they only ever narrow further). `guard`
+composition DID have one real, dangerous shape: two DIFFERENT followed
+protocols declaring a guard with the SAME NAME (e.g. both `protocol A`
+and `protocol B` declare `guard Approve: Int { .. }` with different
+bodies) used to resolve silently to whichever protocol was encountered
+last in `follows` — a genuine footgun (a later, unrelated protocol
+addition could silently change what an existing `guards Approve` clause
+enforces, with zero diagnostic). Picked the third candidate answer:
+**a same-name collision across two different followed protocols is now
+a compile-time error, K1010** (`guards.rs::desugar_guards`), independent
+of whether any exposed fun actually references the colliding name —
+rename one of the guards to disambiguate. Still open, genuinely: whether
+a rule can be partially statically checked and partially runtime-checked
+(moot today — `forbids` is 100% static, `guard` 100% runtime, nothing
+straddles both yet); whether protocols are inherited (an agent spawned BY
+another agent automatically follows its parent's protocols, mirroring how
+a child process inherits capabilities in most sandboxing models) or must
+be declared explicitly every time — this remains unstarted, and is a
+materially different question (agent-spawns-agent trees) from the
+guard-naming question just closed above.
 
 ## 4. Weight class: let the agent pick its own concurrency implementation
 
@@ -608,18 +625,19 @@ specific answer yet, only to naming the axes:
   vision (crash-consistency, cross-process concurrent writers, schema
   migration, per-instance identity all remain open, explicitly named
   rather than silently deferred).
-- **NOT STARTED:** multi-protocol composition/conflict resolution remains
-  open but lower-urgency now that both shipped slices (`forbids`-only
-  union, `guards`-only explicit-opt-in) sidestep it (see §3's own "Open"
-  note). This is now the LAST remaining fully-open item in this whole
-  initiative's own originally-scoped question set — §5's "judgment vs.
-  determinism" (DONE, 2026-09-02, `deterministic`/K1008/K1009) and
-  "infinite agents" bounding (the bounding half DONE,
-  `MAX_ACTOR_INSTANCES`) are both resolved in the narrower sense their
-  own entries describe.
 - **DONE, 2026-09-02:** §5's "judgment vs. determinism" axis, the
   coarser agent-level declaration — `agent Foo { deterministic }`,
   K1008/K1009. See §5's own updated entry above for the full mechanism.
-- **Recommended next slice:** multi-protocol composition/conflict
-  resolution (§3) is now the only remaining named-but-unstarted item
-  from this initiative's own original question set.
+- **DONE, 2026-09-02:** multi-protocol composition/conflict resolution
+  (§3), for its one concretely dangerous shape — a same-named `guard`
+  declared by two DIFFERENT followed protocols is now K1010 (a
+  compile-time error), instead of silently resolving to whichever
+  protocol is encountered last in `follows`. `forbids` never needed a
+  resolution (union only narrows, never conflicts). See §3's own updated
+  entry above.
+- **Recommended next slice:** the ONLY remaining named-but-unstarted item
+  from this initiative's own original question set is protocol
+  inheritance across agent-spawns-agent trees (§3's own updated entry,
+  last paragraph) — a materially different, bigger question than the
+  guard-naming collision just closed, since it needs actual spawn-tree
+  bookkeeping that doesn't exist yet, not just a static name check.
