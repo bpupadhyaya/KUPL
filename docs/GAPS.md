@@ -1477,9 +1477,12 @@ claim (the runtime is single-threaded today; Go/Rust/Kotlin/Swift all win).
       content hash (`self_hash`, `OnceLock`-cached per process) rather
       than trusting `CARGO_PKG_VERSION` alone — a REAL correctness
       consideration caught during design, not found live: this project's
-      crate version stays `1.0.0-alpha` across every `Production-hardening
-      itN` commit, including ones that change `compile_module`/`emit_c`/
-      `cgen.rs`'s own embedded C runtime template, so a version-only key
+      crate version doesn't bump on every internal commit (it stayed
+      fixed at `1.0.0-alpha` across every `Production-hardening itN`
+      commit before the `0.1.0` release, including ones that change
+      `compile_module`/`emit_c`/`cgen.rs`'s own embedded C runtime
+      template, and the same will be true of commits between future
+      numbered releases), so a version-only key
       would let a stale cache entry silently survive an in-place `cargo
       build` and serve OLD compiled output under NEW compiler logic with
       zero diagnostic. Tying the key to the binary's actual bytes means

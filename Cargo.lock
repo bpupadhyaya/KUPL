@@ -4,4 +4,4 @@ version = 4
 
 [[package]]
 name = "kupl"
-version = "1.0.0-alpha"
+version = "0.1.0"

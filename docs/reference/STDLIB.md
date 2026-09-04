@@ -1,6 +1,6 @@
 # KUPL Standard Library Reference
 
-**Version:** 1.0-alpha. Everything here is built into the language runtime and
+**Version:** 0.1.0. Everything here is built into the language runtime and
 available without imports, identically on all engines (interpreter, KVM,
 native). Errors below marked *panics* terminate the component (or program)
 unless supervised.

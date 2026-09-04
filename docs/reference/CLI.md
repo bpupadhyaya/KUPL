@@ -1,6 +1,6 @@
 # KUPL CLI Reference
 
-**Version:** 1.0-alpha · one binary: `kupl`
+**Version:** 0.1.0 · one binary: `kupl`
 
 All file-taking commands are **multi-file aware**: they load the entry file
 plus everything reachable through `use`, and diagnostics point into the file
@@ -226,7 +226,7 @@ Creates `<name>/` with `main.kupl` (a wired two-component app), `util.kupl`
 (demonstrating `use` + a `pub fun`), and `kupl.toml`. The project runs
 immediately: `kupl run <name>/main.kupl`.
 
-`kupl.toml` (v1.0-alpha fields):
+`kupl.toml` (v0.1.0 fields):
 
 ```toml
 [project]

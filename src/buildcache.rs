@@ -77,8 +77,9 @@ fn feed(buf: &mut String, s: &str) {
 /// this invocation. Deliberately re-derived from `current_exe()` rather
 /// than trusting `CARGO_PKG_VERSION` alone: this project's own commit
 /// history is full of `compile_module`/`emit_c`/`cgen.rs` changes that
-/// land on the SAME crate version (`1.0.0-alpha` throughout) — a cache key
-/// that only changed on a version bump would let a stale entry from BEFORE
+/// land on the SAME crate version (fixed at `1.0.0-alpha` for the whole
+/// pre-`0.1.0` history, and the same will be true between future numbered
+/// releases) — a cache key that only changed on a version bump would let a stale entry from BEFORE
 /// such a change silently survive an in-place `cargo build`, serving OLD
 /// compiled output under NEW compiler logic with no diagnostic at all.
 /// Tying the key to the binary's actual content means any rebuild that

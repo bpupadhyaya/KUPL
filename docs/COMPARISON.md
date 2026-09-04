@@ -1,6 +1,6 @@
 # KUPL vs. the field — an honest audit
 
-**Version:** 1.0-alpha · first audited 2026-07-04 · **refreshed after enrichment
+**Version:** 0.1.0 · first audited 2026-07-04 · **refreshed after enrichment
 iteration 95, then again after iteration 129** (structured `par { }` fork-join
 gets real OS threads; capabilities as attenuable runtime values (`CapNet`/
 `CapFs`); hot-swap state migration fully resolved including a user-provided
@@ -221,7 +221,7 @@ domain universality, reflected in the prose.
 
 Two things are true at once and must not be conflated:
 
-- **KUPL v1.0-alpha is a real, complete, four-engine toolchain** — REPL,
+- **KUPL v0.1.0 is a real, complete, four-engine toolchain** — REPL,
   tree-walking interpreter, register VM, and a native machine-code path — with
   zero external dependencies, held byte-identical across engines by
   differential tests, plus a genuinely novel AI-native core no other language
@@ -240,7 +240,7 @@ Throughout, **✅ = shipped and tested today**, **◐ = partial / bounded**,
 
 ## The scorecard
 
-Ratings are 0–5 for the language *as it exists today* (KUPL = v1.0-alpha, not
+Ratings are 0–5 for the language *as it exists today* (KUPL = v0.1.0, not
 its design docs). They are impressionistic, not benchmarks.
 
 | Criterion | KUPL | Python | Go | TypeScript | Java | Rust | Haskell | C++ | Swift | Kotlin |
@@ -428,7 +428,7 @@ changes), **structured diagnostics** (132 stable K-codes with spans and a JSON
 mode built for editors and AI agents), a zero-dependency LSP server, component
 manifests for visual tools, `kupl context` for LLM prompt-packing, and
 property-based testing built in. This is Rust-cargo-quality ambition delivered
-in a v1.0-alpha. It trails Rust only because rust-analyzer/clippy/the crates
+in a v0.1.0. It trails Rust only because rust-analyzer/clippy/the crates
 graph are mature; the LSP now serves **hover, go-to-definition, completion, find-references, and
 rename** (it44/it49) in addition to diagnostics — the everyday IDE feature set is
 shipped (references/rename are token-based, not yet scope-aware). What still
@@ -520,7 +520,7 @@ Kotlin's coroutines (KUPL lacks) and KUPL's AI-native core (Kotlin lacks).
 
 ## The honest bottom line
 
-**What KUPL is, today (v1.0-alpha):** the only language with AI as a
+**What KUPL is, today (v0.1.0):** the only language with AI as a
 first-class feature; a safe, readable, effect-checked, component/actor language
 with best-in-class-for-its-age tooling and a genuinely complete four-engine
 toolchain — held byte-identical by differential tests, with zero dependencies.

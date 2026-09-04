@@ -2,7 +2,7 @@
 
 ## Supported Versions
 
-KUPL is pre-1.0 (`1.0.0-alpha`). Only the latest commit on `main` and the most
+KUPL is pre-1.0 (currently `0.1.0`). Only the latest commit on `master` and the most
 recent tagged release are supported with security fixes — there are no
 long-term-support branches yet. See [`docs/VERSIONING.md`](docs/VERSIONING.md)
 for the versioning policy and the path to `1.0.0` stable.

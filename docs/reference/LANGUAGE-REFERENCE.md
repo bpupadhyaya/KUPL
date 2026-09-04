@@ -1,6 +1,6 @@
 # KUPL Language Reference Manual
 
-**Version:** 1.0-alpha · **Status:** normative for the implemented language
+**Version:** 0.1.0 · **Status:** normative for the implemented language
 
 This manual describes the KUPL language *as implemented* by the reference
 toolchain in this repository. Features that exist only in the design proposal
@@ -256,7 +256,7 @@ par { f(a)  g(b)  h(c) }            // structured fork-join → List of results
   `Result[_, E]`; on `Err(e)` the function returns early with that error. Not
   allowed in handlers (K0237) — handle the Result with `match` there.
 - `await expr` is accepted and currently evaluates `expr` directly (expose
-  calls are synchronous in v1.0-alpha; true asynchrony is **[design]**).
+  calls are synchronous in v0.1.0; true asynchrony is **[design]**).
 - **`if let` / `while let`** desugar to `match`, so the full pattern grammar
   applies. `if let P = E { T } else { F }` runs `T` (with `P`'s bindings) when
   `E` matches `P`, else `F`; the `else` is optional (a non-match yields `Unit`,
@@ -420,7 +420,7 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   warns (K0302).
 - Effect names are hierarchical: declaring `db` covers `db.read`; declaring
   `db.read` does not cover `db.write`. Built-in effectful operations in
-  v1.0-alpha: `print` / `eprint` (`io`); the file builtins `read_file` /
+  v0.1.0: `print` / `eprint` (`io`); the file builtins `read_file` /
   `write_file` / `append_file` / `delete_file` / `file_exists` (`io.fs`); and
   `args` / `env_var` (`io.env`); `http_get` / `http_post` (`io.net`); and `now` (`io.time`). The
   sub-effects mean `uses io` covers all of them, while `uses io.fs` /
@@ -438,7 +438,7 @@ pub fun broadcast(msg: Str) uses io {   // public: effects MUST be declared
   kinds beyond these two remain **[design]**, pending a concrete need.
 - Recursion (incl. mutual) is fully supported. Functions are first-class:
   pass them by name or as lambdas; calls through variables are supported
-  (their effects are not tracked in v1.0-alpha — documented limitation).
+  (their effects are not tracked in v0.1.0 — documented limitation).
 
 ### 6.1 AI-native functions (`ai fun`)
 
@@ -533,7 +533,7 @@ Rules:
 - A panic inside a tool surfaces to the ai fun as a failure: captured as
   `Err` if the ai fun returns `Result[T, Str]`, otherwise it panics.
 - Tool effects are **not** statically propagated to the ai fun in
-  v1.0-alpha (a documented limitation, like calls through variables).
+  v0.1.0 (a documented limitation, like calls through variables).
 
 The mock provider scripts the loop deterministically: `KUPL_AI_MOCK_<FUN>` is
 a JSON **array of rounds**, each either `{"tool": name, "input": {…}}` or
@@ -576,7 +576,7 @@ across calls on the instance. See `examples/agent_component.kupl`.
 
 Note the effects limitation: effects do **not** propagate across an expose
 call (`bot.ask(...)` is a method call on an instance), so a caller of `ask`
-is not statically required to declare `ai` — the same v1.0-alpha limitation
+is not statically required to declare `ai` — the same v0.1.0 limitation
 that applies to calls through variables. The `ai` effect is still required and
 checked on `ask` itself.
 

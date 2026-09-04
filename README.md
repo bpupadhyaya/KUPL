@@ -74,10 +74,28 @@ cargo build --release
 export PATH="$PWD/target/release:$PATH"
 ```
 
+### Option C: download a pre-built release
+
+No Rust toolchain needed. Grab the archive for your platform from the
+[Releases page](https://github.com/bpupadhyaya/KUPL/releases), then:
+
+```sh
+tar xzf kupl-0.1.0-<platform>.tar.gz
+sudo mv kupl /usr/local/bin/          # or anywhere already on your PATH
+kupl version                          # -> kupl 0.1.0
+```
+
+Currently published: `aarch64-apple-darwin` (macOS on Apple Silicon), built
+and tested directly against this release's own commit. Other platforms
+(Linux, Intel macOS, Windows) aren't published yet — build from source with
+Option A/B above; the toolchain is a single dependency-free Rust crate, so
+this works identically everywhere Rust and a C compiler (for `kupl native`
+only) are available.
+
 ### Verify
 
 ```sh
-kupl version                 # -> kupl 1.0.0-alpha
+kupl version                 # -> kupl 0.1.0
 kupl run examples/counter.kupl
 cargo test                   # ~1,980 tests, includes interpreter-vs-VM differential suite
 ```
@@ -337,14 +355,18 @@ language, every example verified against the toolchain).
 
 ## Status & roadmap
 
-**v1.0-alpha**: the founding vision is implemented end to end — ~130,000 lines
-of dependency-free Rust, ~1,980 tests, all engines differentially verified.
-The package registry (`kupl pkg tree/lock/fetch`), LSP hover/completion, the
-full `agent`/`protocol`/`guard` system (all three `weight` classes,
-`durable` state persistence, `deterministic`), and production infrastructure
-(CI, `SECURITY.md`, resource limits, crypto/logging stdlib) are already
-implemented — see `docs/PRODUCTION.md` for the honest list of what's still
-alpha-stage. Next arc (per `docs/design/TOOLCHAIN.md`): KIR
+**v0.1.0** (pre-1.0, following semver's own `0.x` = "anything may still
+change" convention — see `docs/VERSIONING.md`): the founding vision is
+implemented end to end — ~130,000 lines of dependency-free Rust, ~1,980
+tests, all engines differentially verified. The package registry (`kupl
+pkg tree/lock/fetch`), LSP hover/completion, the full `agent`/`protocol`/
+`guard` system (all three `weight` classes, `durable` state persistence,
+`deterministic`), and production infrastructure (CI, `SECURITY.md`,
+resource limits, crypto/logging stdlib) are already implemented — see
+`docs/PRODUCTION.md` for the honest list of what's still incomplete, and
+`docs/VERSIONING.md`'s "Path to 1.0.0 Stable" for exactly what's left
+before a real compatibility guarantee begins. Next arc (per
+`docs/design/TOOLCHAIN.md`): KIR
 (typed SSA) with GPU lowering (Metal first), a genuine per-component
 generational GC in the native backend (native already supports components,
 supervision, and timers — this arc is specifically about the GC), and

@@ -7,6 +7,12 @@ change and the release process.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-04
+
+First tagged, tracked release — see `docs/VERSIONING.md` for what this
+version number does and doesn't promise (pre-1.0, no compatibility
+guarantee yet).
+
 ### Added
 
 - CI workflow (`.github/workflows/ci.yml`): build + full test suite on
@@ -138,7 +144,8 @@ change and the release process.
 
 ## [1.0.0-alpha]
 
-The current baseline. A summary of what shipped before this changelog existed:
+The pre-`0.1.0` baseline this project's crate version stayed fixed at for
+its entire history before this release. A summary of what shipped before this changelog existed:
 
 - **Four byte-identical execution engines**: a tree-walking interpreter (the
   reference semantics), a register-based bytecode VM, a compiled `.kx`

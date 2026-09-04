@@ -1,6 +1,6 @@
 # KUPL Diagnostics Index
 
-**Version:** 1.0-alpha. Every diagnostic has a stable code, a precise source
+**Version:** 0.1.0. Every diagnostic has a stable code, a precise source
 span, and (via `kupl check --json`) a machine-readable form. Codes are grouped
 by compiler phase; codes are never reused with a different meaning.
 

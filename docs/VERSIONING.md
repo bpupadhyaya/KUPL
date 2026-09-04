@@ -49,7 +49,8 @@ This policy covers everything a KUPL user or tool depends on:
 
 ## Pre-1.0 Caveat
 
-While KUPL is `0.x`/`1.0.0-alpha`, breaking changes may still ship in a
+While KUPL is `0.x` (currently `0.1.0` — see "Path to `1.0.0` Stable"
+below for exactly what's left), breaking changes may still ship in a
 version bump smaller than a hypothetical future `MAJOR`. This policy's
 breaking/non-breaking distinction still applies for changelog purposes (see
 `CHANGELOG.md`'s Added/Changed/Fixed/Removed categories), but it does not yet
@@ -93,5 +94,12 @@ so this checklist doesn't contradict it. `1.0.0` stable is warranted once:
 - [ ] The project has run in a real, non-toy production workload for a
       meaningful period without a correctness regression.
 
-Until then, expect `1.0.0-alpha`/`-beta`-style pre-release identifiers and
-this document's pre-1.0 caveat to apply.
+Until then, expect ordinary `0.x.y` semver numbers (not `1.0.0`-prerelease
+identifiers — `0.y.z` is semver's own designated range for "anything MAY
+change at any time, the public API SHOULD NOT be considered stable,"
+which is a more accurate signal here than a `1.0.0-alpha`/`-beta` tag
+implying an imminent, scoped path to `1.0.0`) and this document's pre-1.0
+caveat to apply. `0.1.0` (this project's first tagged, tracked release —
+see `CHANGELOG.md`) is exactly such a release: extensively self-tested
+internally, zero hours of real-world usage by anyone else yet, no
+compatibility promise attached.
