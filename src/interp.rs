@@ -1646,8 +1646,13 @@ enum ActorRoute {
         /// `None` once the connection has failed or `stop_all` has closed
         /// it -- mirrors `Dedicated`'s own `inbox: Option<...>` "already
         /// shut down" sentinel exactly, including the same "message
-        /// dropped, not panicked" handling at every send site.
-        stream: Option<std::net::TcpStream>,
+        /// dropped, not panicked" handling at every send site. Bundled
+        /// with its `SessionKeys` (the derived, per-direction ChaCha20-
+        /// Poly1305 keys + monotonic nonce counters, `distribution.rs`)
+        /// since the socket and its encryption state must live and die
+        /// together -- there's no meaningful state where one is present
+        /// without the other.
+        conn: Option<(std::net::TcpStream, crate::distribution::SessionKeys)>,
     },
 }
 
@@ -2540,7 +2545,11 @@ impl Interp {
             let (token, addr) = crate::distribution::parse_node_env(&raw).map_err(|e| Self::panic_flow(e, span))?;
             let mut stream = crate::distribution::connect_and_authenticate(&addr, &token)
                 .map_err(|e| Self::panic_flow(e, span))?;
-            crate::distribution::spawn_remote(&mut stream, &comp_name, portable_args)
+            // Auth succeeded -- both sides now hold the confirmed-correct
+            // token, so every message from here (Spawn onward) is
+            // encrypted (`distribution.rs`'s own module doc comment).
+            let mut keys = crate::distribution::SessionKeys::derive(&token, true);
+            crate::distribution::spawn_remote(&mut stream, &mut keys, &comp_name, portable_args)
                 .map_err(|e| Self::panic_flow(e, span))?;
             // Handshake complete -- `connect_and_authenticate`'s own
             // `CONNECT_TIMEOUT` read timeout must NOT keep bounding reads
@@ -2556,7 +2565,7 @@ impl Interp {
             let _ = ready_tx.send(None);
             let id = self.instances.len();
             self.instances.push(InstanceSlot::Remote(ActorHandle {
-                route: ActorRoute::Distributed { stream: Some(stream) },
+                route: ActorRoute::Distributed { conn: Some((stream, keys)) },
                 ready: Some(ready_rx),
                 shutdown_panic,
             }));
@@ -2884,16 +2893,21 @@ impl Interp {
         if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::AuthOk.to_wire()).is_err() {
             return;
         }
+        // Auth succeeded -- both sides now hold the confirmed-correct
+        // token, so every message from here on (Spawn onward) is
+        // encrypted (`distribution.rs`'s own module doc comment). Server
+        // is NOT the client, so its own outgoing key is `s2c`.
+        let mut keys = crate::distribution::SessionKeys::derive(token, false);
 
-        let Ok(second) = crate::kser::read_value_frame(&mut stream) else { return };
-        let Ok(crate::distribution::DistMsg::Spawn { comp_name, args }) = crate::distribution::DistMsg::from_wire(second)
-        else {
+        let Ok(second) = crate::distribution::read_encrypted_msg(&mut stream, &mut keys) else { return };
+        let crate::distribution::DistMsg::Spawn { comp_name, args } = second else {
             return;
         };
         let Some(comp) = db.components.get(&comp_name).cloned() else {
-            let _ = crate::kser::write_value_frame(
+            let _ = crate::distribution::write_encrypted_msg(
                 &mut stream,
-                &crate::distribution::DistMsg::SpawnErr { msg: format!("unknown component `{comp_name}`") }.to_wire(),
+                &mut keys,
+                &crate::distribution::DistMsg::SpawnErr { msg: format!("unknown component `{comp_name}`") },
             );
             return;
         };
@@ -2908,21 +2922,23 @@ impl Interp {
         })();
         match startup {
             Ok(()) => {
-                if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::SpawnOk { remote_id: 0 }.to_wire()).is_err() {
+                if crate::distribution::write_encrypted_msg(&mut stream, &mut keys, &crate::distribution::DistMsg::SpawnOk { remote_id: 0 })
+                    .is_err()
+                {
                     return;
                 }
             }
             Err(Flow::Panic { msg, .. }) => {
-                let _ = crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::SpawnErr { msg }.to_wire());
+                let _ = crate::distribution::write_encrypted_msg(&mut stream, &mut keys, &crate::distribution::DistMsg::SpawnErr { msg });
                 return;
             }
             Err(_) => {
-                let _ = crate::kser::write_value_frame(
+                let _ = crate::distribution::write_encrypted_msg(
                     &mut stream,
+                    &mut keys,
                     &crate::distribution::DistMsg::SpawnErr {
                         msg: "internal error: unexpected control flow escaped a distributed actor's own startup".to_string(),
-                    }
-                    .to_wire(),
+                    },
                 );
                 return;
             }
@@ -2932,8 +2948,7 @@ impl Interp {
         let _ = stream.set_read_timeout(None);
 
         loop {
-            let Ok(frame) = crate::kser::read_value_frame(&mut stream) else { break };
-            let Ok(msg) = crate::distribution::DistMsg::from_wire(frame) else { break };
+            let Ok(msg) = crate::distribution::read_encrypted_msg(&mut stream, &mut keys) else { break };
             match msg {
                 crate::distribution::DistMsg::Deliver { port, value, .. } => {
                     let v = crate::parallel::from_portable(&value);
@@ -2954,8 +2969,12 @@ impl Interp {
                         Err(Flow::Panic { msg, .. }) => Err(msg),
                         Err(_) => Err("internal error: unexpected control flow escaped a distributed expose call".to_string()),
                     };
-                    if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::CallReply { call_id, result: reply }.to_wire())
-                        .is_err()
+                    if crate::distribution::write_encrypted_msg(
+                        &mut stream,
+                        &mut keys,
+                        &crate::distribution::DistMsg::CallReply { call_id, result: reply },
+                    )
+                    .is_err()
                     {
                         break;
                     }
@@ -3091,7 +3110,7 @@ impl Interp {
                             *stop_sent = true;
                         }
                     }
-                    ActorRoute::Distributed { stream } => {
+                    ActorRoute::Distributed { conn } => {
                         // Dropping the `TcpStream` closes the connection
                         // (a TCP FIN), which is what the server-side
                         // `serve_distributed_connection`'s own `read_frame`
@@ -3106,7 +3125,7 @@ impl Interp {
                         // the remote actor's own `on stop` after seeing
                         // the close, this coordinator just doesn't block
                         // on that finishing first.
-                        stream.take();
+                        conn.take();
                     }
                 }
                 continue;
@@ -3447,10 +3466,10 @@ impl Interp {
                 // on this same route also cleanly treats it as shut down,
                 // instead of re-attempting a write on a socket already
                 // known to be broken.
-                ActorRoute::Distributed { stream } => {
-                    if let Some(s) = stream {
-                        if crate::distribution::deliver_remote(s, 0, port, pv).is_err() {
-                            *stream = None;
+                ActorRoute::Distributed { conn } => {
+                    if let Some((s, keys)) = conn {
+                        if crate::distribution::deliver_remote(s, keys, 0, port, pv).is_err() {
+                            *conn = None;
                         }
                     }
                 }
@@ -5605,7 +5624,7 @@ impl Interp {
         let already_shutdown = match &handle.route {
             ActorRoute::Dedicated { inbox, .. } => inbox.is_none(),
             ActorRoute::Pooled { stop_sent, .. } => *stop_sent,
-            ActorRoute::Distributed { stream } => stream.is_none(),
+            ActorRoute::Distributed { conn } => conn.is_none(),
         };
         if already_shutdown {
             return Err(Self::panic_flow(
@@ -5622,16 +5641,16 @@ impl Interp {
         // not an async message needing a reply channel at all. Kept as an
         // early return specifically so the Dedicated/Pooled logic below
         // stays byte-for-byte untouched.
-        if let ActorRoute::Distributed { stream } = &mut handle.route {
+        if let ActorRoute::Distributed { conn } = &mut handle.route {
             self.pending_remote_calls.insert(id);
-            let outcome = match stream {
-                Some(s) => {
+            let outcome = match conn {
+                Some((s, keys)) => {
                     let _ = s.set_read_timeout(timeout);
                     let _ = s.set_write_timeout(timeout);
-                    match crate::distribution::call_remote_over_wire(s, 0, name, portable_args, 0) {
+                    match crate::distribution::call_remote_over_wire(s, keys, 0, name, portable_args, 0) {
                         Ok(result) => Some(result.map_err(|msg| (msg, span))),
                         Err(_transport_err) => {
-                            *stream = None;
+                            *conn = None;
                             None
                         }
                     }

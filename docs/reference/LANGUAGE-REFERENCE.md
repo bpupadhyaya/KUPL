@@ -821,7 +821,7 @@ tiers backs this agent, mirroring Go goroutines / Java platform threads
 |---|---|
 | `lightweight` (default) | multiplexed onto a shared worker-pool thread, like a plain `concurrent component` |
 | `heavyweight` | a dedicated, always-resident OS thread |
-| `distributed` | a real, shared-secret-authenticated TCP connection to a separate `kupl node <file> --listen <addr> --token <token>` process — see `docs/reference/CLI.md` and `docs/design/DISTRIBUTION.md`. **Authenticated, not encrypted** — do not run across an untrusted network. |
+| `distributed` | a real, shared-secret-authenticated TCP connection to a separate `kupl node <file> --listen <addr> --token <token>` process — see `docs/reference/CLI.md` and `docs/design/DISTRIBUTION.md`. **Authenticated AND ChaCha20-Poly1305 encrypted** from `Spawn` onward — not full TLS/mTLS (no PKI-based identity, no perfect forward secrecy); see `docs/PRODUCTION.md`'s Known Limitations for the precise posture. |
 
 **`durable`** — agent-only (K1006). This agent's own `state` fields
 survive not just an in-process supervised restart (which every agent

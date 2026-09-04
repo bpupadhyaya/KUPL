@@ -19,26 +19,38 @@ format needed). This is deliberately a NARROWER slice than the full
 vision below: ONE statically-configured node per connection (the
 `KUPL_DISTRIBUTED_NODE` env var, `<token>@<host:port>`), no `cap.Cluster`
 capability, no dynamic membership, no deployment manifest. **Security
-posture, stated plainly:** the connection is SHARED-SECRET
-AUTHENTICATED (a token, constant-time compared, gates who may spawn
-actors or send messages at all) but NOT ENCRYPTED — every message,
-including the token itself, travels in plaintext. Do not run a
-`kupl node` across any network you don't already trust; put it behind a
-VPN/SSH tunnel/service mesh. Hand-rolling real TLS from scratch, under
-time pressure, without expert review, is exactly the class of risk this
-doc's own ORIGINAL sequencing reasoning (below) was written to avoid —
-this update does not attempt it either; see `docs/PRODUCTION.md`'s
-Known Limitations for the same caveat in the production-readiness
-context.
+posture, stated plainly:** the connection is SHARED-SECRET AUTHENTICATED
+(a token, constant-time compared, gates who may spawn actors or send
+messages at all) — the `Auth`/`AuthOk`/`AuthFailed` handshake itself
+still travels in plaintext, but **UPDATE, 2026-09-04: every message
+from `Spawn` onward is now ENCRYPTED too**, ChaCha20-Poly1305 (RFC 8439,
+`src/aead.rs`) with per-direction keys both sides derive from the
+shared token (no key exchange needed) — see `src/distribution.rs`'s own
+module doc comment for the exact construction. This is real
+confidentiality + integrity for the data that matters (component names,
+args, every `Deliver`/`Call` payload), but it is NOT full TLS/mTLS: no
+PKI/certificate-based peer identity (a leaked token still grants full
+trust), no perfect forward secrecy (a token leaked later lets recorded
+traffic be decrypted retroactively), no MITM protection on the very
+first connection. Put a `kupl node` behind a VPN/SSH tunnel/service mesh
+for defense in depth on any link crossing a genuinely untrusted network.
+Hand-rolling FULL TLS (asymmetric key exchange, certificate validation,
+a real handshake state machine) remains exactly the class of risk this
+doc's own ORIGINAL sequencing reasoning (below) was written to avoid;
+deriving a symmetric key from an ALREADY-shared secret and AEAD-
+encrypting with it, by contrast, is a materially smaller, more tractable
+problem — see `docs/PRODUCTION.md`'s Known Limitations for the full,
+precise security posture in the production-readiness context.
 
 Everything past THIS slice — `cap.Cluster`, dynamic membership,
 deployment manifests, port references, the full "what may cross a
-network port" portability rules, and real transport-layer encryption —
-remains **design now, implement later** (toolchain Phase 6+, per this
-doc's own original sequencing below, still accurate for everything
-except the one slice just described). The wire format and "what may
-cross a network port" rules must be fixed in spec v1.0, because they
-constrain the type system and cannot be retrofitted.
+network port" portability rules, and PKI-based transport identity
+(mTLS) — remains **design now, implement later** (toolchain Phase 6+,
+per this doc's own original sequencing below, still accurate for
+everything except the payload-encryption slice just described). The
+wire format and "what may cross a network port" rules must be fixed in
+spec v1.0, because they constrain the type system and cannot be
+retrofitted.
 
 **Why this doc exists:** "any software application" includes the most common shape
 of all — client + server + database across a network. KUPL's component model
@@ -152,9 +164,20 @@ Explicitly **not portable**:
   above):** `weight distributed` (`docs/design/AGENTS.md` §4) shipped
   real remote wiring WITHOUT waiting for `cap.Cluster`/deployment
   manifests/`at node(...)` — a static, single-node-per-connection,
-  shared-secret-authenticated (not encrypted) TCP transport, `kupl node`.
-  See this doc's own top-of-file status update for the full writeup and
-  the explicit security caveat. This does NOT retire the Phase 6+ items
-  above — they cover genuinely different ground (cluster membership,
-  deployment-manifest-driven placement, `at node(...)` syntax, real
-  transport encryption) this slice deliberately left alone.
+  shared-secret-authenticated TCP transport, `kupl node`. See this doc's
+  own top-of-file status update for the full writeup.
+- **UPDATE, 2026-09-04 — payload encryption also shipped**, for the same
+  narrower slice: every message from `Spawn` onward (component names,
+  args, `Deliver` payloads, `Call` args/results) is now ChaCha20-Poly1305
+  encrypted (`src/aead.rs`, RFC 8439) using per-direction keys both sides
+  derive from the shared token (`SHA-256(token || ":c2s"/":s2c")`,
+  `distribution.rs::SessionKeys`) -- no key exchange needed, since the
+  token is already the shared secret. This is genuine confidentiality +
+  integrity, but NOT the full "real transport encryption" this section's
+  Phase 6+ line means: no PKI/certificate-based identity, no perfect
+  forward secrecy, no MITM protection on the very first connection (no
+  certificate to pin against). These properties are exactly what
+  `cap.Cluster`-driven mTLS would add and this slice still doesn't --
+  Phase 6+ is NOT retired by this update, it's narrowed to precisely
+  that remaining gap. See `PRODUCTION.md`'s own "Known limitations" for
+  the full, precise security posture.

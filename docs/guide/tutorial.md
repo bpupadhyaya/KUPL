@@ -869,8 +869,9 @@ app Main {
   exposed function's own return value.
 - **`weight lightweight|heavyweight|distributed`** picks the concurrency
   tier backing the agent (default `lightweight`) — `distributed` connects
-  to a separate `kupl node` process over an authenticated (not encrypted)
-  TCP connection; see the [CLI reference](../reference/CLI.md).
+  to a separate `kupl node` process over an authenticated and encrypted
+  (ChaCha20-Poly1305) TCP connection, though not full TLS/mTLS; see the
+  [CLI reference](../reference/CLI.md).
 - **`durable`** persists this agent's `state` to disk across separate
   `kupl run` invocations, not just supervised restarts. Run
   `examples/agent_keyword.kupl` twice in a row and watch its counter keep

@@ -8,19 +8,44 @@
 //!
 //! **Security posture, stated plainly (matching this whole codebase's own
 //! "known limitation, not silently ignored" discipline, `docs/PRODUCTION.md`
-//! §"Known limitations"):** this is a SHARED-SECRET-AUTHENTICATED channel,
-//! NOT an ENCRYPTED one. A `DistAuth` token (a plain string, compared with
-//! a constant-time check) gates who may spawn actors or exchange messages,
-//! closing the "any host on the network can silently RCE this" failure
-//! mode a fully open listener would have -- but the token itself, and
-//! every message after it, travels in PLAINTEXT. Do not run a distributed
-//! `kupl node` across any network you don't already trust; put it behind a
-//! VPN/SSH tunnel/service mesh (exactly the same guidance `docs/design/
-//! DISTRIBUTION.md`'s own "Phase 6+" sequencing already gives for the
-//! eventual mTLS story) if the link crosses anything untrusted. Hand-
-//! rolling real TLS from scratch, under time pressure, without expert
-//! review, is explicitly the kind of risk that doc's own sequencing
-//! reasoning was written to avoid -- this module does not attempt it.
+//! §"Known limitations"):** this is a SHARED-SECRET-AUTHENTICATED **AND**
+//! ENCRYPTED channel -- but with a materially smaller security model than
+//! real TLS/mTLS, and that gap is stated precisely, not glossed over.
+//!
+//! - The `Auth`/`AuthOk`/`AuthFailed` handshake itself travels in
+//!   PLAINTEXT (the token is compared via `tokens_match`'s own
+//!   constant-time check) -- unchanged from the original design, so a
+//!   wrong token still gets a clean `AuthFailed` instead of an opaque
+//!   decryption failure.
+//! - Every message from `Spawn` onward -- i.e. every message that can
+//!   carry actual program data (component names, args, `Deliver`
+//!   payloads, `Call` args/results) -- is encrypted with ChaCha20-
+//!   Poly1305 (RFC 8439, `src/aead.rs`), using two per-DIRECTION keys
+//!   (`client->server`, `server->client`) both sides derive independently
+//!   via `SHA-256(token || ":c2s"/":s2c")` -- no key exchange needed,
+//!   since the token itself is already the shared secret. Each direction
+//!   also keeps its own strictly-monotonic per-connection nonce counter
+//!   (`SessionKeys`), so no (key, nonce) pair is ever reused within a
+//!   connection's lifetime -- the one property a stream cipher's whole
+//!   security rests on.
+//! - **What this is still NOT**: there is no PKI/certificate-based peer
+//!   identity (a leaked token grants full trust, exactly as before), no
+//!   perfect forward secrecy (the SAME token-derived keys protect an
+//!   entire connection's lifetime; a token that leaks LATER lets an
+//!   attacker who recorded the traffic decrypt it retroactively), and no
+//!   protection against a man-in-the-middle during the very first
+//!   connection (there's no certificate to pin against -- an attacker who
+//!   can intercept AND already knows the token could still impersonate
+//!   either side). Put a `kupl node` behind a VPN/SSH tunnel/service mesh
+//!   (exactly the same guidance `docs/design/DISTRIBUTION.md`'s own
+//!   "Phase 6+" sequencing already gives for the eventual mTLS story) for
+//!   defense in depth on any link crossing a genuinely untrusted network
+//!   -- this is a real, tested confidentiality+integrity layer, not a
+//!   substitute for one. Hand-rolling FULL TLS (asymmetric key exchange,
+//!   certificate validation, a real handshake state machine) remains
+//!   out of scope for the reasons this module's history already gives;
+//!   deriving a symmetric key from an ALREADY-shared secret and AEAD-
+//!   encrypting with it is a materially smaller, more tractable problem.
 
 use crate::parallel::PortableValue;
 
@@ -355,6 +380,78 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// Per-connection ChaCha20-Poly1305 encryption state -- see this module's
+/// own top-of-file doc comment for the full security posture. Both keys
+/// are derivable by EITHER side from the shared token alone (no key
+/// exchange), so this is constructed independently on the client and the
+/// server right after the plaintext `Auth`/`AuthOk` round-trip succeeds;
+/// from `Spawn` onward, every message on the connection is encrypted.
+///
+/// `send_counter`/`recv_counter` are the nonce source: a fresh 96-bit
+/// nonce per message, strictly increasing, NEVER reused within this
+/// struct's own lifetime -- the one property ChaCha20-Poly1305's entire
+/// security rests on. A `u64` counter cannot wrap within any connection
+/// that could plausibly exist (2^64 messages), so no overflow handling is
+/// needed.
+pub struct SessionKeys {
+    send_key: [u8; 32],
+    recv_key: [u8; 32],
+    send_counter: u64,
+    recv_counter: u64,
+}
+
+impl SessionKeys {
+    /// `is_client`: which of the two token-derived keys is this side's OWN
+    /// "outgoing" key. The client sends with the `c2s`-derived key and
+    /// reads with `s2c`; the server does the exact opposite -- both sides
+    /// compute the SAME two keys, just assign send/recv oppositely.
+    pub fn derive(token: &str, is_client: bool) -> SessionKeys {
+        let c2s = crate::encoding::sha256_raw(format!("{token}:c2s").as_bytes());
+        let s2c = crate::encoding::sha256_raw(format!("{token}:s2c").as_bytes());
+        if is_client {
+            SessionKeys { send_key: c2s, recv_key: s2c, send_counter: 0, recv_counter: 0 }
+        } else {
+            SessionKeys { send_key: s2c, recv_key: c2s, send_counter: 0, recv_counter: 0 }
+        }
+    }
+
+    fn next_nonce(counter: &mut u64) -> [u8; 12] {
+        let n = *counter;
+        *counter += 1;
+        let mut nonce = [0u8; 12];
+        nonce[4..12].copy_from_slice(&n.to_le_bytes());
+        nonce
+    }
+}
+
+/// Encrypt-then-frame one `DistMsg` on this connection's own OUTGOING
+/// key/counter. No AAD (the frame length prefix `kser::write_frame` adds
+/// is already integrity-checked implicitly -- a truncated/extended frame
+/// simply fails to decrypt or leaves trailing bytes `kser::from_bytes`
+/// rejects).
+pub fn write_encrypted_msg<W: std::io::Write>(w: &mut W, keys: &mut SessionKeys, msg: &DistMsg) -> std::io::Result<()> {
+    let plaintext = crate::kser::to_bytes(&msg.to_wire());
+    let nonce = SessionKeys::next_nonce(&mut keys.send_counter);
+    let ciphertext = crate::aead::encrypt(&keys.send_key, &nonce, &[], &plaintext);
+    crate::kser::write_frame(w, &ciphertext)
+}
+
+/// The inverse of [`write_encrypted_msg`], on this connection's own
+/// INCOMING key/counter. A tampered/corrupted frame, or the two sides'
+/// nonce counters having drifted out of lockstep (which can only happen
+/// from a genuine protocol bug, never from ordinary network reordering --
+/// TCP is already ordered), fails the AEAD tag check and is reported as
+/// `ErrorKind::InvalidData`, exactly like an unparseable plaintext frame
+/// already was before encryption existed.
+pub fn read_encrypted_msg<R: std::io::Read>(r: &mut R, keys: &mut SessionKeys) -> std::io::Result<DistMsg> {
+    let ciphertext = crate::kser::read_frame(r)?;
+    let nonce = SessionKeys::next_nonce(&mut keys.recv_counter);
+    let plaintext = crate::aead::decrypt(&keys.recv_key, &nonce, &[], &ciphertext)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let v = crate::kser::from_bytes(&plaintext).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    DistMsg::from_wire(v).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+}
+
 /// How long the CLIENT side waits for the initial TCP connect PLUS the
 /// whole Auth+Spawn handshake before giving up -- the client-side mirror
 /// of `AUTH_HANDSHAKE_TIMEOUT` above. Without this, `TcpStream::connect`
@@ -407,13 +504,14 @@ pub fn connect_and_authenticate(addr: &str, token: &str) -> Result<std::net::Tcp
 /// flight.
 pub fn spawn_remote(
     stream: &mut std::net::TcpStream,
+    keys: &mut SessionKeys,
     comp_name: &str,
     args: Vec<(Option<String>, PortableValue)>,
 ) -> Result<u64, String> {
-    crate::kser::write_value_frame(stream, &DistMsg::Spawn { comp_name: comp_name.to_string(), args }.to_wire())
+    write_encrypted_msg(stream, keys, &DistMsg::Spawn { comp_name: comp_name.to_string(), args })
         .map_err(|e| format!("distributed spawn: sending Spawn failed: {e}"))?;
-    let reply = crate::kser::read_value_frame(stream).map_err(|e| format!("distributed spawn: reading Spawn reply failed: {e}"))?;
-    match DistMsg::from_wire(reply)? {
+    let reply = read_encrypted_msg(stream, keys).map_err(|e| format!("distributed spawn: reading Spawn reply failed: {e}"))?;
+    match reply {
         DistMsg::SpawnOk { remote_id } => Ok(remote_id),
         DistMsg::SpawnErr { msg } => Err(format!("distributed spawn of `{comp_name}` failed on the remote node: {msg}")),
         other => Err(format!("distributed spawn: expected SpawnOk/SpawnErr, got {other:?}")),
@@ -427,8 +525,14 @@ pub fn spawn_remote(
 /// no custom bounded-retry wrapper is added here, unlike `Dedicated`'s own
 /// `try_send_with_backoff`, since that mailbox-depth problem doesn't exist
 /// the same way over a byte STREAM with genuine flow control.
-pub fn deliver_remote(stream: &mut std::net::TcpStream, remote_id: u64, port: &str, value: PortableValue) -> std::io::Result<()> {
-    crate::kser::write_value_frame(stream, &DistMsg::Deliver { remote_id, port: port.to_string(), value }.to_wire())
+pub fn deliver_remote(
+    stream: &mut std::net::TcpStream,
+    keys: &mut SessionKeys,
+    remote_id: u64,
+    port: &str,
+    value: PortableValue,
+) -> std::io::Result<()> {
+    write_encrypted_msg(stream, keys, &DistMsg::Deliver { remote_id, port: port.to_string(), value })
 }
 
 /// Blocking `Call` -- send, then read exactly one reply frame (see
@@ -438,15 +542,16 @@ pub fn deliver_remote(stream: &mut std::net::TcpStream, remote_id: u64, port: &s
 /// depth, even though only one value is possible here.
 pub fn call_remote_over_wire(
     stream: &mut std::net::TcpStream,
+    keys: &mut SessionKeys,
     remote_id: u64,
     fn_name: &str,
     args: Vec<PortableValue>,
     call_id: u64,
 ) -> Result<Result<PortableValue, String>, String> {
-    crate::kser::write_value_frame(stream, &DistMsg::Call { remote_id, fn_name: fn_name.to_string(), args, call_id }.to_wire())
+    write_encrypted_msg(stream, keys, &DistMsg::Call { remote_id, fn_name: fn_name.to_string(), args, call_id })
         .map_err(|e| format!("distributed call: sending Call failed: {e}"))?;
-    let reply = crate::kser::read_value_frame(stream).map_err(|e| format!("distributed call: reading CallReply failed: {e}"))?;
-    match DistMsg::from_wire(reply)? {
+    let reply = read_encrypted_msg(stream, keys).map_err(|e| format!("distributed call: reading CallReply failed: {e}"))?;
+    match reply {
         DistMsg::CallReply { call_id: got_id, result } if got_id == call_id => Ok(result),
         DistMsg::CallReply { call_id: got_id, .. } => {
             Err(format!("distributed call: reply call_id mismatch (sent {call_id}, got {got_id})"))
@@ -646,15 +751,18 @@ mod tests {
             let auth = crate::kser::read_value_frame(&mut stream).unwrap();
             assert_eq!(DistMsg::from_wire(auth).unwrap(), DistMsg::Auth { token: "t".to_string() });
             crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let spawn = crate::kser::read_value_frame(&mut stream).unwrap();
+            let mut keys = SessionKeys::derive("t", false);
+            let spawn = read_encrypted_msg(&mut stream, &mut keys).unwrap();
             assert_eq!(
-                DistMsg::from_wire(spawn).unwrap(),
+                spawn,
                 DistMsg::Spawn { comp_name: "Worker".to_string(), args: vec![(Some("n".to_string()), PortableValue::Int(5))] }
             );
-            crate::kser::write_value_frame(&mut stream, &DistMsg::SpawnOk { remote_id: 7 }.to_wire()).unwrap();
+            write_encrypted_msg(&mut stream, &mut keys, &DistMsg::SpawnOk { remote_id: 7 }).unwrap();
         });
         let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let remote_id = spawn_remote(&mut stream, "Worker", vec![(Some("n".to_string()), PortableValue::Int(5))]).unwrap();
+        let mut keys = SessionKeys::derive("t", true);
+        let remote_id =
+            spawn_remote(&mut stream, &mut keys, "Worker", vec![(Some("n".to_string()), PortableValue::Int(5))]).unwrap();
         assert_eq!(remote_id, 7);
     }
 
@@ -663,11 +771,13 @@ mod tests {
         let addr = spawn_mock_server(|mut stream| {
             let _ = crate::kser::read_value_frame(&mut stream).unwrap();
             crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let _ = crate::kser::read_value_frame(&mut stream).unwrap();
-            crate::kser::write_value_frame(&mut stream, &DistMsg::SpawnErr { msg: "unknown component `Nope`".to_string() }.to_wire()).unwrap();
+            let mut keys = SessionKeys::derive("t", false);
+            let _ = read_encrypted_msg(&mut stream, &mut keys).unwrap();
+            write_encrypted_msg(&mut stream, &mut keys, &DistMsg::SpawnErr { msg: "unknown component `Nope`".to_string() }).unwrap();
         });
         let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let err = spawn_remote(&mut stream, "Nope", vec![]).unwrap_err();
+        let mut keys = SessionKeys::derive("t", true);
+        let err = spawn_remote(&mut stream, &mut keys, "Nope", vec![]).unwrap_err();
         assert!(err.contains("unknown component"), "{err}");
     }
 
@@ -676,27 +786,27 @@ mod tests {
         let addr = spawn_mock_server(|mut stream| {
             let _ = crate::kser::read_value_frame(&mut stream).unwrap(); // Auth
             crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let _ = crate::kser::read_value_frame(&mut stream).unwrap(); // Spawn
-            crate::kser::write_value_frame(&mut stream, &DistMsg::SpawnOk { remote_id: 0 }.to_wire()).unwrap();
+            let mut keys = SessionKeys::derive("t", false);
+            let _ = read_encrypted_msg(&mut stream, &mut keys).unwrap(); // Spawn
+            write_encrypted_msg(&mut stream, &mut keys, &DistMsg::SpawnOk { remote_id: 0 }).unwrap();
             // Deliver: no reply expected, just consume the frame.
-            let deliver = crate::kser::read_value_frame(&mut stream).unwrap();
-            assert_eq!(
-                DistMsg::from_wire(deliver).unwrap(),
-                DistMsg::Deliver { remote_id: 0, port: "num".to_string(), value: PortableValue::Int(9) }
-            );
+            let deliver = read_encrypted_msg(&mut stream, &mut keys).unwrap();
+            assert_eq!(deliver, DistMsg::Deliver { remote_id: 0, port: "num".to_string(), value: PortableValue::Int(9) });
             // Call: reply with a matching call_id.
-            let call = crate::kser::read_value_frame(&mut stream).unwrap();
-            let DistMsg::Call { call_id, .. } = DistMsg::from_wire(call).unwrap() else { panic!("expected Call") };
-            crate::kser::write_value_frame(
+            let call = read_encrypted_msg(&mut stream, &mut keys).unwrap();
+            let DistMsg::Call { call_id, .. } = call else { panic!("expected Call") };
+            write_encrypted_msg(
                 &mut stream,
-                &DistMsg::CallReply { call_id, result: Ok(PortableValue::Str("hi".to_string())) }.to_wire(),
+                &mut keys,
+                &DistMsg::CallReply { call_id, result: Ok(PortableValue::Str("hi".to_string())) },
             )
             .unwrap();
         });
         let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let remote_id = spawn_remote(&mut stream, "Worker", vec![]).unwrap();
-        deliver_remote(&mut stream, remote_id, "num", PortableValue::Int(9)).unwrap();
-        let result = call_remote_over_wire(&mut stream, remote_id, "greet", vec![], 1).unwrap();
+        let mut keys = SessionKeys::derive("t", true);
+        let remote_id = spawn_remote(&mut stream, &mut keys, "Worker", vec![]).unwrap();
+        deliver_remote(&mut stream, &mut keys, remote_id, "num", PortableValue::Int(9)).unwrap();
+        let result = call_remote_over_wire(&mut stream, &mut keys, remote_id, "greet", vec![], 1).unwrap();
         assert_eq!(result, Ok(PortableValue::Str("hi".to_string())));
     }
 
@@ -705,16 +815,85 @@ mod tests {
         let addr = spawn_mock_server(|mut stream| {
             let _ = crate::kser::read_value_frame(&mut stream).unwrap();
             crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let call = crate::kser::read_value_frame(&mut stream).unwrap();
-            let DistMsg::Call { call_id, .. } = DistMsg::from_wire(call).unwrap() else { panic!("expected Call") };
-            crate::kser::write_value_frame(
-                &mut stream,
-                &DistMsg::CallReply { call_id, result: Err("boom".to_string()) }.to_wire(),
-            )
-            .unwrap();
+            let mut keys = SessionKeys::derive("t", false);
+            let call = read_encrypted_msg(&mut stream, &mut keys).unwrap();
+            let DistMsg::Call { call_id, .. } = call else { panic!("expected Call") };
+            write_encrypted_msg(&mut stream, &mut keys, &DistMsg::CallReply { call_id, result: Err("boom".to_string()) }).unwrap();
         });
         let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let result = call_remote_over_wire(&mut stream, 0, "f", vec![], 1).unwrap();
+        let mut keys = SessionKeys::derive("t", true);
+        let result = call_remote_over_wire(&mut stream, &mut keys, 0, "f", vec![], 1).unwrap();
         assert_eq!(result, Err("boom".to_string()));
+    }
+
+    /// The encrypted framing itself: two `SessionKeys` derived from the
+    /// SAME token, one as client one as server, must interoperate over a
+    /// real socket exactly like `connect_and_authenticate`'s own plaintext
+    /// Auth round-trip does -- proves `write_encrypted_msg`/
+    /// `read_encrypted_msg` work end-to-end, independent of any specific
+    /// `DistMsg` variant's own semantics.
+    #[test]
+    fn encrypted_framing_round_trips_multiple_messages_over_a_real_socket() {
+        let addr = spawn_mock_server(|mut stream| {
+            let mut keys = SessionKeys::derive("shared-secret", false);
+            for i in 0..3 {
+                let msg = read_encrypted_msg(&mut stream, &mut keys).unwrap();
+                assert_eq!(msg, DistMsg::Deliver { remote_id: i, port: "p".to_string(), value: PortableValue::Int(i as i64) });
+                write_encrypted_msg(&mut stream, &mut keys, &DistMsg::AuthOk).unwrap();
+            }
+        });
+        let mut stream = std::net::TcpStream::connect(&addr).unwrap();
+        let mut keys = SessionKeys::derive("shared-secret", true);
+        for i in 0..3u64 {
+            write_encrypted_msg(&mut stream, &mut keys, &DistMsg::Deliver { remote_id: i, port: "p".to_string(), value: PortableValue::Int(i as i64) })
+                .unwrap();
+            let reply = read_encrypted_msg(&mut stream, &mut keys).unwrap();
+            assert_eq!(reply, DistMsg::AuthOk);
+        }
+    }
+
+    /// The actual confidentiality property, demonstrated concretely rather
+    /// than just asserted: a distinctive payload string is a visible
+    /// byte-substring of the OLD plaintext `kser::write_value_frame`
+    /// encoding (proving the marker would have been readable off the wire
+    /// before this module had encryption), but is NOT a byte-substring of
+    /// `write_encrypted_msg`'s own output for the identical `DistMsg` --
+    /// i.e. the wire bytes genuinely stopped being inspectable.
+    #[test]
+    fn a_distinctive_payload_string_is_visible_in_the_old_plaintext_encoding_but_absent_from_the_encrypted_wire_bytes() {
+        let marker = "TOP-SECRET-PAYLOAD-MARKER-4f8a2b";
+        let msg = DistMsg::Deliver { remote_id: 0, port: "p".to_string(), value: PortableValue::Str(marker.to_string()) };
+
+        let mut plaintext_frame = Vec::new();
+        crate::kser::write_value_frame(&mut plaintext_frame, &msg.to_wire()).unwrap();
+        assert!(
+            plaintext_frame.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "sanity check: the marker must be visible in the OLD plaintext encoding"
+        );
+
+        let mut encrypted_frame = Vec::new();
+        let mut keys = SessionKeys::derive("some-token", true);
+        write_encrypted_msg(&mut encrypted_frame, &mut keys, &msg).unwrap();
+        assert!(
+            !encrypted_frame.windows(marker.len()).any(|w| w == marker.as_bytes()),
+            "the marker must NOT be visible anywhere in the encrypted wire bytes"
+        );
+    }
+
+    /// A message decrypted with the WRONG token's derived keys must fail
+    /// cleanly (an AEAD tag mismatch), never silently produce garbage data
+    /// that happens to parse -- the whole reason ChaCha20-Poly1305 (an
+    /// AUTHENTICATED cipher) was chosen over plain encryption.
+    #[test]
+    fn decrypting_with_the_wrong_tokens_keys_fails_cleanly() {
+        let mut sender_keys = SessionKeys::derive("correct-token", true);
+        let ciphertext_frame = {
+            let mut buf = Vec::new();
+            write_encrypted_msg(&mut buf, &mut sender_keys, &DistMsg::AuthOk).unwrap();
+            buf
+        };
+        let mut wrong_keys = SessionKeys::derive("wrong-token", false);
+        let mut cursor = std::io::Cursor::new(ciphertext_frame);
+        assert!(read_encrypted_msg(&mut cursor, &mut wrong_keys).is_err());
     }
 }

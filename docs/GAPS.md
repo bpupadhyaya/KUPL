@@ -786,8 +786,10 @@ completion (3). Everything stays byte-identical across engines.
       +`follows`/`forbids`/`guard`/`guards` (statically-checked effect
       rules plus runtime-checked postconditions on a return value),
       `weight lightweight|heavyweight|distributed` (the last backed by a
-      real, shared-secret-authenticated — not encrypted — TCP transport to
-      a separate `kupl node` process), `durable` (state persisted to disk
+      real, shared-secret-authenticated AND ChaCha20-Poly1305-encrypted
+      TCP transport, `src/aead.rs`, to a separate `kupl node` process —
+      see `docs/PRODUCTION.md`'s Known Limitations for the precise
+      posture), `durable` (state persisted to disk
       across separate `kupl run` invocations, not just supervised
       restarts; `kupl agent inspect`/`clear` CLI), and `deterministic`
       (checker-enforced: the agent's own exposed funs may never

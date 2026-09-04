@@ -275,24 +275,37 @@ Being honest about what is not yet production-grade:
 - **Alpha stability.** The language and `.kx` binary format are versioned (a `.kx`
   built by a different compiler version is rejected with a clear message), but no
   long-term source or ABI stability is promised yet.
-- **`weight distributed`/`kupl node` is AUTHENTICATED, NOT ENCRYPTED —
-  do not run it across an untrusted network.** `docs/design/AGENTS.md`
+- **`weight distributed`/`kupl node` is AUTHENTICATED AND ENCRYPTED, but
+  NOT the same trust model as TLS/mTLS — read this before running it
+  across any network you don't fully control.** `docs/design/AGENTS.md`
   §4/`docs/design/DISTRIBUTION.md`: a `concurrent` actor can now be
   spawned on a separate `kupl node` process over a real TCP connection
   (`interp.rs::ActorRoute::Distributed`). A shared-secret token (constant-
   time compared, `distribution.rs::tokens_match`) gates who may connect,
-  spawn actors, or exchange messages at all — closing the "any host on
-  the network can silently spawn arbitrary components" failure mode a
-  fully open listener would have. But the token itself, and every
-  message after it (including full `PortableValue` payloads), travels in
-  PLAINTEXT — there is no TLS/mTLS in this slice. Put a `kupl node`
-  behind a VPN, SSH tunnel, or service mesh if the link crosses anything
-  you don't already trust; hand-rolling real TLS from scratch, under
-  time pressure, without expert review, was deliberately judged too
-  risky to attempt alongside this feature (matching this project's own
-  "never roll your own crypto for a security-critical primitive without
-  expert review" discipline elsewhere). This is also a NARROW slice of
-  the full `docs/design/DISTRIBUTION.md` vision: one statically-
+  spawn actors, or exchange messages at all. The `Auth`/`AuthOk`/
+  `AuthFailed` handshake itself still travels in plaintext (so a wrong
+  token gets a clean rejection, not an opaque decryption failure), but
+  every message from `Spawn` onward — component names, args, `Deliver`
+  payloads, `Call` args/results, i.e. all actual program data — is
+  encrypted with ChaCha20-Poly1305 (RFC 8439, `src/aead.rs`, verified
+  against the RFC's own official test vectors) using per-direction keys
+  both sides derive independently from the shared token (`SHA-256(token
+  || ":c2s"/":s2c")`, `distribution.rs::SessionKeys`) — no separate key
+  exchange needed. What this still is **not**: there is no PKI/
+  certificate-based peer identity (a leaked token grants full trust, same
+  as before), no perfect forward secrecy (a token that leaks later lets
+  an attacker who recorded traffic decrypt it retroactively), and no
+  protection against a man-in-the-middle on the very first connection
+  (no certificate to pin against). Put a `kupl node` behind a VPN, SSH
+  tunnel, or service mesh for defense in depth on any link crossing a
+  genuinely untrusted network; hand-rolling FULL TLS (asymmetric key
+  exchange, certificate validation, a real handshake state machine)
+  remains out of scope for this project's own "never roll your own
+  crypto for a security-critical primitive without expert review"
+  discipline — deriving a symmetric key from an ALREADY-shared secret and
+  AEAD-encrypting with it is a materially smaller, more tractable problem
+  than that, which is why it was in scope here. This is also a NARROW
+  slice of the full `docs/design/DISTRIBUTION.md` vision: one statically-
   configured node per connection (`KUPL_DISTRIBUTED_NODE` env var), no
   `cap.Cluster` capability, no dynamic cluster membership, no deployment
   manifest, no `at node(...)` placement syntax (still K0309-rejected) —

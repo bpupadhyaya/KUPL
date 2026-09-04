@@ -4,8 +4,10 @@ Proposal v0.1 — 2026-08-26.
 Status: **All three originally-scoped slices, PLUS both of §5's own
 follow-on questions, are now IMPLEMENTED.** §4's weight-class slice
 (`agent` + `weight lightweight/heavyweight/distributed`, the last a
-real, shared-secret-authenticated — not encrypted — TCP transport via
-`kupl node`) — see §4's own updated note (K0125/K0316/K0317). §3's
+real, shared-secret-authenticated AND ChaCha20-Poly1305-encrypted TCP
+transport via `kupl node` — see `PRODUCTION.md`'s Known Limitations for
+the precise security posture) — see §4's own updated note
+(K0125/K0316/K0317). §3's
 structural slice (`protocol` + `agent ... follows Protocol` + `forbids
 <effect>`) — see §3's own updated note (K1000/K1001/K1002/K1003). §3's
 behavioral slice (`guard Name: Type { .. }` + `guards Name`, desugared to
@@ -569,22 +571,45 @@ specific answer yet, only to naming the axes:
   actor transport (`interp.rs::ActorRoute::Distributed`, `kupl node`
   server subcommand, `src/kser.rs` hand-rolled binary wire encoding for
   `PortableValue`, `src/distribution.rs`'s `DistMsg` protocol + shared-
-  secret-authenticated TCP). K0316 retired. Security posture stated
-  plainly: AUTHENTICATED (a shared-secret token, constant-time compared)
-  but NOT ENCRYPTED — run behind a VPN/SSH tunnel for anything crossing
-  an untrusted network; see `docs/design/DISTRIBUTION.md`'s own updated
-  status and `docs/PRODUCTION.md`'s Known Limitations for the full
-  writeup. Verified: `kser`/`distribution` unit tests (binary round-trip
-  including NaN bit-pattern preservation, frame boundaries, auth/spawn/
-  deliver/call protocol shapes, all against real TCP loopback mock
-  servers); a genuine end-to-end test spawning a REAL second `kupl node`
-  OS process and round-tripping a message through it; full `cargo test
-  --lib` green twice and `cargo test --bin kupl` green; revert-and-verify
-  on the `ActorRoute` wiring. NOT implemented: `at node(...)` placement
-  syntax (a separate, still-unimplemented mechanism, K0309) and the
-  broader `cap.Cluster`/dynamic-membership/mTLS vision `DISTRIBUTION.md`
-  itself scopes as "Phase 6+" — this ships the single-static-node,
-  authenticated-but-plaintext slice specifically, not the full spec.
+  secret-authenticated TCP). K0316 retired. See `docs/design/
+  DISTRIBUTION.md`'s own updated status and `docs/PRODUCTION.md`'s Known
+  Limitations for the full, precise security posture writeup. Verified:
+  `kser`/`distribution` unit tests (binary round-trip including NaN
+  bit-pattern preservation, frame boundaries, auth/spawn/deliver/call
+  protocol shapes, all against real TCP loopback mock servers); a genuine
+  end-to-end test spawning a REAL second `kupl node` OS process and
+  round-tripping a message through it; full `cargo test --lib` green
+  twice and `cargo test --bin kupl` green; revert-and-verify on the
+  `ActorRoute` wiring. NOT implemented: `at node(...)` placement syntax
+  (a separate, still-unimplemented mechanism, K0309) and the broader
+  `cap.Cluster`/dynamic-membership/mTLS vision `DISTRIBUTION.md` itself
+  scopes as "Phase 6+" — this ships the single-static-node slice
+  specifically, not the full spec.
+- **UPDATE, 2026-09-04 — the "authenticated but plaintext" gap above is
+  now closed for the DATA that matters.** Every message from `Spawn`
+  onward is ChaCha20-Poly1305 encrypted (RFC 8439, `src/aead.rs` --
+  verified against the RFC's own official test vectors, not just
+  internal self-consistency) using per-direction keys both sides derive
+  from the shared token alone (`SHA-256(token || ":c2s"/":s2c")`,
+  `distribution.rs::SessionKeys`) -- no key exchange needed. The `Auth`/
+  `AuthOk`/`AuthFailed` handshake itself stays plaintext (so a wrong
+  token still gets a clean rejection). Still NOT full TLS/mTLS: no
+  PKI/certificate-based identity, no perfect forward secrecy, no MITM
+  protection on the very first connection -- exactly the gap `cap.Cluster`
+  (Phase 6+) is still scoped to eventually close. Verified: a real
+  end-to-end test spawning a genuine second `kupl node` process and
+  round-tripping an encrypted message through it (unchanged, now
+  exercising the encrypted path); a direct confidentiality test proving
+  a distinctive payload marker string is a visible byte-substring of the
+  OLD plaintext `kser` encoding but absent from the new encrypted wire
+  bytes; a LIVE capture of real client<->`kupl node` TCP traffic through
+  a proxy, confirming the marker is genuinely absent from bytes that
+  crossed a real socket, not just a unit-test simulation;
+  revert-and-verify (flipped the client's own client/server key-
+  direction assignment, confirmed the real end-to-end test fails with a
+  decryption error exactly as predicted, restored, confirmed
+  byte-identical via cmp, reconfirmed passing); full `cargo test --lib`
+  green twice (1881/1881) and `cargo test --bin kupl` green (99/99).
 - **DONE:** §3's structural slice — `protocol Name { intent "..." forbids
   <effect>... }` + `agent Foo follows Protocol1, Protocol2 { .. }`,
   checker-enforced via K1000/K1001/K1002/K1003 (§3's own updated section
@@ -617,8 +642,10 @@ specific answer yet, only to naming the axes:
 - **DONE, 2026-09-01:** `weight distributed` itself, real node-to-node
   actor transport (`interp.rs::ActorRoute::Distributed`, `kupl node`,
   `src/kser.rs`, `src/distribution.rs`) — see §4's own updated table.
-  Shared-secret authenticated, NOT encrypted; a static single-node
-  slice, not the full `cap.Cluster` vision. K0316 retired.
+  Shared-secret authenticated; a static single-node slice, not the full
+  `cap.Cluster` vision. K0316 retired. **UPDATE, 2026-09-04: also
+  ChaCha20-Poly1305 encrypted from `Spawn` onward** — see §4's own
+  updated entry for the full writeup.
 - **DONE, 2026-09-01:** §5's "identity & memory" axis, the narrow
   in-process-crash-boundary slice — `durable agent` (`src/agent_persist.rs`,
   see §5's own updated entry above for the full writeup). NOT the full

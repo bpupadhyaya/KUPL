@@ -235,6 +235,14 @@ pub fn sha256_hex(s: &str) -> String {
     bytes_to_hex(&sha256_bytes(s.as_bytes()))
 }
 
+/// SHA-256 over raw bytes, as the raw 32-byte digest (not hex) -- for a
+/// caller that needs the digest AS KEY MATERIAL, not as display text.
+/// `distribution.rs::SessionKeys` uses this to derive ChaCha20-Poly1305
+/// keys from the shared `weight distributed` token.
+pub fn sha256_raw(bytes: &[u8]) -> [u8; 32] {
+    sha256_bytes(bytes)
+}
+
 /// Same as [`sha256_hex`], but over raw bytes directly -- for input that
 /// isn't (and shouldn't be forced to be) valid UTF-8, e.g. `buildcache.rs`
 /// hashing the running `kupl` executable's own bytes. A lossy UTF-8

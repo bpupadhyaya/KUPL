@@ -108,8 +108,9 @@ change and the release process.
   runtime-checked postconditions on a `guards Name`-tagged exposed fun's
   own return value (K1004/K1005). `weight lightweight|heavyweight|
   distributed` — which concurrency tier backs the agent (K0317/K0125),
-  the last a real, shared-secret-authenticated (not encrypted) TCP
-  transport to a separate node process. `durable` — this agent's `state`
+  the last a real, shared-secret-authenticated TCP transport to a
+  separate node process, ChaCha20-Poly1305 encrypted from `Spawn`
+  onward. `durable` — this agent's `state`
   persists to disk across separate `kupl run` invocations, not just
   supervised restarts (K1006). `deterministic` — checker-enforced
   guarantee the agent's exposed funs never transitively reach an `ai
@@ -119,11 +120,21 @@ change and the release process.
 - `kupl node <file.kupl> --listen <addr> --token <token>`: runs a
   program as a server accepting `weight distributed` agent connections
   authenticated by a shared secret token. See `docs/reference/CLI.md`
-  and `docs/design/DISTRIBUTION.md` for the (deliberate) authenticated-
-  not-encrypted security posture.
+  and `docs/design/DISTRIBUTION.md` for the full security posture.
 - `kupl agent inspect <AgentName>` / `kupl agent clear <AgentName>`:
   read or reset a `durable` agent's persisted state without running the
   program.
+- ChaCha20-Poly1305 AEAD (RFC 8439, `src/aead.rs`), hand-rolled and
+  verified against the RFC's own official test vectors: `weight
+  distributed`/`kupl node` traffic is now encrypted (not just
+  authenticated) from `Spawn` onward, using per-direction keys both
+  sides derive from the already-shared token (`SHA-256(token ||
+  ":c2s"/":s2c")`, `distribution.rs::SessionKeys`) — no key exchange
+  needed. The initial `Auth`/`AuthOk`/`AuthFailed` round-trip itself
+  still travels in plaintext. Not full TLS/mTLS: no PKI/certificate-based
+  peer identity, no perfect forward secrecy, no MITM protection on the
+  very first connection — see `docs/PRODUCTION.md`'s Known Limitations
+  for the precise, honest posture.
 
 ## [1.0.0-alpha]
 

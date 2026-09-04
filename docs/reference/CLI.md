@@ -81,10 +81,15 @@ accepts connections forever (one OS thread per connection), each hosting one
 actor spawned by a remote `weight distributed` client. `<token>` is a
 shared secret every connecting client must present (`KUPL_DISTRIBUTED_NODE`
 on the client side, see Environment below); a wrong token is rejected
-immediately, before any actor is spawned. **Authenticated, NOT encrypted** —
-every message, including the token itself, travels in plaintext. Put a
-`kupl node` behind a VPN/SSH tunnel/service mesh for anything crossing a
-network you don't already trust. Bounded against basic resource exhaustion
+immediately, before any actor is spawned. **Authenticated AND encrypted**
+(ChaCha20-Poly1305, RFC 8439) from `Spawn` onward — the initial `Auth`/
+`AuthOk`/`AuthFailed` round-trip itself stays plaintext, but every message
+carrying real data (component names, args, `Deliver`/`Call` payloads) is
+encrypted with keys both sides derive from the shared token. This is not
+full TLS/mTLS — no certificate-based identity, no perfect forward secrecy;
+see `docs/PRODUCTION.md`'s Known Limitations for the precise posture. Put a
+`kupl node` behind a VPN/SSH tunnel/service mesh for defense in depth on
+anything crossing a network you don't already trust. Bounded against basic resource exhaustion
 (a generous `MAX_NODE_CONNECTIONS` cap, a 10s timeout on the initial
 Auth+Spawn handshake so a silent/stalled client can't hold a connection slot
 forever) but this is still a v1 slice — no `cap.Cluster`, no dynamic cluster

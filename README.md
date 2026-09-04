@@ -79,7 +79,7 @@ export PATH="$PWD/target/release:$PATH"
 ```sh
 kupl version                 # -> kupl 1.0.0-alpha
 kupl run examples/counter.kupl
-cargo test                   # ~1,965 tests, includes interpreter-vs-VM differential suite
+cargo test                   # ~1,980 tests, includes interpreter-vs-VM differential suite
 ```
 
 ---
@@ -294,7 +294,8 @@ is its own concurrent actor, with four things a plain component doesn't have:
 - **`weight lightweight | heavyweight | distributed`** — which of Go's
   goroutines, Java's platform threads, or Erlang's distributed processes
   backs this agent. `distributed` is real network transport (`kupl node`,
-  a shared-secret-authenticated TCP server), not just syntax — see
+  a shared-secret-authenticated **and** ChaCha20-Poly1305-encrypted TCP
+  server — not full TLS/mTLS), not just syntax — see
   `docs/reference/CLI.md`. Default: `lightweight`.
 - **`protocol` / `follows` / `guard`** — rules an agent commits to, like a
   human following workplace policy: `forbids <effect>` is checked
@@ -337,7 +338,7 @@ language, every example verified against the toolchain).
 ## Status & roadmap
 
 **v1.0-alpha**: the founding vision is implemented end to end — ~130,000 lines
-of dependency-free Rust, ~1,965 tests, all engines differentially verified.
+of dependency-free Rust, ~1,980 tests, all engines differentially verified.
 The package registry (`kupl pkg tree/lock/fetch`), LSP hover/completion, the
 full `agent`/`protocol`/`guard` system (all three `weight` classes,
 `durable` state persistence, `deterministic`), and production infrastructure
