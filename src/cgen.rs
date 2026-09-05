@@ -10698,7 +10698,7 @@ mod tests {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -10736,7 +10736,7 @@ mod tests {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -10778,7 +10778,7 @@ mod tests {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let compile_out = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .output()
             .expect("cc runs");
         assert!(compile_out.status.success(), "generated C must compile: {compile_out:?}");
@@ -10823,7 +10823,7 @@ mod tests {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -10844,7 +10844,7 @@ mod tests {
         let bin2 = base2.with_extension("out");
         std::fs::write(&cpath2, &c2).unwrap();
         let status2 = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin2.to_str().unwrap(), cpath2.to_str().unwrap()])
+            .args(["-O2", "-o", bin2.to_str().unwrap(), cpath2.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status2.success(), "generated C must compile");
@@ -10876,7 +10876,7 @@ mod tests {
         let bin2c = base2c.with_extension("out");
         std::fs::write(&cpath2c, &c2c).unwrap();
         let status2c = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin2c.to_str().unwrap(), cpath2c.to_str().unwrap()])
+            .args(["-O2", "-o", bin2c.to_str().unwrap(), cpath2c.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status2c.success(), "generated C must compile");
@@ -10958,7 +10958,7 @@ mod tests {
             let bin = base.with_extension("out");
             std::fs::write(&cpath, &c).unwrap();
             let status = std::process::Command::new(cc())
-                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
                 .status()
                 .expect("cc runs");
             assert!(status.success(), "generated C (with the adversarial chunk name) must still compile cleanly");
@@ -11920,7 +11920,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -11976,7 +11976,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -12090,7 +12090,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -12178,7 +12178,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -12357,7 +12357,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             let bin = base.with_extension("out");
             std::fs::write(&cpath, &c).unwrap();
             let status = std::process::Command::new(cc())
-                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
                 .status()
                 .expect("cc runs");
             assert!(status.success(), "generated C must compile for {src:?}");
@@ -12432,7 +12432,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             let bin = base.with_extension("out");
             std::fs::write(&cpath, &c).unwrap();
             let status = std::process::Command::new(cc())
-                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
                 .status()
                 .expect("cc runs");
             assert!(status.success(), "generated C must compile for {src:?}");
@@ -12459,7 +12459,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -12594,7 +12594,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             let bin = base.with_extension("out");
             std::fs::write(&cpath, &c).unwrap();
             assert!(std::process::Command::new(cc())
-                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
                 .status()
                 .unwrap()
                 .success());
@@ -12680,7 +12680,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             let (cp2, bin2) = (base2.with_extension("c"), base2.with_extension("out"));
             std::fs::write(&cp2, &c2).unwrap();
             assert!(std::process::Command::new(cc())
-                .args(["-O2", "-o", bin2.to_str().unwrap(), cp2.to_str().unwrap()])
+                .args(["-O2", "-o", bin2.to_str().unwrap(), cp2.to_str().unwrap(), "-lm"])
                 .status().unwrap().success());
             let out = std::process::Command::new(&bin2).env(envk, mock).output().unwrap();
             let _ = std::fs::remove_file(&cp2);
@@ -12737,7 +12737,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin).env("KUPL_AI_MOCK_I", &deep).output().unwrap();
         let _ = std::fs::remove_file(&cp);
@@ -12772,7 +12772,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin).env("KUPL_AI_MOCK_LI", "-0.0").output().unwrap();
         let _ = std::fs::remove_file(&cp);
@@ -12953,7 +12953,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
             let bin = base.with_extension("out");
             std::fs::write(&cpath, &c).unwrap();
             assert!(std::process::Command::new(cc())
-                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
                 .status().unwrap().success());
             let bad_arg = std::ffi::OsString::from_vec(vec![0xFF, 0xFE]);
             let out = std::process::Command::new(&bin).arg(&bad_arg).output().expect("binary runs");
@@ -13114,7 +13114,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .stderr(std::process::Stdio::piped())
@@ -13180,7 +13180,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -13228,7 +13228,7 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -13768,7 +13768,7 @@ fun main() uses io {
         // this fix eliminates) is enabled by default on this platform's
         // `cc`, confirmed live without `-Wall` before this fix existed.
         let out = std::process::Command::new(cc())
-            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .output()
             .expect("cc runs");
         assert!(out.status.success(), "generated C must compile");
@@ -14325,7 +14325,7 @@ fun main() uses io {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let _ = std::fs::remove_file(&cpath);
         let run = |mock: &str| -> (String, String) {
@@ -17507,7 +17507,7 @@ fun main() uses io {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -17781,7 +17781,7 @@ fun main() uses io {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -17831,7 +17831,7 @@ fun main() uses io {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -18123,7 +18123,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         // Connect with a generous retry budget (~12s): under heavy parallel test
@@ -18178,7 +18178,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let mut stream = None;
@@ -18247,7 +18247,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let mut stream = None;
@@ -18327,7 +18327,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let mut stream = None;
@@ -18405,7 +18405,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -18479,7 +18479,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -18549,7 +18549,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -18622,7 +18622,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -18719,7 +18719,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -18807,7 +18807,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -18931,7 +18931,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mut child = std::process::Command::new(&bin).spawn().expect("server runs");
         let connect = || {
@@ -19617,7 +19617,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -19719,7 +19719,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let run_with = |input: &str| -> String {
             use std::io::Write;
@@ -19752,7 +19752,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         // returns (stdout, stderr_first_line)
         let run_with = |input: &[u8]| -> (String, String) {
@@ -19814,7 +19814,7 @@ fun main() uses io {
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let run_with = |input: &[u8]| -> String {
             use std::io::Write;
@@ -19931,7 +19931,7 @@ fun main() uses io {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -19968,7 +19968,7 @@ fun main() uses io {
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -20052,7 +20052,7 @@ app Root {\n    intent \"supervises a component that always fails\"\n    let b =
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -20215,7 +20215,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let ran = std::process::Command::new(&bin).output().expect("runs");
         // the one-shot timer resurrects (per interp/vm's own reference semantics) once per
@@ -20247,7 +20247,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -20331,7 +20331,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         // auto-fuse. Kept in sync with run.rs's flag so THIS test harness
         // exercises the exact same compile settings real users get.
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-ffp-contract=off", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -20362,7 +20362,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -20395,7 +20395,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let combined = base.with_extension("combined");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -20476,7 +20476,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin).output().unwrap();
         assert!(String::from_utf8_lossy(&out.stderr).contains("integer overflow in addition"));
@@ -21088,7 +21088,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -21141,7 +21141,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -21196,7 +21196,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
             let bin = base.with_extension("out");
             std::fs::write(&cpath, &c).unwrap();
             assert!(std::process::Command::new(cc())
-                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+                .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
                 .status()
                 .unwrap()
                 .success());
@@ -21254,7 +21254,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -21336,7 +21336,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -21377,7 +21377,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .unwrap()
             .success());
@@ -22043,7 +22043,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .env("KUPL_AI_MOCK_HAIKU", "cherry blossoms")
@@ -22082,7 +22082,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .env("KUPL_AI_MOCK", "\u{A0}hi\u{A0}")
@@ -22113,7 +22113,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .env("KUPL_AI_MOCK", "\u{A0}```json\n{\"value\": 42}\n```\u{A0}")
@@ -22142,7 +22142,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .env("KUPL_AI_MOCK_ASSIST", "[{\"tool\":\"add\",\"input\":{\"a\":2,\"b\":3}},{\"final\":\"5\"}]")
@@ -22180,7 +22180,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         // happy path: two tools in one round -> final answer
         let ok = std::process::Command::new(&bin)
@@ -22307,7 +22307,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         // a whole number exactly one past i64::MAX (2^63): must panic, not
         // silently succeed with a corrupted argument.
@@ -22480,7 +22480,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin).output().expect("runs");
         assert_eq!(
@@ -22516,7 +22516,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .env("KUPL_AI_MOCK_ASSIST4", "[{\"tool\":\"tool_div4\",\"input\":{}},{\"final\":\"5\"}]")
@@ -22593,7 +22593,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let out = std::process::Command::new(&bin)
             .env("KUPL_AI_MOCK_CALL_A9", "[{\"tools\": []}, {\"final\": \"hi\"}]")
@@ -22650,7 +22650,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mock = format!(
             "[{{\"tools\":[{{\"tool\":\"mark_c9\",\"input\":{{\"path\":\"{}\"}}}},{{\"bogus\":\"entry\"}}]}}]",
@@ -22715,7 +22715,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let (cp, bin) = (base.with_extension("c"), base.with_extension("out"));
         std::fs::write(&cp, &c).unwrap();
         assert!(std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cp.to_str().unwrap(), "-lm"])
             .status().unwrap().success());
         let mock = "[{\"tool\":\"mark_a\",\"input\":{},\"tools\":[{\"tool\":\"mark_b\",\"input\":{}}]},{\"final\":\"done\"}]";
         let out = std::process::Command::new(&bin)
@@ -22870,7 +22870,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -23011,7 +23011,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -23140,7 +23140,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -23290,7 +23290,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");
@@ -23431,7 +23431,7 @@ app Main {\n    intent \"main\"\n    let ticker = Ticker()\n    let beacon = Bea
         let bin = base.with_extension("out");
         std::fs::write(&cpath, &c).unwrap();
         let status = std::process::Command::new(cc())
-            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap()])
+            .args(["-O2", "-o", bin.to_str().unwrap(), cpath.to_str().unwrap(), "-lm"])
             .status()
             .expect("cc runs");
         assert!(status.success(), "generated C must compile");

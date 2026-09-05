@@ -1748,7 +1748,7 @@ pub fn native(path: &str, args: &[String]) -> i32 {
     // architecture's or compiler's default), so post-fix all three engines are
     // BIT-IDENTICAL regardless of the build machine's ISA.
     let status = std::process::Command::new(&cc)
-        .args(["-O2", "-ffp-contract=off", "-o", &out, &c_path])
+        .args(["-O2", "-ffp-contract=off", "-o", &out, &c_path, "-lm"])
         .status();
     let keep_c = keep_c_flag;
     match status {
