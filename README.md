@@ -31,6 +31,37 @@ component Counter {
 }
 ```
 
+An `agent` is a higher-level actor, purpose-built to represent a human-like
+co-worker rather than a low-level concurrency primitive — with commitments
+it can't violate (`protocol`/`guard`), memory that outlives a single run
+(`durable`), and a judgment boundary the checker enforces (`deterministic`):
+
+```kupl
+protocol SpendingLimit {
+    intent "No single decision commits more than $10,000."
+    guard CommitAmount: Int {
+        expect result <= 10000
+    }
+}
+
+agent Approver follows SpendingLimit {
+    intent "Approves requests within its own spending limit."
+    durable                          // state persists across separate `kupl run`s
+    deterministic                    // may never reach an `ai fun`
+
+    state handled: Int = 0
+
+    expose fun approve(amount: Int) -> Int guards CommitAmount {
+        handled += 1
+        amount
+    }
+}
+```
+
+See `examples/agent_keyword.kupl` and `docs/reference/LANGUAGE-REFERENCE.md`
+§7.3 for the full picture (`weight lightweight|heavyweight|distributed`
+included).
+
 AI is part of the language, not a library. An `ai fun` is a typed prompt
 function — its return type drives structured output, parsed into real values:
 
