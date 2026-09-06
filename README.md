@@ -376,6 +376,7 @@ language, every example verified against the toolchain).
 - [`docs/reference/DIAGNOSTICS.md`](docs/reference/DIAGNOSTICS.md) — the complete K-code index (172 active diagnostics + 2 retired, grouped by phase)
 - [`docs/PRODUCTION.md`](docs/PRODUCTION.md) — running KUPL in production: security model, resource limits, threat model (it is **not** a sandbox), operations, and an honest list of known limitations
 - [`docs/COMPARISON.md`](docs/COMPARISON.md) — an honest audit of KUPL vs Python, Go, TypeScript, Java, Rust, Haskell, C++, Swift, and Kotlin (as-implemented vs designed)
+- [`docs/ROADMAP.md`](docs/ROADMAP.md) — the release-by-release plan from `0.1.0` to `1.0.0`
 
 ## Design documents
 
@@ -396,7 +397,11 @@ pkg tree/lock/fetch`), LSP hover/completion, the full `agent`/`protocol`/
 resource limits, crypto/logging stdlib) are already implemented — see
 `docs/PRODUCTION.md` for the honest list of what's still incomplete, and
 `docs/VERSIONING.md`'s "Path to 1.0.0 Stable" for exactly what's left
-before a real compatibility guarantee begins. Next arc (per
+before a real compatibility guarantee begins. See
+[`docs/ROADMAP.md`](docs/ROADMAP.md) for the concrete, release-by-release
+plan from here to `1.0.0` (cross-platform reliability, security
+hardening, a real package registry, live-provider AI hardening, and what
+still can't be done by writing more code). Next arc (per
 `docs/design/TOOLCHAIN.md`): KIR
 (typed SSA) with GPU lowering (Metal first), a genuine per-component
 generational GC in the native backend (native already supports components,
