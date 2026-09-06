@@ -3022,7 +3022,18 @@ mod tests {
             std::thread::spawn(move || {
                 let _ = tx.send(super::run_tests(&path));
             });
-            rx.recv_timeout(std::time::Duration::from_secs(20)).ok()
+            // A REAL flake found live (0.2.0 cross-platform arc): 20s was
+            // tight enough that a slower/more contended CI runner
+            // (confirmed on windows-latest, a tier GitHub's own hosted
+            // runners are consistently slower on) could still be mid-loop-
+            // guard-check when this fired, timing out even though the
+            // actual property under test (the runaway loop eventually
+            // fails cleanly, never truly hangs forever) still held -- just
+            // needed more wall-clock margin on that machine. This test's
+            // own name is about "not hanging forever," not "finishes
+            // within exactly 20s," so a more generous bound loses nothing
+            // it's actually checking for.
+            rx.recv_timeout(std::time::Duration::from_secs(60)).ok()
         };
 
         // a runaway top-level law must fail cleanly, not hang.
@@ -3100,7 +3111,18 @@ mod tests {
             std::thread::spawn(move || {
                 let _ = tx.send(super::run_tests(&path));
             });
-            rx.recv_timeout(std::time::Duration::from_secs(20)).ok()
+            // A REAL flake found live (0.2.0 cross-platform arc): 20s was
+            // tight enough that a slower/more contended CI runner
+            // (confirmed on windows-latest, a tier GitHub's own hosted
+            // runners are consistently slower on) could still be mid-loop-
+            // guard-check when this fired, timing out even though the
+            // actual property under test (the runaway loop eventually
+            // fails cleanly, never truly hangs forever) still held -- just
+            // needed more wall-clock margin on that machine. This test's
+            // own name is about "not hanging forever," not "finishes
+            // within exactly 20s," so a more generous bound loses nothing
+            // it's actually checking for.
+            rx.recv_timeout(std::time::Duration::from_secs(60)).ok()
         };
 
         // a top-level law with an excessively large `for` range must fail cleanly, not hang.
