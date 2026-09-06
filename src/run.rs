@@ -2434,6 +2434,9 @@ mod tests {
     /// leaves no `.tmp-*` sibling behind.
     #[test]
     fn native_rebuild_with_keep_c_overwrites_c_path_atomically_and_leaves_no_tmp_sibling() {
+        if !crate::cgen::cc_available() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("kupl-it1151-native-rebuild-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("app.kupl");
@@ -2479,6 +2482,9 @@ mod tests {
     /// invocation this cache exists to skip).
     #[test]
     fn native_populates_the_build_cache_and_a_rebuild_reproduces_byte_identical_output() {
+        if !crate::cgen::cc_available() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("kupl-buildcache-native-integ-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("app.kupl");
@@ -2526,6 +2532,9 @@ mod tests {
     /// rebuilt executable, never a stale served artifact.
     #[test]
     fn native_cache_key_changes_when_the_source_changes() {
+        if !crate::cgen::cc_available() {
+            return;
+        }
         let dir = std::env::temp_dir().join(format!("kupl-buildcache-native-invalidate-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let source = dir.join("app.kupl");

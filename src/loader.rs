@@ -3342,7 +3342,16 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
 
         let err = super::write_atomically(&target, "new content").unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::IsADirectory, "{err:?}");
+        // The exact `ErrorKind` for "renamed onto an existing directory"
+        // is itself platform-dependent (confirmed live: `IsADirectory` on
+        // Unix, `PermissionDenied` on Windows) -- not the property this
+        // test is actually about. What matters, and is checked below, is
+        // that the rename failing at all still leaves no `.tmp-{pid}`
+        // staging file behind.
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::IsADirectory | std::io::ErrorKind::PermissionDenied),
+            "expected a rename-onto-a-directory failure, got {err:?}"
+        );
 
         let tmp = base.join(format!("kupl.lock.tmp-{}", std::process::id()));
         assert!(

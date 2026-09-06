@@ -20130,32 +20130,41 @@ fun probe() -> Str {\n    m_assist5(\"x\")\n}\n";
         // text (`diff_ai_fun_multi_tool_round` above), so a caller can choose not to
         // blindly retry; this test locks in that the surfaced fact is accurate on
         // BOTH engines.
-        let path = "/tmp/kupl_difftest_it770_marker.txt";
-        let _ = std::fs::remove_file(path);
+        // A REAL bug found+fixed (0.2.0 cross-platform arc): this used to
+        // hardcode a Unix-style `/tmp/...` literal -- see
+        // diff_file_io_roundtrip_it14's own comment for why that's not
+        // portable to Windows, and why forward slashes are used here too.
+        let path = std::env::temp_dir()
+            .join("kupl_difftest_it770_marker.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let _ = std::fs::remove_file(&path);
         std::env::set_var(
             "KUPL_AI_MOCK_ASSIST770",
             "[{\"tools\":[{\"tool\":\"append_marker770\",\"input\":{\"msg\":\"X\"}},\
 {\"tool\":\"nope770\",\"input\":{}}]}]",
         );
-        let src = "fun append_marker770(msg: Str) -> Str {\n    \
-            let _ = append_file(\"/tmp/kupl_difftest_it770_marker.txt\", msg)\n    \"wrote\"\n}\n\
-ai fun assist770(q: Str) -> Result[Str, Str] tools [append_marker770] {\n    intent \"Assist.\"\n}\n\
-fun probe() -> Str {\n    \
-    let _ = delete_file(\"/tmp/kupl_difftest_it770_marker.txt\")\n    \
-    let r1 = match assist770(\"go\") {\n        Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
-    let r2 = match assist770(\"go\") {\n        Ok(_) => \"ok\"\n        Err(e) => e\n    }\n    \
-    let content = match read_file(\"/tmp/kupl_difftest_it770_marker.txt\") {\n        \
-        Ok(c) => c\n        Err(_) => \"MISSING\"\n    }\n    \
-    \"r1={r1} r2={r2} content={content}\"\n}\n";
+        let src = format!(
+            "fun append_marker770(msg: Str) -> Str {{\n    \
+            let _ = append_file(\"{path}\", msg)\n    \"wrote\"\n}}\n\
+ai fun assist770(q: Str) -> Result[Str, Str] tools [append_marker770] {{\n    intent \"Assist.\"\n}}\n\
+fun probe() -> Str {{\n    \
+    let _ = delete_file(\"{path}\")\n    \
+    let r1 = match assist770(\"go\") {{\n        Ok(_) => \"ok\"\n        Err(e) => e\n    }}\n    \
+    let r2 = match assist770(\"go\") {{\n        Ok(_) => \"ok\"\n        Err(e) => e\n    }}\n    \
+    let content = match read_file(\"{path}\") {{\n        \
+        Ok(c) => c\n        Err(_) => \"MISSING\"\n    }}\n    \
+    \"r1={{r1}} r2={{r2}} content={{content}}\"\n}}\n"
+        );
         assert_eq!(
-            differential(src),
+            differential(&src),
             "r1=model called unknown tool `nope770` \
 (this tool failed after 1 other tool call(s) in the same round already ran: append_marker770) \
 r2=model called unknown tool `nope770` \
 (this tool failed after 1 other tool call(s) in the same round already ran: append_marker770) \
 content=XX"
         );
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -21510,25 +21519,40 @@ fun probe() -> Str {\n    match assist4(\"x\") {\n        Ok(v) => \"ok:{v}\"\n 
     #[test]
     fn diff_file_io_roundtrip_it14() {
         // write → exists → read → append → delete → gone, all via a fixed temp
-        // path; interpreter and KVM must agree byte-for-byte (both use fs_builtin)
-        let src = "fun probe() -> Str {\n\
-            let p = \"/tmp/kupl_difftest_it14.txt\"\n\
+        // path; interpreter and KVM must agree byte-for-byte (both use fs_builtin).
+        // A REAL bug found+fixed (0.2.0 cross-platform arc): this used to
+        // hardcode a Unix-style `/tmp/...` literal, which isn't a real
+        // (or writable) directory on Windows -- every fs_builtin call
+        // silently no-op'd/failed there instead of exercising anything.
+        // `std::env::temp_dir()` is the portable equivalent every other
+        // test in this codebase already uses; forward slashes only (a
+        // literal Windows `\` inside a KUPL string is an escape sequence,
+        // not a path separator, but `/` is accepted as an alternate
+        // separator by Windows' own filesystem APIs).
+        let p = std::env::temp_dir()
+            .join("kupl_difftest_it14.txt")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let src = format!(
+            "fun probe() -> Str {{\n\
+            let p = \"{p}\"\n\
             let _ = write_file(p, \"alpha\\nbeta\")\n\
             let exists = file_exists(p)\n\
-            let n = match read_file(p) {\n\
+            let n = match read_file(p) {{\n\
                 Ok(c) => c.lines().len()\n\
                 Err(_) => 0 - 1\n\
-            }\n\
+            }}\n\
             let _ = append_file(p, \"\\ngamma\")\n\
-            let n2 = match read_file(p) {\n\
+            let n2 = match read_file(p) {{\n\
                 Ok(c) => c.lines().len()\n\
                 Err(_) => 0 - 1\n\
-            }\n\
+            }}\n\
             let _ = delete_file(p)\n\
             let gone = file_exists(p)\n\
-            \"exists={exists} n={n} n2={n2} gone={gone}\"\n\
-        }\n";
-        assert_eq!(differential(src), "exists=true n=2 n2=3 gone=false");
+            \"exists={{exists}} n={{n}} n2={{n2}} gone={{gone}}\"\n\
+        }}\n"
+        );
+        assert_eq!(differential(&src), "exists=true n=2 n2=3 gone=false");
     }
 
     #[test]

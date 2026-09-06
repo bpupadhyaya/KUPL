@@ -3318,6 +3318,19 @@ fn text_at_path(path: &std::path::Path, buffers: &HashMap<PathBuf, String>) -> O
 /// The inverse of `uri_to_path`: percent-encode a filesystem path into a
 /// `file://` URI. Only bytes outside the RFC 3986 "unreserved" set are
 /// escaped, so ordinary paths round-trip through `uri_to_path` unchanged.
+///
+/// A REAL, live-confirmed bug on Windows (0.2.0 cross-platform arc): a
+/// file URI's path portion always uses `/` regardless of the host OS
+/// (RFC 8089) -- but this function only ever special-cased `/` in its own
+/// allow-list, so a native Windows path's own `\` separators fell through
+/// to the percent-encoding branch (`%5C`) instead. Every URI this
+/// function built from a real Windows path was byte-for-byte different
+/// from the SAME logical path built with `/` (e.g. from a hardcoded test
+/// fixture, or a path arriving via a different, `/`-using code path),
+/// breaking every string comparison against it. Fixed by normalizing `\`
+/// to `/` the same way `/` itself already passes through unescaped -- a
+/// no-op on Unix, where `\` is just an ordinary filename byte that was
+/// never expected to appear in a real path anyway.
 fn path_to_uri(path: &std::path::Path) -> String {
     let mut out = String::from("file://");
     for b in path.to_string_lossy().as_bytes() {
@@ -3325,6 +3338,7 @@ fn path_to_uri(path: &std::path::Path) -> String {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'.' | b'-' | b'_' | b'~' => {
                 out.push(*b as char)
             }
+            b'\\' => out.push('/'),
             _ => out.push_str(&format!("%{b:02X}")),
         }
     }

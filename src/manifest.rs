@@ -196,8 +196,20 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                         // path traversal (`../evil`, `/abs`, `a/b`)... the `.`/`..`
                         // specials") -- `entry` was the one manifest field the project
                         // hadn't applied that same discipline to.
+                        // A REAL, live-confirmed Windows gap in the check
+                        // above (0.2.0 cross-platform arc): `Path::
+                        // is_absolute()` on Windows requires a DRIVE
+                        // prefix (`C:\...`) -- a rooted-but-prefixless
+                        // path like `/etc/passwd` or `\etc\passwd` returns
+                        // `false` there (it's "rooted relative to the
+                        // current drive," not "absolute" by Windows' own
+                        // definition), even though it still escapes the
+                        // project directory exactly like a Unix absolute
+                        // path does. `has_root()` catches both shapes on
+                        // every platform (on Unix the two checks are
+                        // already equivalent, so this is a no-op there).
                         let p = std::path::Path::new(&s);
-                        if p.is_absolute() {
+                        if p.is_absolute() || p.has_root() {
                             return Err(format!(
                                 "line {}: `entry` must be a path relative to the project directory, not absolute (`{s}`)",
                                 i + 1
