@@ -12840,8 +12840,12 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
     /// is explicitly documented to never follow symlinks in either
     /// position -- confirmed live on interp.rs before fixing native to
     /// match, using `lstat` for nested entries and an explicit top-level
-    /// `lstat`+`unlink` check in `k_remove_dir`.
+    /// `lstat`+`unlink` check in `k_remove_dir`. Unix-only: this test
+    /// exercises `lstat`-vs-`stat` semantics specifically (a POSIX-only
+    /// distinction, no such syscall pair on Windows), and `std::os::unix`
+    /// doesn't exist to build on non-Unix platforms in the first place.
     #[test]
+    #[cfg(unix)]
     fn native_remove_dir_does_not_follow_symlinks_out_of_the_tree() {
         if !cc_available() {
             return;
@@ -13015,14 +13019,30 @@ app Main6 {\n    intent \"m\"\n    let worker = Worker6()\n    let driver = Driv
              let longname = \"x\".repeat(400)\n    \
              match exec(longname, []) {{ Ok(_) => print(\"ok\"), Err(e) => print(\"{{e.len()}}|{{e}}\") }}\n}}\n"
         );
-        let expected = format!("cannot run {longname}: No such file or directory (os error 2)");
-        let expected_len = expected.chars().count();
+        let out = native_main_stdout(&src, "execlongname");
+        let out = out.trim();
+        // Deliberately NOT hardcoding the trailing OS-error text: a 400-byte
+        // single-component filename overflows different length limits on
+        // different platforms (confirmed live -- this exact case triggers
+        // `ENOENT`/"No such file or directory" on macOS but `ENAMETOOLONG`/
+        // "File name too long" on Linux), so the exact `strerror` suffix is
+        // legitimately platform-dependent. What must hold on EVERY platform
+        // is the actual regression this test guards: the full, untruncated
+        // `program` name reaches the `Err(Str)` value, and the reported
+        // `.len()` matches the message's own real character count (the old
+        // fixed `char m[300]` buffer silently truncated BOTH once `program`
+        // alone approached ~280 bytes).
+        let (len_str, msg) = out.split_once('|').unwrap_or_else(|| panic!("expected `<len>|<message>` shape, got {out:?}"));
+        let reported_len: usize = len_str.parse().unwrap_or_else(|_| panic!("length prefix must be an integer, got {out:?}"));
         assert_eq!(
-            native_main_stdout(&src, "execlongname").trim(),
-            format!("{expected_len}|{expected}"),
-            "the Err(Str) VALUE must carry the FULL, untruncated message -- the old \
-             fixed-size char m[300] buffer used to silently drop the OS-error suffix \
-             once `program` alone approached ~280 bytes"
+            reported_len,
+            msg.chars().count(),
+            "the Err(Str) VALUE's own reported length must match its real character \
+             count -- a mismatch means the message was truncated somewhere: {out:?}"
+        );
+        assert!(
+            msg.starts_with(&format!("cannot run {longname}: ")),
+            "the full, untruncated 400-char program name must appear in the message: {out:?}"
         );
     }
 
