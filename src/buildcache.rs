@@ -147,10 +147,37 @@ pub fn cc_hash(cc: &str) -> Option<String> {
         PathBuf::from(cc)
     } else {
         let path_var = std::env::var_os("PATH")?;
-        std::env::split_paths(&path_var).map(|dir| dir.join(cc)).find(|p| is_executable_file(p))?
+        find_on_path(cc, &path_var)?
     };
     let bytes = std::fs::read(&path).ok()?;
     Some(crate::encoding::sha256_hex_bytes(&bytes))
+}
+
+/// Search `$PATH` for `cc` the same way `std::process::Command::new(cc)`
+/// itself resolves a bare (no path separator) command name -- a REAL,
+/// live-confirmed bug (found via Windows CI, 0.2.0 cross-platform arc):
+/// on Windows, a bare name is resolved by trying each `PATHEXT` extension
+/// in turn (`cc.exe`, `cc.cmd`, ...) UNLESS the name already carries an
+/// extension of its own, which is exactly how `CreateProcess`/`Command`
+/// find it -- a manual search checking only the literal, extension-less
+/// name (the previous implementation here) never finds `cc.exe`, so
+/// `cc_available()` (a real `Command::new(cc).spawn()` probe) and
+/// `cc_hash()` disagreed about whether the SAME `cc` resolves at all.
+fn find_on_path(cc: &str, path_var: &std::ffi::OsStr) -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if std::path::Path::new(cc).extension().is_some() {
+            return std::env::split_paths(path_var).map(|dir| dir.join(cc)).find(|p| is_executable_file(p));
+        }
+        let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+        let exts: Vec<&str> = pathext.split(';').collect();
+        std::env::split_paths(path_var)
+            .find_map(|dir| exts.iter().map(|ext| dir.join(format!("{cc}{ext}"))).find(|p| is_executable_file(p)))
+    }
+    #[cfg(not(windows))]
+    {
+        std::env::split_paths(path_var).map(|dir| dir.join(cc)).find(|p| is_executable_file(p))
+    }
 }
 
 /// Build the cache key for one compile. `extra` lets a caller fold in
