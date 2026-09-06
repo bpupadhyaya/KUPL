@@ -10650,12 +10650,52 @@ mod tests {
     fn cc() -> String {
         std::env::var("CC").unwrap_or_else(|_| "cc".to_string())
     }
+    /// A REAL bug found+fixed (0.2.0 cross-platform arc, via live Windows
+    /// CI): a bare `cc --version` probe is not the same question as "can
+    /// this environment actually build a KUPL native program." On
+    /// windows-latest, `cc` resolves to a genuine, working MinGW-w64 GCC
+    /// (confirmed live: `cc --version` and even `cc -O2 -o x --version`
+    /// both succeed cleanly) -- but EVERY generated program's shared
+    /// runtime preamble unconditionally includes `<sys/wait.h>` (needed
+    /// for the `fork`/`pipe`/`waitpid`-based `exec` implementation), a
+    /// POSIX-only header MinGW does not provide. The old check reported
+    /// "available" and let ~388 tests fail on a real compile error
+    /// instead of skipping cleanly. Fixed by actually compiling the SAME
+    /// runtime preamble every real program gets (`emit_c` on a trivial
+    /// `fun main() {}`) instead of guessing from `--version` alone --
+    /// this also means the check self-corrects if a future portable
+    /// runtime rewrite (or a POSIX-compat environment) ever fixes this,
+    /// with no hardcoded platform check to remember to remove. Cached
+    /// (`OnceLock`) since this now runs a real `-O2` compile+link, not a
+    /// sub-millisecond `--version` call, and every native test calls it.
     fn cc_available() -> bool {
-        std::process::Command::new(cc())
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *AVAILABLE.get_or_init(|| {
+            let compiled = match crate::run::compile("fun main() {}\n") {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            let Ok(module) = crate::compile::compile_module(&compiled.program, &compiled.checked) else {
+                return false;
+            };
+            let Ok(c) = super::emit_c(&module) else {
+                return false;
+            };
+            let base = std::env::temp_dir().join(format!("kupl-cc-available-probe-{}", std::process::id()));
+            let cpath = base.with_extension("c");
+            let bin = base.with_extension("out");
+            if std::fs::write(&cpath, &c).is_err() {
+                return false;
+            }
+            let ok = std::process::Command::new(cc())
+                .args(["-O2", "-o", bin.to_str().unwrap_or_default(), cpath.to_str().unwrap_or_default(), "-lm"])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let _ = std::fs::remove_file(&cpath);
+            let _ = std::fs::remove_file(&bin);
+            ok
+        })
     }
 
     /// The "no entry point" error message doesn't claim multi-component apps

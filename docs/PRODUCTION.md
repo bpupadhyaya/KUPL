@@ -210,6 +210,19 @@ contract* — pick the engine and idiom that fit the workload:
 
 Being honest about what is not yet production-grade:
 
+- **`kupl native`/`kupl bundle` do not work on Windows yet.** Confirmed live
+  (0.2.0 cross-platform arc, the first time this project's CI ever tested
+  Windows at all): the C compiler resolves and works fine on GitHub's
+  `windows-latest` runner (a real, working MinGW-w64 GCC) — the blocker is
+  that EVERY generated program's shared C runtime preamble unconditionally
+  includes `<sys/wait.h>` and uses `fork`/`pipe`/`waitpid` (for the `exec`
+  builtin), POSIX-only APIs with no MinGW equivalent (Windows has no `fork`
+  in the POSIX sense at all, even under MinGW). Making the native C runtime
+  genuinely cross-platform (a Windows-native process-spawning path, or a
+  bundled POSIX-compat layer) is a real, separate engineering effort — see
+  `docs/ROADMAP.md`. The tree-walking interpreter, the register-based KVM
+  (`kupl run --vm`), and the `.kx` bytecode format are unaffected — pure
+  Rust, no C codegen involved, and confirmed working on Windows.
 - **The real-provider AI path is now retry-hardened, but still only lightly
   battle-tested.** The `anthropic`, `openai`, and `ollama` providers share one
   `http_post` (`ai.rs`) with a 120s per-attempt timeout and a 10MiB response cap; it

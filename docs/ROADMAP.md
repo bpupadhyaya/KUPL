@@ -29,48 +29,86 @@ otherwise:
 **Theme:** KUPL builds, tests green, and ships an installable artifact on
 all three major desktop platforms — not just macOS.
 
-**Status:** in progress. A real, previously-undiscovered bug was already
-found and fixed this cycle: `kupl native`'s generated C code was never
-linked against `libm`, so every native compile failed on Linux from the
-day CI was first added (invisible on macOS, where libm is folded into
-libSystem). Fixed in commit `eae91e7`.
+**Status:** in progress. Real, previously-undiscovered bugs found and fixed
+this cycle, each confirmed live via actually running CI on a platform this
+project had never tested before (or had never checked the results of):
+
+- `kupl native`'s generated C code was never linked against `libm`, so
+  every native compile failed on Linux from the day CI was first added
+  (invisible on macOS, where libm is folded into libSystem). Fixed in
+  commit `eae91e7`.
+- `native_remove_dir_does_not_follow_symlinks_out_of_the_tree` used
+  `std::os::unix::fs::symlink` unconditionally, failing to even COMPILE
+  on Windows (`std::os::unix` doesn't exist there). Fixed by gating the
+  whole test `#[cfg(unix)]` — it tests POSIX-only `lstat` semantics, no
+  clean Windows equivalent exists. Commit `0bb07b2`.
+- `native_exec_error_message_is_not_truncated_by_a_fixed_size_buffer`
+  hardcoded an exact OS error string that differs by platform (a
+  400-byte filename triggers `ENAMETOOLONG` on Linux, `ENOENT` on macOS)
+  — the feature was correct on both, only the test's assumption wasn't
+  portable. Fixed to check the actual regression (length, untruncated
+  content) instead. Commit `0bb07b2`.
+- `cc_hash()`'s manual `$PATH` search never found `cc.exe` on Windows (no
+  extension handling, unlike `Command::new`'s own PATHEXT-aware
+  resolution) — `cc_available()` and `cc_hash()` disagreed about whether
+  the same `cc` even resolves. Fixed with a proper Windows PATHEXT-aware
+  search. Commit `7f971a4`.
+- **The big one**: `kupl native`/`kupl bundle` genuinely don't work on
+  Windows at all today. Confirmed live: `cc` resolves to a real, working
+  MinGW-w64 GCC on `windows-latest` — but every generated program's
+  shared C runtime preamble unconditionally includes `<sys/wait.h>` and
+  uses `fork`/`pipe`/`waitpid` for the `exec` builtin, POSIX-only APIs
+  with no MinGW equivalent (Windows has no `fork` in the POSIX sense at
+  all). `cc_available()`'s own test-suite gate used to just check
+  `cc --version` succeeds, which is true here — it now actually compiles
+  the same runtime preamble every real program gets, so native-codegen
+  tests correctly SKIP on Windows instead of failing. See
+  `docs/PRODUCTION.md`'s Known Limitations for the full writeup. This is
+  now tracked as its own, separate, larger future item (see "Explicitly
+  out of scope for 0.2.0" below) — not something to force into this
+  release. The interpreter, `kupl run --vm`, and `.kx` bytecode are
+  unaffected (pure Rust, no C codegen) and confirmed working on Windows.
 
 **Remaining work:**
-1. **Resolve the GitHub Actions billing/quota situation.** Two consecutive
-   CI reruns on `ubuntu-latest` were killed externally (exit 143, "runner
-   has received a shutdown signal") at a suspiciously consistent ~8m33s
-   mark, while `macos-latest` completed cleanly in the same run. Working
-   theory: the account's Actions-minutes quota (macOS runners cost 10x the
-   multiplier) is exhausted from weeks of failing/hanging CI runs. Needs a
-   check of github.com/settings/billing — this is the one item in this
-   whole release that depends on the user, not on more code.
-2. **Confirm Linux CI is genuinely green** post-`libm` fix, once the above
-   is resolved (a clean, uninterrupted run).
-3. **Get Windows CI green** — real, previously-untested territory (the CI
-   matrix has only ever had `ubuntu-latest`/`macos-latest`). Likely real
-   issues to find and fix:
-   - `kupl native`'s C compiler resolution (`buildcache.rs::cc()` defaults
-     to the `cc` env var or literal `"cc"` — Windows has no `cc` by
-     default; needs either a documented MinGW-w64/MSVC prerequisite,
-     matching the existing "a C compiler, `kupl native` only" prerequisite
-     pattern already used for macOS/Linux, or CI-side MinGW setup).
-   - Possible path-separator assumptions (hardcoded `/` vs `PathBuf`).
-   - Possible `\r\n` vs `\n` line-ending assumptions in string
-     comparisons/golden-output tests.
-   - `exec()`/subprocess semantics differences.
-   - Socket/networking behavior differences affecting the `weight
-     distributed` test suite.
-   - The core interpreter/VM/KVM path is pure Rust with no OS-specific C
-     dependency, so it should need little to no change — `kupl native`
-     is where the real risk concentrates.
+1. **Resolve the GitHub Actions billing/quota situation.** Repeated CI
+   runs on `ubuntu-latest` — now confirmed across four separate attempts,
+   including after the `libm` fix — get killed externally (exit 143,
+   "runner has received a shutdown signal") at a suspiciously consistent
+   ~8m33s-8m59s mark, always at roughly the same point in test
+   progression, while `macos-latest` in the same run completes cleanly.
+   Working theory: the account's Actions-minutes quota (macOS runners
+   cost a 10x multiplier) is exhausted from weeks of failing/hanging CI
+   runs before this arc even started. Needs a check of
+   github.com/settings/billing — this is the one item in this whole
+   release that depends on the user, not on more code.
+2. **Confirm Linux CI is genuinely green** once the above is resolved (a
+   clean, uninterrupted run — every failure seen on Linux so far has
+   either been the now-fixed `libm`/error-message bugs, or this external
+   kill, never a hang or a genuine remaining test failure).
+3. **Confirm Windows CI is green** with the `cc_available()` fix in place
+   (native-codegen tests should now skip cleanly rather than fail).
 4. **Build and publish real artifacts.** Once both platforms are green,
    use their own GitHub-hosted runners (not local cross-compilation, which
    isn't verifiable from this macOS dev machine — no Docker/mingw/musl
    cross-toolchain available locally) to produce real
    `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` binaries.
-   Attach to a `v0.2.0` release alongside the existing macOS artifact.
+   Attach to a `v0.2.0` release alongside the existing macOS artifact. The
+   Windows artifact ships with the honest caveat that `kupl native`/
+   `kupl bundle` don't work there yet (see above) — `kupl run`,
+   `kupl run --vm`, `kupl check`, `kupl build`, `kupl fmt`, `kupl test`,
+   etc. are unaffected.
 5. **Update install docs** — remove the "only macOS published" caveat from
-   the README once Linux/Windows artifacts exist.
+   the README once Linux/Windows artifacts exist, and add the Windows
+   `kupl native` caveat there too.
+
+**Explicitly out of scope for 0.2.0** (a separate, future item, not a
+release blocker): making `kupl native`'s C runtime genuinely portable to
+Windows — replacing the `fork`/`pipe`/`waitpid`-based `exec` 
+implementation with a `CreateProcess`-based one behind a build-time
+`#ifdef _WIN32`, and auditing the rest of the generated runtime for other
+POSIX-only assumptions. This is real, substantial engineering (a new
+process-spawning backend, not a flag flip) and deserves its own scoped
+effort rather than being rushed into a cross-platform-reliability release.
 
 ---
 

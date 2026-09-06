@@ -20,22 +20,6 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Diagnostic only (0.2.0 cross-platform investigation): 388 native-
-      # codegen tests fail on windows-latest with "generated C must
-      # compile" even though cc_available() (a bare `cc --version` probe)
-      # returns true -- something resolves as `cc` here but can't handle
-      # the GCC/Clang-style flags KUPL's own cc invocations use. Find out
-      # what, before guessing at a fix.
-      - name: Diagnose cc resolution (windows-latest only)
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          Get-Command cc -All -ErrorAction SilentlyContinue
-          cc --version
-          echo "---"
-          cc -O2 -o test.exe --version 2>&1
-        continue-on-error: true
-
       - name: Build
         run: cargo build --locked --verbose
 
