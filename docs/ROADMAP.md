@@ -164,23 +164,41 @@ state files (now `0600` on Unix) — see `docs/design/DISTRIBUTION.md`'s
 the full writeup. Only item 1 (the effect system gap) remains open for
 0.3.0.
 
-1. **The effect system's known indirect-propagation gap.** Today, effect
-   tracking through a component instance is precise for two syntactically
-   provable cases (`let s = SomeComponent()` used same-function, and a
+1. **DONE (fallback path, not the sound-extension path) — The effect
+   system's known indirect-propagation gap.** Today, effect tracking
+   through a component instance is precise for two syntactically provable
+   cases (`let s = SomeComponent()` used same-function, and a
    component-typed parameter) but not when the instance arrives through a
    record field, a generic wrapper, a match-bound pattern, or a
-   reassignment. Two possible directions, to be decided based on
-   investigation cost/benefit once started:
-   - Extend the existing effect-inference pass with a broader (but still
-     sound, still conservative) points-to approximation covering the
-     remaining cases, closing the gap for real; or
-   - If a sound extension proves too invasive for this stage, at minimum:
-     tighten the documentation of exactly which patterns are unproven (already
-     partially done), add explicit test coverage pinning the CURRENT
-     boundary so a future change can't silently widen the gap further
-     un-noticed, and evaluate whether a conservative "unknown effect,
-     assume the worst" fallback is viable without breaking too much
-     existing code.
+   reassignment. Investigated both candidate directions this iteration:
+   - A real, sound points-to extension covering the remaining cases was
+     considered but NOT attempted: this pass runs on syntactic shape alone
+     (no cross-function/field-level type information at this stage), so
+     closing the gap for real needs either deeper integration with
+     `check.rs`'s own type-checking results or a genuine points-to
+     analysis — real, substantial new type-system machinery with its own
+     soundness-bug risk, not a small extension. Deferred as a separately-
+     scoped future effort rather than rushed.
+   - The "unknown effect, assume the worst" fallback was evaluated and
+     **rejected**: forcing every unresolved method call (record field,
+     generic wrapper, returned value, etc.) to require the broadest
+     declared effect would flag a large fraction of ordinary, CORRECT
+     component-oriented code that happens to route through one of these
+     common patterns — this is the exact false-positive regression the
+     original design (`effects.rs`'s own PR-it707) already rejected once;
+     re-adopting it now would be a real usability regression for a
+     soundness property this project doesn't yet have the type-system
+     machinery to provide precisely.
+   - What DID land: two residual gaps named in `effects.rs`'s own doc
+     comment (a component stored in a record field/prop, and a component
+     returned from another function) had no dedicated regression test
+     pinning them — both now do
+     (`a_component_instance_stored_in_a_record_field_is_not_tracked_but_does_not_crash`,
+     `a_component_instance_returned_from_another_function_is_not_tracked_but_does_not_crash`),
+     joining the reassignment/generic-wrapper/match-arm-shadow tests that
+     already existed. Every named residual shape in the doc comment now
+     has an executable pin. `docs/PRODUCTION.md`'s "Known gap" section
+     updated to point at this.
 2. **An opt-in OS-level sandbox wrapper** (`kupl run --sandbox`) —
    directly answers `docs/PRODUCTION.md`'s own "not a sandbox" caveat with
    something concrete rather than just a warning. Scope: restrict

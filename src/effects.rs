@@ -1861,6 +1861,53 @@ mod tests {
         );
     }
 
+    /// A component instance stored in a RECORD FIELD (as opposed to a bare
+    /// local/parameter) is correctly, safely NOT tracked -- production-
+    /// hardening, 0.3.0 security-hardening milestone, item 1: this pass has
+    /// no field-level points-to information, so `h.bot.ask()` is
+    /// unresolved regardless of `h`'s own declared type naming `Bot`
+    /// precisely. Named explicitly as a residual gap in this module's own
+    /// top-of-file doc comment and `docs/PRODUCTION.md`'s "Known gap"
+    /// callout since PR-it1129/PR-it1130 -- this test is what PINS that
+    /// gap with an executable regression, so a future change can't
+    /// silently widen (or accidentally narrow, which would be a welcome
+    /// but currently unverified improvement) it without this test noticing.
+    #[test]
+    fn a_component_instance_stored_in_a_record_field_is_not_tracked_but_does_not_crash() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             type Holder = { bot: Bot }\n\
+             pub fun record_field_case(h: Holder) {\n    h.bot.ask()\n}\n",
+        );
+        assert!(
+            !d.iter().any(|d| d.code == "K0301"),
+            "documents the residual, deliberately-conservative gap for a component stored in a record field: {d:?}"
+        );
+    }
+
+    /// A component instance RETURNED FROM ANOTHER FUNCTION (as opposed to
+    /// constructed directly at the `let`'s own initializer) is correctly,
+    /// safely NOT tracked -- same rationale as the record-field case just
+    /// above: `local_component_bindings`'s `Let` handling only recognizes
+    /// `ComponentName(...)` as the callee, never an arbitrary function that
+    /// merely RETURNS a component-typed value, since that would need this
+    /// pass to know `make_bot`'s own return type (real cross-function type
+    /// information this syntactic pass deliberately doesn't have). Pins
+    /// the gap exactly as named in this module's own top-of-file doc
+    /// comment ("returned from another function").
+    #[test]
+    fn a_component_instance_returned_from_another_function_is_not_tracked_but_does_not_crash() {
+        let d = diags_for(
+            "component Bot {\n    intent \"io\"\n    expose fun ask() uses io {\n        print(\"x\")\n    }\n}\n\
+             fun make_bot() -> Bot {\n    Bot()\n}\n\
+             pub fun returned_case() {\n    let b = make_bot()\n    b.ask()\n}\n",
+        );
+        assert!(
+            !d.iter().any(|d| d.code == "K0301"),
+            "documents the residual, deliberately-conservative gap for a component returned from another function: {d:?}"
+        );
+    }
+
     #[test]
     fn unused_effect_warns() {
         let d = diags_for("pub fun quiet() uses io -> Int {\n    42\n}\n");

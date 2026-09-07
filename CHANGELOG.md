@@ -36,6 +36,21 @@ change and the release process.
   permissions on Unix, instead of the OS default (typically world/group-
   readable).
 
+### Docs
+- Expanded fuzz/property test coverage on `aead.rs` (ChaCha20-Poly1305
+  round-trip, tamper-detection, and key/nonce avalanche across hundreds of
+  random cases) and `guards.rs` (K1010's cross-protocol guard collision
+  detector, checked against an independent ground truth across random
+  protocol sets and orderings).
+- Pinned the effect system's remaining known indirect-propagation gaps
+  (component instance stored in a record field/prop, and one returned
+  from another function) with dedicated regression tests in `effects.rs`
+  — every shape named in that module's own doc comment now has an
+  executable test locking in the current, documented boundary.
+  `docs/PRODUCTION.md`'s "Known gap" section and `docs/ROADMAP.md`
+  updated with the evaluation of (and reasons for rejecting, for now) a
+  sound points-to extension and an "assume the worst" fallback.
+
 ## [0.2.0] - 2026-09-06
 
 Cross-platform reliability release — real, CI-verified support for

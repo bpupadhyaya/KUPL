@@ -90,6 +90,14 @@ component-constructing code to over-declare effects it may not have. It does **n
 weaken the threat model below — the effect system was never a runtime sandbox — but it
 does mean an *absence* of a `uses` declaration is not proof a function performs no side
 effects when component instances are involved in one of these remaining indirect ways.
+**As of the 0.3.0 security-hardening self-review**: every remaining case named above
+(record field/prop, returned from another function, generic-wrapped, reassigned,
+match-arm-bound) now has a dedicated regression test in `effects.rs`'s own test module
+asserting the CURRENT boundary exactly — a future change that accidentally widens (or
+narrows) this gap will fail one of those tests, rather than drifting unnoticed. A sound
+extension closing these cases for real (a real points-to pass, not this syntactic
+scan) remains a larger, separately-scoped future effort, not attempted here — see
+`docs/ROADMAP.md`'s own 0.3.0 section for the two candidate directions considered.
 
 ### Threat model — read this before running untrusted code
 
