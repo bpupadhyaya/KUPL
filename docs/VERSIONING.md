@@ -49,7 +49,7 @@ This policy covers everything a KUPL user or tool depends on:
 
 ## Pre-1.0 Caveat
 
-While KUPL is `0.x` (currently `0.2.0` — see "Path to `1.0.0` Stable"
+While KUPL is `0.x` (currently `0.3.0` — see "Path to `1.0.0` Stable"
 below for exactly what's left), breaking changes may still ship in a
 version bump smaller than a hypothetical future `MAJOR`. This policy's
 breaking/non-breaking distinction still applies for changelog purposes (see

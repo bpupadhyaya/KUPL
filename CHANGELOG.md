@@ -7,6 +7,13 @@ change and the release process.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-06
+
+Security-hardening release — an opt-in OS-level sandbox, three real security
+bugs found and fixed via an internal self-review, expanded fuzz coverage on
+the newest cryptographic/security surfaces, and the effect system's
+remaining known gaps pinned with regression tests.
+
 ### Added
 - `kupl run <file.kupl> --sandbox` (macOS only): opt-in OS-level confinement
   via `sandbox-exec` — denies network access and confines filesystem writes

@@ -112,15 +112,15 @@ No Rust toolchain needed. Grab the archive for your platform from the
 
 ```sh
 # macOS / Linux
-tar xzf kupl-0.2.0-<platform>.tar.gz
-sudo mv kupl-0.2.0-<platform>/kupl /usr/local/bin/   # or anywhere already on your PATH
-kupl version                                          # -> kupl 0.2.0
+tar xzf kupl-0.3.0-<platform>.tar.gz
+sudo mv kupl-0.3.0-<platform>/kupl /usr/local/bin/   # or anywhere already on your PATH
+kupl version                                          # -> kupl 0.3.0
 ```
 
 ```powershell
 # Windows (PowerShell)
-Expand-Archive kupl-0.2.0-x86_64-pc-windows-msvc.zip
-.\kupl-0.2.0-x86_64-pc-windows-msvc\kupl.exe version   # -> kupl 0.2.0
+Expand-Archive kupl-0.3.0-x86_64-pc-windows-msvc.zip
+.\kupl-0.3.0-x86_64-pc-windows-msvc\kupl.exe version   # -> kupl 0.3.0
 ```
 
 Published: `aarch64-apple-darwin` (macOS/Apple Silicon),
@@ -136,7 +136,7 @@ above; the toolchain is a single dependency-free Rust crate.
 ### Verify
 
 ```sh
-kupl version                 # -> kupl 0.2.0
+kupl version                 # -> kupl 0.3.0
 kupl run examples/counter.kupl
 cargo test                   # ~1,980 tests, includes interpreter-vs-VM differential suite
 ```
@@ -397,15 +397,16 @@ language, every example verified against the toolchain).
 
 ## Status & roadmap
 
-**v0.2.0** (pre-1.0, following semver's own `0.x` = "anything may still
+**v0.3.0** (pre-1.0, following semver's own `0.x` = "anything may still
 change" convention — see `docs/VERSIONING.md`): the founding vision is
-implemented end to end — ~130,000 lines of dependency-free Rust, ~1,980
+implemented end to end — ~130,000 lines of dependency-free Rust, ~2,000
 tests, all engines differentially verified. The package registry (`kupl
 pkg tree/lock/fetch`), LSP hover/completion, the full `agent`/`protocol`/
 `guard` system (all three `weight` classes, `durable` state persistence,
-`deterministic`), and production infrastructure (CI, `SECURITY.md`,
-resource limits, crypto/logging stdlib) are already implemented, and
-real installable releases now cover macOS, Linux, and Windows — see
+`deterministic`), an opt-in OS-level sandbox (`kupl run --sandbox`,
+macOS), and production infrastructure (CI, `SECURITY.md`, resource
+limits, crypto/logging stdlib) are already implemented, and real
+installable releases now cover macOS, Linux, and Windows — see
 `docs/PRODUCTION.md` for the honest list of what's still incomplete, and
 `docs/VERSIONING.md`'s "Path to 1.0.0 Stable" for exactly what's left
 before a real compatibility guarantee begins. See
