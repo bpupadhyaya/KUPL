@@ -1,0 +1,112 @@
+name: Release artifacts
+
+# Builds real, native release binaries on each platform's own GitHub-hosted
+# runner (never local cross-compilation from a single dev machine, which
+# can't be verified without a real target-platform environment to run the
+# result on). Deliberately does NOT run the full test suite -- that's
+# CI's job (.github/workflows/ci.yml), which gates every push already;
+# this workflow exists to produce artifacts once a release is ready to
+# cut, not to re-prove correctness a second time.
+#
+# Triggers:
+#   - push of a `v*` tag (e.g. `v0.2.0`) -- fully automatic for a real
+#     tagged release.
+#   - workflow_dispatch -- manual run against any ref, useful for
+#     producing artifacts before a tag exists yet, or re-running after a
+#     transient runner failure without needing a new tag.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag, or commit SHA)"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --locked --verbose
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: echo "version=$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)" >> "$GITHUB_OUTPUT"
+
+      # Smoke test -- the release binary must at least run and report its
+      # own version correctly before it's packaged as a downloadable
+      # artifact. Not a substitute for CI's own full suite, just a floor:
+      # never publish an artifact that can't even start.
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          ./target/release/kupl version
+          ./target/release/kupl run examples/counter.kupl
+
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./target/release/kupl.exe version
+          ./target/release/kupl.exe run examples/counter.kupl
+
+      - name: Package (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
+        run: |
+          set -e
+          name="kupl-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp target/release/kupl "dist/$name/"
+          cp README.md LICENSE "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - name: Package (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        run: |
+          $name = "kupl-${{ steps.version.outputs.version }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Path "dist/$name" -Force | Out-Null
+          Copy-Item target/release/kupl.exe "dist/$name/"
+          Copy-Item README.md, LICENSE "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          (Get-FileHash "dist/$name.zip" -Algorithm SHA256).Hash.ToLower() + "  $name.zip" | Out-File -Encoding ascii "dist/$name.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kupl-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          if-no-files-found: error
