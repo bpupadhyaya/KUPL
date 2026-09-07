@@ -4079,6 +4079,22 @@ mod tests {
                 format!("{expected}\n"),
                 "run #{expected}: durable state must accumulate on the NODE across separate client invocations: {out:?}"
             );
+            // A REAL flake found live (0.2.0 cross-platform arc, on a
+            // shared macos-latest CI runner running 3 concurrent OS-level
+            // jobs): the client's own disconnect (a dropped TCP stream)
+            // and the SERVER's own async on-disconnect `stop_all` (which
+            // is what actually persists durable state to disk,
+            // `serve_distributed_connection`'s own "no second-pass wait
+            // for confirmation" v1 simplification, `docs/design/
+            // DISTRIBUTION.md`) are not synchronized -- the very next
+            // client can connect and load state before the PREVIOUS
+            // client's own save has landed on disk. Normally far too fast
+            // to notice on an unloaded machine; widened enough to lose
+            // the race under real CI contention. A brief pause here
+            // (never the fix for the underlying protocol gap, just this
+            // test's own false-flake margin) gives the prior save time to
+            // complete before the next connection arrives.
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
 
         let _ = node.kill();
