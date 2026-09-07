@@ -24,14 +24,20 @@ otherwise:
 
 ---
 
-## 0.2.0 — Cross-platform reliability
+## 0.2.0 — Cross-platform reliability — **RELEASED 2026-09-06**
 
 **Theme:** KUPL builds, tests green, and ships an installable artifact on
 all three major desktop platforms — not just macOS.
 
-**Status:** in progress. Real, previously-undiscovered bugs found and fixed
-this cycle, each confirmed live via actually running CI on a platform this
-project had never tested before (or had never checked the results of):
+**Tag:** `v0.2.0` (branch `release/0.2.0`) —
+github.com/bpupadhyaya/KUPL/releases/tag/v0.2.0. One item (Linux CI's
+own billing/quota block, item 1 below) is still genuinely open and not
+retired by this release — see the "DONE" note further down for how the
+release itself worked around it without waiting on it.
+
+Real, previously-undiscovered bugs found and fixed this cycle, each
+confirmed live via actually running CI on a platform this project had
+never tested before (or had never checked the results of):
 
 - `kupl native`'s generated C code was never linked against `libm`, so
   every native compile failed on Linux from the day CI was first added
@@ -96,20 +102,29 @@ separate, bigger item).
 2. **Confirm Linux CI is genuinely green** once the above is resolved (a
    clean, uninterrupted run — every failure seen on Linux so far has
    either been the now-fixed `libm` bug or this external kill, never a
-   hang or a genuine remaining test failure).
-3. **Build and publish real artifacts.** Once Linux is confirmed green,
-   use their own GitHub-hosted runners (not local cross-compilation, which
-   isn't verifiable from this macOS dev machine — no Docker/mingw/musl
-   cross-toolchain available locally) to produce real
-   `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc` binaries.
-   Attach to a `v0.2.0` release alongside the existing macOS artifact. The
-   Windows artifact ships with the honest caveat that `kupl native`/
-   `kupl bundle` don't work there yet (see above) — `kupl run`,
-   `kupl run --vm`, `kupl check`, `kupl build`, `kupl fmt`, `kupl test`,
-   etc. are unaffected.
-4. **Update install docs** — remove the "only macOS published" caveat from
-   the README once Linux/Windows artifacts exist, and add the Windows
-   `kupl native` caveat there too.
+   hang or a genuine remaining test failure). Still open — the billing
+   check is the user's own action, not something this release could wait
+   on indefinitely (see "**DONE**" note below for how this was worked
+   around for the release itself).
+
+**DONE, 2026-09-06 — `v0.2.0` shipped.** Rather than block the whole
+release on the `ubuntu-latest` full-test-suite billing question (item 1,
+still open), added `.github/workflows/release.yml`: a SEPARATE,
+lightweight workflow that just runs `cargo build --release` + a smoke
+test (`kupl version`, run a real example) on each platform's own native
+runner — no full test suite, so it isn't exposed to the same
+long-running-job quota constraint. All three platforms
+(`aarch64-apple-darwin`, `x86_64-unknown-linux-gnu`,
+`x86_64-pc-windows-msvc`) built and smoke-tested cleanly on the very
+first run. Tagged `v0.2.0` (branch `release/0.2.0`), published at
+github.com/bpupadhyaya/KUPL/releases/tag/v0.2.0 with all three
+binaries + `SHA256SUMS`. This does NOT retire item 1 above — the full
+Linux test suite still needs to actually finish clean at some point,
+just not as a release blocker anymore now that a real, verified Linux
+binary exists via a path unaffected by the billing question.
+4. **Update install docs** — DONE. README's Option C now covers all
+   three platforms with platform-specific install snippets and the
+   Windows `kupl native` caveat stated inline.
 
 **Explicitly out of scope for 0.2.0** (a separate, future item, not a
 release blocker): making `kupl native`'s C runtime genuinely portable to
