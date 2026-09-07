@@ -363,4 +363,166 @@ mod tests {
         let out_b = encrypt(&key, &[2u8; 12], b"", b"same plaintext, same key");
         assert_ne!(out_a, out_b);
     }
+
+    // -- Fuzz coverage (production-hardening, 0.3.0 security-hardening
+    // milestone) -----------------------------------------------------------
+    //
+    // The tests above pin the RFC vectors and a handful of hand-picked
+    // edge cases. The tests below extend coverage with many pseudo-random
+    // key/nonce/aad/plaintext combinations, seeded deterministically (same
+    // rationale as `prop.rs`'s own generator: reproducible across every
+    // machine and every run, not flaky, no external `proptest`/`quickcheck`
+    // dependency needed for a project that otherwise has zero dependencies).
+
+    /// Minimal xorshift64* PRNG, deliberately NOT shared with `prop.rs`'s
+    /// own `Rng` (that one generates KUPL `Value`s from a `TyExpr` and its
+    /// step methods are private to that module) -- this one only needs
+    /// bytes and bounded integers.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            FuzzRng(if seed == 0 { 0xdead_beef } else { seed })
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next_u64() % n as u64) as usize
+            }
+        }
+        fn bytes(&mut self, len: usize) -> Vec<u8> {
+            (0..len).map(|_| (self.next_u64() & 0xff) as u8).collect()
+        }
+        fn key(&mut self) -> [u8; 32] {
+            self.bytes(32).try_into().unwrap()
+        }
+        fn nonce(&mut self) -> [u8; 12] {
+            self.bytes(12).try_into().unwrap()
+        }
+    }
+
+    /// 500 pseudo-random (key, nonce, aad, plaintext) combinations, every
+    /// length from 0 to 300 bytes for both aad and plaintext -- crosses many
+    /// more block-boundary and padding-length combinations than the
+    /// hand-picked list above. Every single one must round-trip exactly.
+    #[test]
+    fn fuzz_round_trip_holds_across_many_random_inputs_and_lengths() {
+        let mut rng = FuzzRng::new(1);
+        for i in 0..500 {
+            let key = rng.key();
+            let nonce = rng.nonce();
+            let aad_len = rng.below(301);
+            let aad = rng.bytes(aad_len);
+            let pt_len = rng.below(301);
+            let plaintext = rng.bytes(pt_len);
+            let out = encrypt(&key, &nonce, &aad, &plaintext);
+            assert_eq!(out.len(), plaintext.len() + 16, "case {i}: ciphertext length");
+            let decrypted = decrypt(&key, &nonce, &aad, &out)
+                .unwrap_or_else(|e| panic!("case {i}: must decrypt cleanly, got {e}"));
+            assert_eq!(decrypted, plaintext, "case {i}: round trip mismatch");
+        }
+    }
+
+    /// For 300 random encryptions, flip exactly one random bit somewhere in
+    /// `ciphertext || tag` and confirm decryption is rejected every single
+    /// time -- not just for the one hand-picked byte position the earlier
+    /// test above covers. A single bit anywhere (ciphertext body OR tag)
+    /// must invalidate the whole message.
+    #[test]
+    fn fuzz_any_single_flipped_bit_in_ciphertext_or_tag_is_always_rejected() {
+        let mut rng = FuzzRng::new(2);
+        for i in 0..300 {
+            let key = rng.key();
+            let nonce = rng.nonce();
+            let aad_len = rng.below(64);
+            let aad = rng.bytes(aad_len);
+            // At least 1 byte so there's always a body byte to flip, in
+            // addition to the 16 tag bytes.
+            let pt_len = 1 + rng.below(64);
+            let plaintext = rng.bytes(pt_len);
+            let mut out = encrypt(&key, &nonce, &aad, &plaintext);
+            let bit_pos = rng.below(out.len() * 8);
+            out[bit_pos / 8] ^= 1 << (bit_pos % 8);
+            assert!(
+                decrypt(&key, &nonce, &aad, &out).is_err(),
+                "case {i}: a single flipped bit at byte {} (of {}) must be rejected",
+                bit_pos / 8,
+                out.len()
+            );
+        }
+    }
+
+    /// For 200 random encryptions with non-empty AAD, flip one random bit
+    /// somewhere in the AAD (ciphertext+tag untouched) and confirm rejection
+    /// every time -- generalizes the single hand-picked `tampered_aad_is_rejected`
+    /// case above across many AAD lengths and bit positions.
+    #[test]
+    fn fuzz_any_single_flipped_bit_in_aad_is_always_rejected() {
+        let mut rng = FuzzRng::new(3);
+        let mut i = 0;
+        while i < 200 {
+            let key = rng.key();
+            let nonce = rng.nonce();
+            let aad_len = 1 + rng.below(64);
+            let aad = rng.bytes(aad_len);
+            let pt_len = rng.below(64);
+            let plaintext = rng.bytes(pt_len);
+            let out = encrypt(&key, &nonce, &aad, &plaintext);
+            let mut tampered_aad = aad.clone();
+            let bit_pos = rng.below(aad_len * 8);
+            tampered_aad[bit_pos / 8] ^= 1 << (bit_pos % 8);
+            assert!(
+                decrypt(&key, &nonce, &tampered_aad, &out).is_err(),
+                "case {i}: a single flipped AAD bit must be rejected"
+            );
+            i += 1;
+        }
+    }
+
+    /// For 200 random (key, nonce, plaintext) triples, changing EITHER the
+    /// key or the nonce by a single bit (keeping the other fixed) must
+    /// produce a completely different ciphertext -- the avalanche property a
+    /// stream cipher's keystream depends on. A weak avalanche would mean
+    /// related keys/nonces leak information about each other's ciphertexts.
+    #[test]
+    fn fuzz_flipping_one_bit_of_key_or_nonce_changes_the_ciphertext_substantially() {
+        let mut rng = FuzzRng::new(4);
+        for i in 0..200 {
+            let key = rng.key();
+            let nonce = rng.nonce();
+            let pt_len = 32 + rng.below(64);
+            let plaintext = rng.bytes(pt_len);
+            let baseline = encrypt(&key, &nonce, b"aad", &plaintext);
+
+            let mut key2 = key;
+            key2[rng.below(32)] ^= 1 << rng.below(8);
+            let out_key_flip = encrypt(&key2, &nonce, b"aad", &plaintext);
+            let differing_bytes =
+                baseline.iter().zip(out_key_flip.iter()).filter(|(a, b)| a != b).count();
+            assert!(
+                differing_bytes > baseline.len() / 4,
+                "case {i}: a 1-bit key change only changed {differing_bytes}/{} ciphertext bytes",
+                baseline.len()
+            );
+
+            let mut nonce2 = nonce;
+            nonce2[rng.below(12)] ^= 1 << rng.below(8);
+            let out_nonce_flip = encrypt(&key, &nonce2, b"aad", &plaintext);
+            let differing_bytes =
+                baseline.iter().zip(out_nonce_flip.iter()).filter(|(a, b)| a != b).count();
+            assert!(
+                differing_bytes > baseline.len() / 4,
+                "case {i}: a 1-bit nonce change only changed {differing_bytes}/{} ciphertext bytes",
+                baseline.len()
+            );
+        }
+    }
 }

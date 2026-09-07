@@ -635,4 +635,120 @@ mod tests {
         let src = "protocol A {\n    intent \"a\"\n    guard Approve: Int {\n        expect result > 0\n    }\n}\nagent Ag follows A {\n    intent \"a single followed protocol\"\n    expose fun go(x: Int) -> Int guards Approve {\n        x\n    }\n}\n";
         assert!(crate::run::compile(src).is_ok(), "a single followed protocol must never self-collide");
     }
+
+    // -- Fuzz coverage for K1010's collision detector (production-hardening,
+    // 0.3.0 security-hardening milestone) -----------------------------------
+    //
+    // The hand-picked tests above cover exactly 1-2 protocols with a fixed
+    // `follows` order. This fuzzes the general case the loop in the real
+    // collision-detection site (this module, ~line 113) is meant to handle:
+    // an arbitrary number of followed protocols, an arbitrary overlapping
+    // set of guard names across them, in an arbitrary `follows` order --
+    // and asserts the result matches an independently-computed ground truth
+    // (any guard name declared by >= 2 DISTINCT followed protocols) rather
+    // than re-deriving the same HashMap logic under test.
+
+    /// Same minimal xorshift64* PRNG as `aead.rs`'s own fuzz tests --
+    /// deterministic, no external dependency, not shared as a `pub` item
+    /// since this project keeps fuzz-only helpers local to their module.
+    struct FuzzRng(u64);
+    impl FuzzRng {
+        fn new(seed: u64) -> Self {
+            FuzzRng(if seed == 0 { 0xdead_beef } else { seed })
+        }
+        fn next_u64(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            if n == 0 {
+                0
+            } else {
+                (self.next_u64() % n as u64) as usize
+            }
+        }
+    }
+
+    /// Fisher-Yates shuffle driven by `FuzzRng`, so the SAME guard-name
+    /// assignment can be tried under many different `follows` orderings --
+    /// the collision result must be a property of the SET of declarations,
+    /// never of the order they're listed or discovered in.
+    fn shuffled(mut items: Vec<usize>, rng: &mut FuzzRng) -> Vec<usize> {
+        for i in (1..items.len()).rev() {
+            let j = rng.below(i + 1);
+            items.swap(i, j);
+        }
+        items
+    }
+
+    #[test]
+    fn fuzz_k1010_collision_detection_matches_an_independent_ground_truth_across_random_protocol_sets() {
+        const GUARD_NAMES: [&str; 5] = ["GuardA", "GuardB", "GuardC", "GuardD", "GuardE"];
+        let mut rng = FuzzRng::new(1);
+        for case in 0..300 {
+            let n_protocols = 2 + rng.below(4); // 2..=5 protocols
+            // For each protocol, a random non-empty subset of GUARD_NAMES.
+            let mut protocol_guards: Vec<Vec<usize>> = Vec::with_capacity(n_protocols);
+            for _ in 0..n_protocols {
+                let mut names: Vec<usize> = (0..GUARD_NAMES.len()).collect();
+                names = shuffled(names, &mut rng);
+                let take = 1 + rng.below(GUARD_NAMES.len()); // 1..=5 guards
+                names.truncate(take);
+                protocol_guards.push(names);
+            }
+
+            // Ground truth: a guard-name index collides iff it's declared by
+            // strictly more than one of the n_protocols index positions
+            // above (computed directly from the generated data, independent
+            // of any code in this module).
+            let mut declared_by: HashMap<usize, usize> = HashMap::new();
+            for guards in &protocol_guards {
+                for &g in guards {
+                    *declared_by.entry(g).or_insert(0) += 1;
+                }
+            }
+            let expect_collision = declared_by.values().any(|&count| count > 1);
+
+            // Build the KUPL source: one `protocol` per entry, an agent
+            // following all of them in a RANDOMIZED order (order must not
+            // affect the outcome).
+            let mut src = String::new();
+            let mut protocol_order: Vec<usize> = (0..n_protocols).collect();
+            protocol_order = shuffled(protocol_order, &mut rng);
+            for (idx, guards) in protocol_guards.iter().enumerate() {
+                src.push_str(&format!("protocol Proto{idx} {{\n    intent \"p{idx}\"\n"));
+                for &g in guards {
+                    src.push_str(&format!(
+                        "    guard {}: Int {{\n        expect result > 0\n    }}\n",
+                        GUARD_NAMES[g]
+                    ));
+                }
+                src.push_str("}\n");
+            }
+            let follows_list =
+                protocol_order.iter().map(|&idx| format!("Proto{idx}")).collect::<Vec<_>>().join(", ");
+            src.push_str(&format!(
+                "agent Ag follows {follows_list} {{\n    intent \"fuzz\"\n    expose fun go(x: Int) -> Int {{\n        x\n    }}\n}}\n"
+            ));
+
+            let result = crate::run::compile(&src);
+            match (expect_collision, result) {
+                (true, Ok(_)) => panic!(
+                    "case {case}: expected a K1010 collision but compile succeeded\nsource:\n{src}"
+                ),
+                (true, Err(diags)) => assert!(
+                    diags.iter().any(|d| d.code == "K1010"),
+                    "case {case}: expected K1010 among diags, got {diags:?}\nsource:\n{src}"
+                ),
+                (false, Err(diags)) => panic!(
+                    "case {case}: expected a clean compile (no cross-protocol guard-name collision) but got {diags:?}\nsource:\n{src}"
+                ),
+                (false, Ok(_)) => {}
+            }
+        }
+    }
 }
