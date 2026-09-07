@@ -69,25 +69,35 @@ project had never tested before (or had never checked the results of):
   release. The interpreter, `kupl run --vm`, and `.kx` bytecode are
   unaffected (pure Rust, no C codegen) and confirmed working on Windows.
 
+**Status update:** `windows-latest` CI is now GREEN (confirmed live,
+commit `a14dfd0`) — the full journey was 388 real/spurious failures →
+10 → 1 → 0, each step a genuine bug found and fixed (see the list
+above), ending with a test-timeout margin widened for a slower CI
+tier. `macos-latest` also surfaced one genuine, pre-existing timing
+flake under real 3-job CI contention (a `weight distributed` + `durable`
+race already named in `docs/design/DISTRIBUTION.md`'s own "no
+second-pass wait for confirmation" v1 simplification) — hardened with
+a test-side delay in commit `6f2a186`, not a protocol fix (that's a
+separate, bigger item).
+
 **Remaining work:**
 1. **Resolve the GitHub Actions billing/quota situation.** Repeated CI
-   runs on `ubuntu-latest` — now confirmed across four separate attempts,
-   including after the `libm` fix — get killed externally (exit 143,
-   "runner has received a shutdown signal") at a suspiciously consistent
-   ~8m33s-8m59s mark, always at roughly the same point in test
-   progression, while `macos-latest` in the same run completes cleanly.
-   Working theory: the account's Actions-minutes quota (macOS runners
-   cost a 10x multiplier) is exhausted from weeks of failing/hanging CI
-   runs before this arc even started. Needs a check of
-   github.com/settings/billing — this is the one item in this whole
-   release that depends on the user, not on more code.
+   runs on `ubuntu-latest` — now confirmed across SIX separate attempts,
+   including after every real fix landed in this arc — get killed
+   externally (exit 143, "runner has received a shutdown signal") at a
+   consistent point in test progression, while `macos-latest`/
+   `windows-latest` in the same run complete (successfully, once their
+   own real bugs were fixed). Working theory unchanged: the account's
+   Actions-minutes quota (macOS runners cost a 10x multiplier) is
+   exhausted from weeks of failing/hanging CI runs before this arc even
+   started. Needs a check of github.com/settings/billing — this remains
+   the one item in this whole release that depends on the user, not on
+   more code. Every other platform is now confirmed clean.
 2. **Confirm Linux CI is genuinely green** once the above is resolved (a
    clean, uninterrupted run — every failure seen on Linux so far has
-   either been the now-fixed `libm`/error-message bugs, or this external
-   kill, never a hang or a genuine remaining test failure).
-3. **Confirm Windows CI is green** with the `cc_available()` fix in place
-   (native-codegen tests should now skip cleanly rather than fail).
-4. **Build and publish real artifacts.** Once both platforms are green,
+   either been the now-fixed `libm` bug or this external kill, never a
+   hang or a genuine remaining test failure).
+3. **Build and publish real artifacts.** Once Linux is confirmed green,
    use their own GitHub-hosted runners (not local cross-compilation, which
    isn't verifiable from this macOS dev machine — no Docker/mingw/musl
    cross-toolchain available locally) to produce real
@@ -97,7 +107,7 @@ project had never tested before (or had never checked the results of):
    `kupl bundle` don't work there yet (see above) — `kupl run`,
    `kupl run --vm`, `kupl check`, `kupl build`, `kupl fmt`, `kupl test`,
    etc. are unaffected.
-5. **Update install docs** — remove the "only macOS published" caveat from
+4. **Update install docs** — remove the "only macOS published" caveat from
    the README once Linux/Windows artifacts exist, and add the Windows
    `kupl native` caveat there too.
 
