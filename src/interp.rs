@@ -2543,12 +2543,12 @@ impl Interp {
                 )
             })?;
             let (token, addr) = crate::distribution::parse_node_env(&raw).map_err(|e| Self::panic_flow(e, span))?;
-            let mut stream = crate::distribution::connect_and_authenticate(&addr, &token)
+            let (mut stream, mut keys) = crate::distribution::connect_and_authenticate(&addr, &token)
                 .map_err(|e| Self::panic_flow(e, span))?;
             // Auth succeeded -- both sides now hold the confirmed-correct
-            // token, so every message from here (Spawn onward) is
-            // encrypted (`distribution.rs`'s own module doc comment).
-            let mut keys = crate::distribution::SessionKeys::derive(&token, true);
+            // token (and their own freshly-salted `SessionKeys`), so every
+            // message from here (Spawn onward) is encrypted
+            // (`distribution.rs`'s own module doc comment).
             crate::distribution::spawn_remote(&mut stream, &mut keys, &comp_name, portable_args)
                 .map_err(|e| Self::panic_flow(e, span))?;
             // Handshake complete -- `connect_and_authenticate`'s own
@@ -2883,21 +2883,27 @@ impl Interp {
         // never be mistaken for a stuck client.
         let _ = stream.set_read_timeout(Some(crate::distribution::AUTH_HANDSHAKE_TIMEOUT));
         let Ok(first) = crate::kser::read_value_frame(&mut stream) else { return };
-        let Ok(crate::distribution::DistMsg::Auth { token: got }) = crate::distribution::DistMsg::from_wire(first) else {
+        let Ok(crate::distribution::DistMsg::Auth { token: got, salt: client_salt }) =
+            crate::distribution::DistMsg::from_wire(first)
+        else {
             return;
         };
         if !crate::distribution::tokens_match(&got, token) {
             let _ = crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::AuthFailed.to_wire());
             return;
         }
-        if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::AuthOk.to_wire()).is_err() {
+        let server_salt = crate::distribution::gen_connection_salt();
+        if crate::kser::write_value_frame(&mut stream, &crate::distribution::DistMsg::AuthOk { salt: server_salt.clone() }.to_wire())
+            .is_err()
+        {
             return;
         }
         // Auth succeeded -- both sides now hold the confirmed-correct
-        // token, so every message from here on (Spawn onward) is
-        // encrypted (`distribution.rs`'s own module doc comment). Server
-        // is NOT the client, so its own outgoing key is `s2c`.
-        let mut keys = crate::distribution::SessionKeys::derive(token, false);
+        // token AND both freshly-generated salts, so every message from
+        // here on (Spawn onward) is encrypted (`distribution.rs`'s own
+        // module doc comment). Server is NOT the client, so its own
+        // outgoing key is `s2c`.
+        let mut keys = crate::distribution::SessionKeys::derive(token, false, &client_salt, &server_salt);
 
         let Ok(second) = crate::distribution::read_encrypted_msg(&mut stream, &mut keys) else { return };
         let crate::distribution::DistMsg::Spawn { comp_name, args } = second else {

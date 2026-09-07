@@ -27,6 +27,40 @@ use crate::value::IntW;
 /// data is ever rejected.
 pub const MAX_COLLECTION_LEN: u64 = 10_000_000;
 
+/// PRODUCTION-HARDENING (0.3.0 security-hardening milestone, an internal
+/// self-review finding): `read_value` recurses directly for every nested
+/// `List`/`Ctor`/`Map`/`Set`, with no depth limit of its own --
+/// `MAX_COLLECTION_LEN`/`MAX_FRAME_LEN` only bound one collection's WIDTH
+/// and a frame's total byte size, neither bounds nesting DEPTH. A `List`
+/// nested inside a `List` costs only ~2 bytes on the wire per level (one
+/// tag byte + a 1-byte varint length of 1), so a single `MAX_FRAME_LEN`
+/// (64 MiB) frame can encode tens of millions of nesting levels -- reached
+/// directly from `Interp::serve_distributed_connection`'s very FIRST frame
+/// read, before the shared-secret token is ever checked, on a fresh
+/// `std::thread::spawn` connection thread (the OS default ~2-8 MiB stack,
+/// not the interpreter's own oversized main-thread stack) -- so an
+/// unauthenticated network peer could crash the whole `kupl node` process
+/// with one crafted packet (a native stack overflow aborts the process,
+/// not just the offending thread). Same RATIONALE as `json::MAX_JSON_DEPTH`
+/// (500) / `cgen.rs`'s `K_MAX_JSON_DEPTH` / regex.rs's
+/// `MAX_GROUP_REPEAT_DEPTH` -- this project's already-established answer to
+/// "how deep can adversarial recursive input nest before a clean error
+/// beats an unbounded native stack" -- but deliberately a SMALLER value
+/// (150, not 500), empirically bisected rather than copied: `read_value`'s
+/// per-call stack frame is heavier than `json.rs`'s recursive-descent
+/// parser's (one ~19-arm tag match with sizeable per-arm locals, sized in
+/// an unoptimized debug build for the union of every arm, not just the one
+/// actually taken), and a direct live probe (build a `TAG_LIST`-nested
+/// buffer of a given depth, call the recursive decoder, and check whether
+/// the TEST PROCESS survives -- a stack overflow SIGABRTs the whole
+/// process, so this can only be measured from outside) confirmed a debug
+/// build overflows this specific recursion between depth 200 and 270 on
+/// the OS default thread stack size. 150 keeps a comfortable margin below
+/// that measured failure point rather than reusing `MAX_JSON_DEPTH`'s 500
+/// on the unverified assumption that the same number is safe for a
+/// differently-shaped recursive function.
+pub const MAX_VALUE_NESTING_DEPTH: usize = 150;
+
 const TAG_INT: u8 = 0;
 const TAG_SIZED_INT: u8 = 1;
 const TAG_F32: u8 = 2;
@@ -299,6 +333,15 @@ fn read_fixed<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8], 
 }
 
 fn read_value(buf: &[u8], pos: &mut usize) -> Result<PortableValue, String> {
+    read_value_depth(buf, pos, 0)
+}
+
+fn read_value_depth(buf: &[u8], pos: &mut usize, depth: usize) -> Result<PortableValue, String> {
+    if depth > MAX_VALUE_NESTING_DEPTH {
+        return Err(format!(
+            "kser: value nested more than {MAX_VALUE_NESTING_DEPTH} levels deep -- rejected before recursing further"
+        ));
+    }
     let Some(&tag) = buf.get(*pos) else {
         return Err("kser: truncated value tag".to_string());
     };
@@ -354,7 +397,7 @@ fn read_value(buf: &[u8], pos: &mut usize) -> Result<PortableValue, String> {
             let len = read_len(buf, pos, MAX_COLLECTION_LEN)?;
             let mut items = Vec::with_capacity(len.min(1024));
             for _ in 0..len {
-                items.push(read_value(buf, pos)?);
+                items.push(read_value_depth(buf, pos, depth + 1)?);
             }
             Ok(PortableValue::List(items))
         }
@@ -364,7 +407,7 @@ fn read_value(buf: &[u8], pos: &mut usize) -> Result<PortableValue, String> {
             let len = read_len(buf, pos, MAX_COLLECTION_LEN)?;
             let mut fields = Vec::with_capacity(len.min(1024));
             for _ in 0..len {
-                fields.push(read_value(buf, pos)?);
+                fields.push(read_value_depth(buf, pos, depth + 1)?);
             }
             Ok(PortableValue::Ctor { ty, variant, fields })
         }
@@ -381,8 +424,8 @@ fn read_value(buf: &[u8], pos: &mut usize) -> Result<PortableValue, String> {
             let len = read_len(buf, pos, MAX_COLLECTION_LEN)?;
             let mut entries = Vec::with_capacity(len.min(1024));
             for _ in 0..len {
-                let k = read_value(buf, pos)?;
-                let val = read_value(buf, pos)?;
+                let k = read_value_depth(buf, pos, depth + 1)?;
+                let val = read_value_depth(buf, pos, depth + 1)?;
                 entries.push((k, val));
             }
             Ok(PortableValue::Map(entries))
@@ -391,7 +434,7 @@ fn read_value(buf: &[u8], pos: &mut usize) -> Result<PortableValue, String> {
             let len = read_len(buf, pos, MAX_COLLECTION_LEN)?;
             let mut items = Vec::with_capacity(len.min(1024));
             for _ in 0..len {
-                items.push(read_value(buf, pos)?);
+                items.push(read_value_depth(buf, pos, depth + 1)?);
             }
             Ok(PortableValue::Set(items))
         }
@@ -620,6 +663,54 @@ mod tests {
     fn an_unknown_tag_is_rejected_cleanly() {
         let buf = vec![255u8];
         assert!(from_bytes(&buf).is_err());
+    }
+
+    /// PRODUCTION-HARDENING (0.3.0 security-hardening milestone): a value
+    /// nested WAY past `MAX_VALUE_NESTING_DEPTH` must be rejected with a
+    /// clean `Err`, not a native stack overflow -- the exact shape an
+    /// unauthenticated network peer could send as the very first frame on a
+    /// `kupl node` connection (parsed before the token is ever checked, on
+    /// a thread with only the OS default stack size). Builds the wire bytes
+    /// directly (a `TAG_LIST` + a varint length of 1, repeated) rather than
+    /// via `to_bytes`/`PortableValue::List`, since constructing an
+    /// equally-deep VALUE in Rust would itself recurse on this test's own
+    /// stack -- the whole point being tested is that DECODING must not do
+    /// that, regardless of how the bytes were produced.
+    #[test]
+    fn a_value_nested_far_past_the_depth_cap_is_rejected_cleanly_not_a_stack_overflow() {
+        let mut buf = Vec::new();
+        for _ in 0..1_000_000 {
+            buf.push(TAG_LIST);
+            write_varint(&mut buf, 1); // "one child follows"
+        }
+        buf.push(TAG_UNIT); // the innermost value, never actually reached
+        let err = from_bytes(&buf).unwrap_err();
+        assert!(err.contains("nested"), "expected a nesting-depth error, got: {err}");
+    }
+
+    /// The cap must reject nesting deep enough to be dangerous while still
+    /// accepting the shallow, ordinary case -- confirms this isn't an
+    /// off-by-one that also rejects legitimate small-to-moderate nesting.
+    #[test]
+    fn nesting_within_the_depth_cap_still_round_trips() {
+        let depth = MAX_VALUE_NESTING_DEPTH - 1;
+        let mut buf = Vec::new();
+        for _ in 0..depth {
+            buf.push(TAG_LIST);
+            write_varint(&mut buf, 1);
+        }
+        buf.push(TAG_UNIT);
+        let v = from_bytes(&buf).expect("nesting just under the cap must decode cleanly");
+        // Walk back down to confirm it's genuinely the value encoded, not
+        // some other tolerant-but-wrong decode.
+        let mut cur = &v;
+        for _ in 0..depth {
+            match cur {
+                PortableValue::List(items) => cur = &items[0],
+                other => panic!("expected a List at this depth, got {other:?}"),
+            }
+        }
+        assert_eq!(*cur, PortableValue::Unit);
     }
 
     #[test]

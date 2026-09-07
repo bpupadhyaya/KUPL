@@ -181,3 +181,20 @@ Explicitly **not portable**:
   Phase 6+ is NOT retired by this update, it's narrowed to precisely
   that remaining gap. See `PRODUCTION.md`'s own "Known limitations" for
   the full, precise security posture.
+- **FIX, 2026-09-06 (0.3.0 security-hardening self-review) — key/nonce
+  reuse across connections closed.** The scheme described just above was a
+  PURE function of the token alone: every connection made with the same
+  token derived the identical keys with nonce counters restarting at 0,
+  so a passive observer of two such connections (an ordinary occurrence --
+  spawning more than one `weight distributed` actor, or ever reconnecting)
+  could XOR same-index ciphertexts to recover the XOR of the two
+  plaintexts, and Poly1305's repeated one-time key is a known forgery
+  condition. `Auth`/`AuthOk` now each carry a freshly-generated,
+  non-secret per-connection salt (`distribution::gen_connection_salt`);
+  `SessionKeys::derive` mixes BOTH exchanged salts into its SHA-256 input,
+  so every connection gets fresh keys regardless of how many share a
+  token. A companion fix in the same self-review pass: `kser::read_value`
+  (the frame decoder this whole handshake sits on top of) had no
+  recursion-depth limit and was reachable BEFORE the token check, letting
+  an unauthenticated peer crash the whole node with one deeply-nested
+  frame -- fixed with `kser::MAX_VALUE_NESTING_DEPTH`.

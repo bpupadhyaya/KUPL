@@ -41,6 +41,17 @@
 //!   one state file per agent type, not per dynamically-spawned instance
 //!   (mirrors `weight distributed`'s own "one connection hosts exactly
 //!   one actor" v1 narrowing).
+//! - **Symlink/TOCTOU hardening on the `.tmp` path.** `save`'s own doc
+//!   comment restricts the FINAL file to owner-only permissions on Unix,
+//!   but the `.tmp` path itself is fully predictable from `agent_name`
+//!   and `state_dir()` (itself overridable via an env var a deployment
+//!   might point at a shared/writable directory) and `std::fs::write`/
+//!   `rename` both follow symlinks -- a local attacker who can write into
+//!   the state directory AHEAD of a save could pre-plant a symlink there.
+//!   Not hardened against (would need `O_EXCL`/symlink-refusing opens),
+//!   named here rather than silently left unmentioned; the realistic
+//!   deployment (a project-local `.kupl/agent-state` directory, not a
+//!   shared multi-tenant path) narrows this considerably in practice.
 //!
 //! Reuses `kser`'s existing, already-tested binary encoding entirely —
 //! persisted state is just a `PortableValue::Map(field_name -> value)`,
@@ -120,6 +131,29 @@ pub fn save(agent_name: &str, state_fields: &[String], env: &Env) {
     if let Err(e) = std::fs::write(&tmp, &bytes) {
         eprintln!("kupl: warning: could not write {} for `durable agent {agent_name}`'s state: {e} -- not persisted", tmp.display());
         return;
+    }
+    // PRODUCTION-HARDENING (0.3.0 security-hardening milestone, an internal
+    // self-review finding): `std::fs::write` creates a file with default,
+    // umask-dependent permissions -- typically world/group-readable
+    // (`0644`) on Unix. A durable agent's own `state` fields are arbitrary
+    // KUPL data (whatever the program chose to keep in memory), so this
+    // file can hold anything from ordinary counters to something more
+    // sensitive; nothing here should assume it's always safe for other
+    // local users to read. Restricted to owner-only BEFORE the rename, so
+    // the file is never briefly world-readable at any point between
+    // creation and its final name. Best-effort: a failure here doesn't
+    // block the save (the write itself already succeeded), matching this
+    // function's existing "warn, don't abort the whole program" posture
+    // for every OTHER I/O failure in this same function.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "kupl: warning: could not restrict permissions on {} for `durable agent {agent_name}`'s state: {e}",
+                tmp.display()
+            );
+        }
     }
     if let Err(e) = std::fs::rename(&tmp, &path) {
         eprintln!("kupl: warning: could not finalize {} for `durable agent {agent_name}`'s state: {e} -- not persisted", path.display());
@@ -211,6 +245,32 @@ mod tests {
             let map: std::collections::HashMap<_, _> = loaded.into_iter().collect();
             assert!(matches!(map.get("count"), Some(Value::Int(42))));
             assert!(matches!(map.get("name"), Some(Value::Str(s)) if s.as_str() == "alice"));
+        });
+    }
+
+    /// PRODUCTION-HARDENING (0.3.0 security-hardening milestone, an
+    /// internal self-review finding): a saved state file must not be
+    /// readable/writable by anyone other than its owner -- `std::fs::write`
+    /// alone would leave it at the OS's default (typically world/group-
+    /// readable) permissions, since a durable agent's `state` fields are
+    /// arbitrary program data with no guarantee it's safe for other local
+    /// users to read.
+    #[test]
+    #[cfg(unix)]
+    fn saved_state_file_is_restricted_to_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        with_isolated_state_dir(|| {
+            let env = Env::new();
+            env.define("secret", Value::Int(1));
+            save("PermCheckAgent", &["secret".to_string()], &env);
+            let path = state_path("PermCheckAgent");
+            let mode = std::fs::metadata(&path).expect("state file must exist").permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o600,
+                "state file must be owner-read-write only, got mode {:o}",
+                mode & 0o777
+            );
         });
     }
 

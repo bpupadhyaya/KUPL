@@ -163,8 +163,13 @@ pub enum DistMsg {
     /// principle but always sent by the CLIENT first in practice: proves
     /// the sender knows the shared secret before the server does anything
     /// else on this connection.
-    Auth { token: String },
-    AuthOk,
+    Auth { token: String, salt: String },
+    /// `salt`: see `gen_connection_salt`'s own doc comment -- mixed into
+    /// `SessionKeys::derive` alongside the client's own `Auth.salt` so two
+    /// connections authenticated with the SAME token never derive the same
+    /// (key, nonce) sequence (production-hardening, 0.3.0 security-
+    /// hardening milestone, an internal self-review finding).
+    AuthOk { salt: String },
     /// The connection is closed immediately after this is sent -- there is
     /// no retry-with-a-different-token dance, matching how a rejected TLS
     /// handshake or a rejected SSH key both just end the connection.
@@ -261,8 +266,10 @@ fn result_from_wire(v: PortableValue) -> Result<Result<PortableValue, String>, S
 impl DistMsg {
     pub fn to_wire(&self) -> PortableValue {
         match self {
-            DistMsg::Auth { token } => ctor("Auth", vec![PortableValue::Str(token.clone())]),
-            DistMsg::AuthOk => ctor("AuthOk", vec![]),
+            DistMsg::Auth { token, salt } => {
+                ctor("Auth", vec![PortableValue::Str(token.clone()), PortableValue::Str(salt.clone())])
+            }
+            DistMsg::AuthOk { salt } => ctor("AuthOk", vec![PortableValue::Str(salt.clone())]),
             DistMsg::AuthFailed => ctor("AuthFailed", vec![]),
             DistMsg::Spawn { comp_name, args } => {
                 ctor("Spawn", vec![PortableValue::Str(comp_name.clone()), args_to_wire(args)])
@@ -295,11 +302,21 @@ impl DistMsg {
             return Err(format!("DistMsg: expected ty \"DistMsg\", got {ty:?}"));
         }
         match (variant.as_str(), fields.len()) {
-            ("Auth", 1) => match fields.pop().unwrap() {
-                PortableValue::Str(token) => Ok(DistMsg::Auth { token }),
-                other => Err(format!("DistMsg::Auth: expected Str, got {other:?}")),
+            ("Auth", 2) => {
+                let salt = match fields.pop().unwrap() {
+                    PortableValue::Str(s) => s,
+                    other => return Err(format!("DistMsg::Auth: expected Str for salt, got {other:?}")),
+                };
+                let token = match fields.pop().unwrap() {
+                    PortableValue::Str(s) => s,
+                    other => return Err(format!("DistMsg::Auth: expected Str for token, got {other:?}")),
+                };
+                Ok(DistMsg::Auth { token, salt })
+            }
+            ("AuthOk", 1) => match fields.pop().unwrap() {
+                PortableValue::Str(salt) => Ok(DistMsg::AuthOk { salt }),
+                other => Err(format!("DistMsg::AuthOk: expected Str for salt, got {other:?}")),
             },
-            ("AuthOk", 0) => Ok(DistMsg::AuthOk),
             ("AuthFailed", 0) => Ok(DistMsg::AuthFailed),
             ("Spawn", 2) => {
                 let args_v = fields.pop().unwrap();
@@ -380,6 +397,62 @@ pub fn tokens_match(a: &str, b: &str) -> bool {
     diff == 0
 }
 
+/// A per-connection value mixed into `SessionKeys::derive`'s key derivation
+/// so two different connections authenticated with the SAME shared token
+/// never derive the same (key, nonce) sequence (production-hardening,
+/// 0.3.0 security-hardening milestone, an internal self-review finding).
+/// Before this existed, `SessionKeys::derive` was a pure function of the
+/// token ALONE, with both nonce counters always starting at 0 -- so
+/// connection #2 (or a reconnect) under the same token replayed the exact
+/// same keystream as connection #1's own first N messages: a passive
+/// observer of two such connections could XOR same-index ciphertexts to
+/// recover the XOR of the two plaintexts (no token knowledge needed), and
+/// Poly1305's one-time key repeating across messages is the textbook
+/// nonce-reuse forgery condition -- a genuine confidentiality+integrity
+/// break, not a theoretical one, since spawning more than one `weight
+/// distributed` actor (or ever reconnecting) is completely ordinary usage.
+///
+/// This value does NOT need to be secret (it travels in the same
+/// plaintext `Auth`/`AuthOk` handshake the token's own presence/absence
+/// already does) -- it only needs to be UNIQUE per connection with
+/// overwhelming probability, which is a materially weaker requirement
+/// than cryptographic unpredictability. This project is zero-dependency
+/// throughout (no `getrandom`/OS-CSPRNG crate available), so uniqueness is
+/// obtained the same pragmatic way `agent_persist.rs`'s own test helpers
+/// already generate collision-free identifiers: mix wall-clock nanoseconds
+/// (changes every call), the OS process ID (disambiguates two `kupl`
+/// processes started in the same nanosecond), and a monotonic in-process
+/// counter (disambiguates two connections from the SAME process within
+/// the same nanosecond) through SHA-256 -- collision probability is
+/// astronomically low for this module's actual threat model (a shared-
+/// secret-authenticated deployment, not a fully adversarial protocol with
+/// no shared secret at all).
+pub fn gen_connection_salt() -> String {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mixed = format!("{nanos}:{}:{n}", std::process::id());
+    bytes_to_hex(&crate::encoding::sha256_raw(mixed.as_bytes()))
+}
+
+/// A minimal raw-bytes-to-hex encoder, deliberately NOT
+/// `encoding::hex_encode` -- that one takes an `&str` and hex-encodes ITS
+/// UTF-8 bytes (meant for encoding text), whereas `gen_connection_salt`
+/// needs to encode arbitrary SHA-256 OUTPUT bytes, which are essentially
+/// never valid UTF-8 on their own.
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xF) as usize] as char);
+    }
+    out
+}
+
 /// Per-connection ChaCha20-Poly1305 encryption state -- see this module's
 /// own top-of-file doc comment for the full security posture. Both keys
 /// are derivable by EITHER side from the shared token alone (no key
@@ -400,14 +473,39 @@ pub struct SessionKeys {
     recv_counter: u64,
 }
 
+/// Hand-written, NOT `#[derive(Debug)]` -- `send_key`/`recv_key` are live
+/// AEAD key material; a derived `Debug` would print the raw 32 bytes of
+/// each, which is exactly the kind of thing that ends up in a log line or
+/// an `unwrap()` panic message by accident. Only needed at all so
+/// `Result<(TcpStream, SessionKeys), String>::unwrap_err()` compiles in
+/// this module's own tests (the Ok side must be `Debug` even when a test
+/// only ever exercises the Err path).
+impl std::fmt::Debug for SessionKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionKeys")
+            .field("send_key", &"<redacted>")
+            .field("recv_key", &"<redacted>")
+            .field("send_counter", &self.send_counter)
+            .field("recv_counter", &self.recv_counter)
+            .finish()
+    }
+}
+
 impl SessionKeys {
     /// `is_client`: which of the two token-derived keys is this side's OWN
     /// "outgoing" key. The client sends with the `c2s`-derived key and
     /// reads with `s2c`; the server does the exact opposite -- both sides
     /// compute the SAME two keys, just assign send/recv oppositely.
-    pub fn derive(token: &str, is_client: bool) -> SessionKeys {
-        let c2s = crate::encoding::sha256_raw(format!("{token}:c2s").as_bytes());
-        let s2c = crate::encoding::sha256_raw(format!("{token}:s2c").as_bytes());
+    ///
+    /// `client_salt`/`server_salt`: the two per-connection salts exchanged
+    /// in the (still-plaintext) `Auth`/`AuthOk` handshake -- see
+    /// `gen_connection_salt`'s own doc comment for why these are required,
+    /// not optional. Both sides mix in BOTH salts (order fixed:
+    /// client-then-server) so a fresh key comes out of EVERY connection,
+    /// even two connections opened back-to-back with the identical token.
+    pub fn derive(token: &str, is_client: bool, client_salt: &str, server_salt: &str) -> SessionKeys {
+        let c2s = crate::encoding::sha256_raw(format!("{token}:c2s:{client_salt}:{server_salt}").as_bytes());
+        let s2c = crate::encoding::sha256_raw(format!("{token}:s2c:{client_salt}:{server_salt}").as_bytes());
         if is_client {
             SessionKeys { send_key: c2s, recv_key: s2c, send_counter: 0, recv_counter: 0 }
         } else {
@@ -465,12 +563,16 @@ pub fn read_encrypted_msg<R: std::io::Read>(r: &mut R, keys: &mut SessionKeys) -
 /// between `Deliver`/`Call` messages must never be bounded by this.
 pub const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Connect to a `kupl node` listener and complete the auth handshake.
-/// Pure transport -- no `Interp` dependency at all, which is exactly what
-/// makes this independently testable against a hand-rolled mock listener
-/// (see `tests` below) rather than needing a full actor runtime just to
-/// exercise the wire protocol.
-pub fn connect_and_authenticate(addr: &str, token: &str) -> Result<std::net::TcpStream, String> {
+/// Connect to a `kupl node` listener and complete the auth handshake,
+/// including the salt exchange `SessionKeys::derive` needs (see
+/// `gen_connection_salt`'s own doc comment) -- returns the connection ready
+/// for `write_encrypted_msg`/`read_encrypted_msg` from `Spawn` onward, keyed
+/// with BOTH sides' freshly-generated salts already mixed in. Pure
+/// transport -- no `Interp` dependency at all, which is exactly what makes
+/// this independently testable against a hand-rolled mock listener (see
+/// `tests` below) rather than needing a full actor runtime just to exercise
+/// the wire protocol.
+pub fn connect_and_authenticate(addr: &str, token: &str) -> Result<(std::net::TcpStream, SessionKeys), String> {
     use std::net::ToSocketAddrs;
     let socket_addr = addr
         .to_socket_addrs()
@@ -484,12 +586,16 @@ pub fn connect_and_authenticate(addr: &str, token: &str) -> Result<std::net::Tcp
     // the caller ever gets a usable `ActorRoute::Distributed` back) --
     // `connect_timeout` above only bounds the TCP-level connect itself.
     let _ = stream.set_read_timeout(Some(CONNECT_TIMEOUT));
-    crate::kser::write_value_frame(&mut stream, &DistMsg::Auth { token: token.to_string() }.to_wire())
+    let client_salt = gen_connection_salt();
+    crate::kser::write_value_frame(&mut stream, &DistMsg::Auth { token: token.to_string(), salt: client_salt.clone() }.to_wire())
         .map_err(|e| format!("distributed spawn: sending Auth to {addr} failed: {e}"))?;
     let reply = crate::kser::read_value_frame(&mut stream)
         .map_err(|e| format!("distributed spawn: reading Auth reply from {addr} failed: {e}"))?;
     match DistMsg::from_wire(reply)? {
-        DistMsg::AuthOk => Ok(stream),
+        DistMsg::AuthOk { salt: server_salt } => {
+            let keys = SessionKeys::derive(token, true, &client_salt, &server_salt);
+            Ok((stream, keys))
+        }
         DistMsg::AuthFailed => Err(format!("distributed spawn: {addr} rejected the shared-secret token")),
         other => Err(format!("distributed spawn: expected AuthOk/AuthFailed from {addr}, got {other:?}")),
     }
@@ -572,8 +678,8 @@ mod tests {
 
     #[test]
     fn every_variant_roundtrips_through_the_wire_shape() {
-        roundtrip(DistMsg::Auth { token: "secret-123".to_string() });
-        roundtrip(DistMsg::AuthOk);
+        roundtrip(DistMsg::Auth { token: "secret-123".to_string(), salt: "deadbeef".to_string() });
+        roundtrip(DistMsg::AuthOk { salt: "cafebabe".to_string() });
         roundtrip(DistMsg::AuthFailed);
         roundtrip(DistMsg::Spawn {
             comp_name: "Worker".to_string(),
@@ -717,8 +823,11 @@ mod tests {
     fn connect_and_authenticate_succeeds_with_the_right_token() {
         let addr = spawn_mock_server(|mut stream| {
             let req = crate::kser::read_value_frame(&mut stream).unwrap();
-            assert_eq!(DistMsg::from_wire(req).unwrap(), DistMsg::Auth { token: "right".to_string() });
-            crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
+            let crate::distribution::DistMsg::Auth { token, .. } = DistMsg::from_wire(req).unwrap() else {
+                panic!("expected Auth");
+            };
+            assert_eq!(token, "right");
+            crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk { salt: gen_connection_salt() }.to_wire()).unwrap();
         });
         connect_and_authenticate(&addr, "right").unwrap();
     }
@@ -745,13 +854,27 @@ mod tests {
         assert!(connect_and_authenticate(&addr, "x").is_err());
     }
 
+    /// Reads the client's `Auth`, replies `AuthOk` with a freshly-generated
+    /// server salt, and returns `SessionKeys` derived from BOTH exchanged
+    /// salts -- the mock-server-side mirror of what `connect_and_authenticate`
+    /// does on the client, and of what `serve_distributed_connection` does
+    /// in `interp.rs`. Every mock-server test below shares this exact
+    /// handshake shape, so it's a helper rather than repeated 4 times.
+    fn mock_server_handshake(stream: &mut std::net::TcpStream, expected_token: &str) -> SessionKeys {
+        let auth = crate::kser::read_value_frame(stream).unwrap();
+        let DistMsg::Auth { token, salt: client_salt } = DistMsg::from_wire(auth).unwrap() else {
+            panic!("expected Auth");
+        };
+        assert_eq!(token, expected_token);
+        let server_salt = gen_connection_salt();
+        crate::kser::write_value_frame(stream, &DistMsg::AuthOk { salt: server_salt.clone() }.to_wire()).unwrap();
+        SessionKeys::derive(&token, false, &client_salt, &server_salt)
+    }
+
     #[test]
     fn spawn_remote_returns_the_remote_id_on_success() {
         let addr = spawn_mock_server(|mut stream| {
-            let auth = crate::kser::read_value_frame(&mut stream).unwrap();
-            assert_eq!(DistMsg::from_wire(auth).unwrap(), DistMsg::Auth { token: "t".to_string() });
-            crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let mut keys = SessionKeys::derive("t", false);
+            let mut keys = mock_server_handshake(&mut stream, "t");
             let spawn = read_encrypted_msg(&mut stream, &mut keys).unwrap();
             assert_eq!(
                 spawn,
@@ -759,8 +882,7 @@ mod tests {
             );
             write_encrypted_msg(&mut stream, &mut keys, &DistMsg::SpawnOk { remote_id: 7 }).unwrap();
         });
-        let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let mut keys = SessionKeys::derive("t", true);
+        let (mut stream, mut keys) = connect_and_authenticate(&addr, "t").unwrap();
         let remote_id =
             spawn_remote(&mut stream, &mut keys, "Worker", vec![(Some("n".to_string()), PortableValue::Int(5))]).unwrap();
         assert_eq!(remote_id, 7);
@@ -769,14 +891,11 @@ mod tests {
     #[test]
     fn spawn_remote_surfaces_a_spawn_err_as_a_clean_result_err() {
         let addr = spawn_mock_server(|mut stream| {
-            let _ = crate::kser::read_value_frame(&mut stream).unwrap();
-            crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let mut keys = SessionKeys::derive("t", false);
+            let mut keys = mock_server_handshake(&mut stream, "t");
             let _ = read_encrypted_msg(&mut stream, &mut keys).unwrap();
             write_encrypted_msg(&mut stream, &mut keys, &DistMsg::SpawnErr { msg: "unknown component `Nope`".to_string() }).unwrap();
         });
-        let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let mut keys = SessionKeys::derive("t", true);
+        let (mut stream, mut keys) = connect_and_authenticate(&addr, "t").unwrap();
         let err = spawn_remote(&mut stream, &mut keys, "Nope", vec![]).unwrap_err();
         assert!(err.contains("unknown component"), "{err}");
     }
@@ -784,9 +903,7 @@ mod tests {
     #[test]
     fn deliver_remote_and_call_remote_over_wire_round_trip_against_a_mock_server() {
         let addr = spawn_mock_server(|mut stream| {
-            let _ = crate::kser::read_value_frame(&mut stream).unwrap(); // Auth
-            crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let mut keys = SessionKeys::derive("t", false);
+            let mut keys = mock_server_handshake(&mut stream, "t");
             let _ = read_encrypted_msg(&mut stream, &mut keys).unwrap(); // Spawn
             write_encrypted_msg(&mut stream, &mut keys, &DistMsg::SpawnOk { remote_id: 0 }).unwrap();
             // Deliver: no reply expected, just consume the frame.
@@ -802,8 +919,7 @@ mod tests {
             )
             .unwrap();
         });
-        let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let mut keys = SessionKeys::derive("t", true);
+        let (mut stream, mut keys) = connect_and_authenticate(&addr, "t").unwrap();
         let remote_id = spawn_remote(&mut stream, &mut keys, "Worker", vec![]).unwrap();
         deliver_remote(&mut stream, &mut keys, remote_id, "num", PortableValue::Int(9)).unwrap();
         let result = call_remote_over_wire(&mut stream, &mut keys, remote_id, "greet", vec![], 1).unwrap();
@@ -813,15 +929,12 @@ mod tests {
     #[test]
     fn call_remote_over_wire_surfaces_a_call_error_as_ok_err_not_a_transport_failure() {
         let addr = spawn_mock_server(|mut stream| {
-            let _ = crate::kser::read_value_frame(&mut stream).unwrap();
-            crate::kser::write_value_frame(&mut stream, &DistMsg::AuthOk.to_wire()).unwrap();
-            let mut keys = SessionKeys::derive("t", false);
+            let mut keys = mock_server_handshake(&mut stream, "t");
             let call = read_encrypted_msg(&mut stream, &mut keys).unwrap();
             let DistMsg::Call { call_id, .. } = call else { panic!("expected Call") };
             write_encrypted_msg(&mut stream, &mut keys, &DistMsg::CallReply { call_id, result: Err("boom".to_string()) }).unwrap();
         });
-        let mut stream = connect_and_authenticate(&addr, "t").unwrap();
-        let mut keys = SessionKeys::derive("t", true);
+        let (mut stream, mut keys) = connect_and_authenticate(&addr, "t").unwrap();
         let result = call_remote_over_wire(&mut stream, &mut keys, 0, "f", vec![], 1).unwrap();
         assert_eq!(result, Err("boom".to_string()));
     }
@@ -835,20 +948,20 @@ mod tests {
     #[test]
     fn encrypted_framing_round_trips_multiple_messages_over_a_real_socket() {
         let addr = spawn_mock_server(|mut stream| {
-            let mut keys = SessionKeys::derive("shared-secret", false);
+            let mut keys = SessionKeys::derive("shared-secret", false, "client-salt", "server-salt");
             for i in 0..3 {
                 let msg = read_encrypted_msg(&mut stream, &mut keys).unwrap();
                 assert_eq!(msg, DistMsg::Deliver { remote_id: i, port: "p".to_string(), value: PortableValue::Int(i as i64) });
-                write_encrypted_msg(&mut stream, &mut keys, &DistMsg::AuthOk).unwrap();
+                write_encrypted_msg(&mut stream, &mut keys, &DistMsg::AuthOk { salt: "reply-salt".to_string() }).unwrap();
             }
         });
         let mut stream = std::net::TcpStream::connect(&addr).unwrap();
-        let mut keys = SessionKeys::derive("shared-secret", true);
+        let mut keys = SessionKeys::derive("shared-secret", true, "client-salt", "server-salt");
         for i in 0..3u64 {
             write_encrypted_msg(&mut stream, &mut keys, &DistMsg::Deliver { remote_id: i, port: "p".to_string(), value: PortableValue::Int(i as i64) })
                 .unwrap();
             let reply = read_encrypted_msg(&mut stream, &mut keys).unwrap();
-            assert_eq!(reply, DistMsg::AuthOk);
+            assert_eq!(reply, DistMsg::AuthOk { salt: "reply-salt".to_string() });
         }
     }
 
@@ -872,7 +985,7 @@ mod tests {
         );
 
         let mut encrypted_frame = Vec::new();
-        let mut keys = SessionKeys::derive("some-token", true);
+        let mut keys = SessionKeys::derive("some-token", true, "client-salt", "server-salt");
         write_encrypted_msg(&mut encrypted_frame, &mut keys, &msg).unwrap();
         assert!(
             !encrypted_frame.windows(marker.len()).any(|w| w == marker.as_bytes()),
@@ -886,14 +999,73 @@ mod tests {
     /// AUTHENTICATED cipher) was chosen over plain encryption.
     #[test]
     fn decrypting_with_the_wrong_tokens_keys_fails_cleanly() {
-        let mut sender_keys = SessionKeys::derive("correct-token", true);
+        let mut sender_keys = SessionKeys::derive("correct-token", true, "client-salt", "server-salt");
         let ciphertext_frame = {
             let mut buf = Vec::new();
-            write_encrypted_msg(&mut buf, &mut sender_keys, &DistMsg::AuthOk).unwrap();
+            write_encrypted_msg(&mut buf, &mut sender_keys, &DistMsg::AuthOk { salt: "x".to_string() }).unwrap();
             buf
         };
-        let mut wrong_keys = SessionKeys::derive("wrong-token", false);
+        let mut wrong_keys = SessionKeys::derive("wrong-token", false, "client-salt", "server-salt");
         let mut cursor = std::io::Cursor::new(ciphertext_frame);
         assert!(read_encrypted_msg(&mut cursor, &mut wrong_keys).is_err());
+    }
+
+    /// The actual vulnerability this whole salt mechanism fixes
+    /// (production-hardening, 0.3.0 security-hardening milestone, an
+    /// internal self-review finding): two connections authenticated with
+    /// the IDENTICAL token must derive DIFFERENT keys when their salts
+    /// differ -- proving `SessionKeys::derive` genuinely depends on the
+    /// salts, not just decoratively accepting them as unused parameters.
+    /// Before the fix, `derive` was a pure function of the token alone, so
+    /// this assertion would have failed (both ciphertexts identical).
+    #[test]
+    fn two_connections_with_the_same_token_but_different_salts_produce_different_ciphertext() {
+        let msg = DistMsg::AuthOk { salt: "x".to_string() };
+        let mut keys_a = SessionKeys::derive("same-token", true, "salt-a-client", "salt-a-server");
+        let mut buf_a = Vec::new();
+        write_encrypted_msg(&mut buf_a, &mut keys_a, &msg).unwrap();
+
+        let mut keys_b = SessionKeys::derive("same-token", true, "salt-b-client", "salt-b-server");
+        let mut buf_b = Vec::new();
+        write_encrypted_msg(&mut buf_b, &mut keys_b, &msg).unwrap();
+
+        assert_ne!(buf_a, buf_b, "the SAME token with DIFFERENT salts must never produce the same ciphertext");
+    }
+
+    /// The companion property: the SAME token AND the SAME salts (i.e. a
+    /// deterministic replay of one specific handshake) must still derive
+    /// keys that produce IDENTICAL ciphertext for the identical message --
+    /// confirms `derive` is a pure, deterministic function of its inputs,
+    /// not accidentally pulling in extra non-reproducible state (so both
+    /// real sides of one real connection, which each compute this
+    /// independently from the two wire-exchanged salts, are guaranteed to
+    /// agree).
+    #[test]
+    fn the_same_token_and_the_same_salts_always_derive_the_same_keys() {
+        let msg = DistMsg::AuthOk { salt: "x".to_string() };
+        let mut keys_a = SessionKeys::derive("same-token", true, "shared-client-salt", "shared-server-salt");
+        let mut buf_a = Vec::new();
+        write_encrypted_msg(&mut buf_a, &mut keys_a, &msg).unwrap();
+
+        let mut keys_b = SessionKeys::derive("same-token", true, "shared-client-salt", "shared-server-salt");
+        let mut buf_b = Vec::new();
+        write_encrypted_msg(&mut buf_b, &mut keys_b, &msg).unwrap();
+
+        assert_eq!(buf_a, buf_b);
+    }
+
+    /// `gen_connection_salt` itself: called twice in a row (the realistic
+    /// case -- e.g. two `weight distributed` spawns from the same process
+    /// moments apart), it must return two DIFFERENT values. This is the
+    /// property the whole fix depends on; if this ever failed, EVERY
+    /// connection from one process would collide regardless of the salt
+    /// plumbing above being correct.
+    #[test]
+    fn gen_connection_salt_never_repeats_across_back_to_back_calls() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let salt = gen_connection_salt();
+            assert!(seen.insert(salt), "gen_connection_salt produced a repeat within 1000 back-to-back calls");
+        }
     }
 }

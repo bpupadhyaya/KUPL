@@ -14,6 +14,28 @@ change and the release process.
   Other platforms report a clean, honest error rather than running
   unconfined. See `docs/PRODUCTION.md`'s threat model section.
 
+### Security
+- Fixed an unauthenticated remote denial-of-service in `kupl node`: the
+  wire-format decoder (`kser::read_value`) recursed with no depth limit,
+  reachable on a fresh connection's very first frame BEFORE the shared-secret
+  token is ever checked — a single crafted packet could overflow the stack
+  and abort the whole node process. Now capped at 150 nesting levels
+  (`kser::MAX_VALUE_NESTING_DEPTH`, empirically bisected against this
+  specific recursive function's stack cost, not just copied from an
+  unrelated parser's own depth cap).
+- Fixed a `weight distributed` key/nonce-reuse bug: `SessionKeys::derive`
+  was a pure function of the shared token alone, so every connection made
+  with the same token derived the identical ChaCha20-Poly1305 keys with
+  nonce counters restarting at 0 — a passive observer of two such
+  connections could recover the XOR of same-index plaintexts, and Poly1305's
+  repeated one-time key is a known forgery condition. The `Auth`/`AuthOk`
+  handshake now exchanges a per-connection salt from each side, mixed into
+  key derivation, so every connection gets fresh keys regardless of how
+  many share the same token.
+- `durable agent` state files are now created with owner-only (`0600`)
+  permissions on Unix, instead of the OS default (typically world/group-
+  readable).
+
 ## [0.2.0] - 2026-09-06
 
 Cross-platform reliability release — real, CI-verified support for
