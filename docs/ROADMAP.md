@@ -137,7 +137,10 @@ effort rather than being rushed into a cross-platform-reliability release.
 
 ---
 
-## 0.3.0 — Security hardening
+## 0.3.0 — Security hardening — **RELEASED 2026-09-06**
+
+[`v0.3.0`](https://github.com/bpupadhyaya/KUPL/releases/tag/v0.3.0) ·
+[`release/0.3.0`](https://github.com/bpupadhyaya/KUPL/tree/release/0.3.0)
 
 **Theme:** close the most concrete, code-addressable security and
 soundness gaps named in `docs/PRODUCTION.md`.
@@ -160,9 +163,12 @@ key/nonce-reuse bug in `weight distributed`'s `SessionKeys::derive` (every
 connection sharing a token derived identical keys — fixed by exchanging a
 per-connection salt in the handshake), and world-readable `durable agent`
 state files (now `0600` on Unix) — see `docs/design/DISTRIBUTION.md`'s
-2026-09-06 update and `CHANGELOG.md`'s `[Unreleased]` Security section for
-the full writeup. Only item 1 (the effect system gap) remains open for
-0.3.0.
+2026-09-06 update and `CHANGELOG.md`'s own `[0.3.0]` Security section for
+the full writeup. Item 1 (the effect system gap) closed via the roadmap's
+own sanctioned fallback path (pin the current boundary, don't rush a
+sound extension) — see its own entry below for the full evaluation. All
+4 items landed; `v0.3.0` shipped with real installable packages for
+macOS, Linux, and Windows via `.github/workflows/release.yml`.
 
 1. **DONE (fallback path, not the sound-extension path) — The effect
    system's known indirect-propagation gap.** Today, effect tracking
