@@ -152,7 +152,17 @@ running unconfined. Item 3 also landed: `aead.rs` and `guards.rs` each got a
 seeded, deterministic fuzz suite (round-trip, single-bit-flip tamper
 detection on ciphertext/tag/AAD, key/nonce avalanche, and an independent-
 ground-truth check for K1010's cross-protocol guard collision detector across
-random protocol counts/orderings). Items 1 and 4 below are still open.
+random protocol counts/orderings). Item 4 also landed: an internal
+self-review of `aead.rs`/`distribution.rs`/`agent_persist.rs`/`encoding.rs`
+found and fixed 3 real bugs — an unauthenticated remote DoS via unbounded
+recursion in `kser::read_value` (reachable before the token check), a
+key/nonce-reuse bug in `weight distributed`'s `SessionKeys::derive` (every
+connection sharing a token derived identical keys — fixed by exchanging a
+per-connection salt in the handshake), and world-readable `durable agent`
+state files (now `0600` on Unix) — see `docs/design/DISTRIBUTION.md`'s
+2026-09-06 update and `CHANGELOG.md`'s `[Unreleased]` Security section for
+the full writeup. Only item 1 (the effect system gap) remains open for
+0.3.0.
 
 1. **The effect system's known indirect-propagation gap.** Today, effect
    tracking through a component instance is precise for two syntactically
