@@ -142,6 +142,18 @@ effort rather than being rushed into a cross-platform-reliability release.
 **Theme:** close the most concrete, code-addressable security and
 soundness gaps named in `docs/PRODUCTION.md`.
 
+**Status:** item 2 (the sandbox wrapper) has a working macOS v1 landed on
+`master` (`src/sandbox.rs`, `kupl run --sandbox`) — live-verified to actually
+block a real network connection and a real filesystem write outside the temp
+dir, not just documented. Linux (`bubblewrap`/seccomp) and Windows backends
+are follow-up work, not blocking 0.3.0's release — `--sandbox` reports a
+clean "not supported on this platform yet" error there rather than silently
+running unconfined. Item 3 also landed: `aead.rs` and `guards.rs` each got a
+seeded, deterministic fuzz suite (round-trip, single-bit-flip tamper
+detection on ciphertext/tag/AAD, key/nonce avalanche, and an independent-
+ground-truth check for K1010's cross-protocol guard collision detector across
+random protocol counts/orderings). Items 1 and 4 below are still open.
+
 1. **The effect system's known indirect-propagation gap.** Today, effect
    tracking through a component instance is precise for two syntactically
    provable cases (`let s = SomeComponent()` used same-function, and a
