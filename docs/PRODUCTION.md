@@ -113,6 +113,17 @@ mechanism:
 untrusted code, run KUPL inside an OS-level sandbox (container, VM, seccomp, cgroup
 memory/CPU limits) — the same as you would for any other general-purpose language.
 
+**`kupl run <file.kupl> --sandbox`** (macOS only, v0.3.0+) is a first, opt-in step
+toward closing this gap for the common case: it re-executes the program under
+`sandbox-exec` with `(deny network*)` and filesystem writes confined to the OS temp
+directory. Filesystem *reads* are **not** restricted in this v1 — it stops
+exfiltration-by-network and stray writes outside a safe area, not arbitrary
+filesystem snooping. There is no Linux/Windows backend yet; `--sandbox` on those
+platforms reports a clean error rather than silently running unconfined. This
+does not replace running genuinely untrusted code in a real OS-level sandbox
+(container, VM) — it hardens the common "I trust this code but want a safety net"
+case, not the "this code is actively adversarial" case.
+
 ---
 
 ## Operations

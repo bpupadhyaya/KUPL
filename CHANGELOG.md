@@ -7,6 +7,13 @@ change and the release process.
 
 ## [Unreleased]
 
+### Added
+- `kupl run <file.kupl> --sandbox` (macOS only): opt-in OS-level confinement
+  via `sandbox-exec` — denies network access and confines filesystem writes
+  to the OS temp directory. Composable with `--vm`/`--timeout`/`--max-memory`.
+  Other platforms report a clean, honest error rather than running
+  unconfined. See `docs/PRODUCTION.md`'s threat model section.
+
 ## [0.2.0] - 2026-09-06
 
 Cross-platform reliability release — real, CI-verified support for

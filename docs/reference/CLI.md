@@ -56,6 +56,16 @@ the exit path directly, unlike the Rust side's own allocator-failure handler).
 `ulimit -v`/cgroups/a container remain a valid OS-level alternative either way.
 Like `--timeout`, this is an operational safety net, not a sandbox.
 
+### `kupl run <file.kupl> --sandbox`
+Opt-in OS-level confinement (**macOS only** in this release — other platforms
+report a clean error rather than running unconfined). Re-executes the program
+under `sandbox-exec` with `(deny network*)` and filesystem writes confined to
+the OS temp directory; filesystem reads are not restricted. Composable with
+`--vm`, `--timeout`, and `--max-memory`. See `docs/PRODUCTION.md`'s threat
+model for exactly what this does and does not cover — it is a first step
+toward real confinement, not a substitute for running genuinely untrusted
+code in a container or VM.
+
 ### `kupl repl`
 Interactive session. Enter expressions, statements, or whole declarations
 (`fun`/`type`/`component` — multi-line input is detected by bracket balance).

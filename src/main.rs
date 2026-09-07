@@ -29,6 +29,7 @@ Usage:
   kupl run <file.kupl> [--vm]       Run the app / `fun main` (--vm: on the KVM bytecode VM)
   kupl run <file.kupl> [--timeout=N] Kill the process after N seconds (exit 124)
   kupl run <file.kupl> [--max-memory=N] Abort if total allocation exceeds N MB
+  kupl run <file.kupl> [--sandbox]  Run under an OS-level sandbox (macOS only; no network, writes confined to temp dir)
   kupl run <file.kx>                Run a compiled .kx module on the KVM
   kupl build <file.kupl> [-o f.kx]  Compile to a .kx bytecode module
   kupl bundle <file.kupl> [-o app]  Produce a self-contained executable (VM + module)
@@ -201,6 +202,29 @@ fn run_cli() -> ExitCode {
         .skip(1)
         .map(|a| a.to_str().map(str::to_string).unwrap_or_else(|| "\u{FFFD}".to_string()))
         .collect();
+    // Opt-in OS-level confinement (`kupl run ... --sandbox`), scoped to `run`
+    // like `--timeout`/`--max-memory` below. This must be checked, and acted
+    // on, BEFORE anything else in this process runs -- the whole point is
+    // that the confinement is applied by the OS to a freshly re-exec'd child
+    // BEFORE the program's own code (or even this process's own further
+    // setup) executes, not layered on top of an already-running process. See
+    // src/sandbox.rs's own doc comment for the full rationale and policy.
+    if matches!(args.first().map(String::as_str), Some("run")) && kupl::sandbox::requested(&args) {
+        let current_exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("error: could not determine the current executable's path: {e}");
+                return ExitCode::from(1);
+            }
+        };
+        return match kupl::sandbox::run_sandboxed(&current_exe, &args) {
+            Ok(code) => ExitCode::from(code as u8),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                ExitCode::from(1)
+            }
+        };
+    }
     let json = args.iter().any(|a| a == "--json");
     let vm = args.iter().any(|a| a == "--vm");
     // Opt-in wall-clock execution limit (`--timeout=<seconds>`), scoped to
