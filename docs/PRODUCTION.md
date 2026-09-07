@@ -5,7 +5,7 @@ operational behavior — and, just as importantly, of what is **not** yet produc
 grade. Every claim here is checked against the implementation; where something is an
 alpha-stage gap, this document says so plainly.
 
-KUPL is **`0.1.0`** — pre-1.0 (semver `0.x`: no compatibility guarantee
+KUPL is **`0.2.0`** — pre-1.0 (semver `0.x`: no compatibility guarantee
 yet, see `docs/VERSIONING.md`). It is feature-complete and internally consistent (four
 execution engines held byte-identical, verified on every build); real, opt-in
 multi-threaded concurrency (`concurrent component`), retry-hardened real-provider AI

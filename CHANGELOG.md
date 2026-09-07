@@ -7,6 +7,58 @@ change and the release process.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-09-06
+
+Cross-platform reliability release — real, CI-verified support for
+Linux and Windows for the first time, plus one real, previously-hidden
+security fix. See `docs/ROADMAP.md` for the full release-by-release
+plan this fits into.
+
+### Added
+
+- `.github/workflows/release.yml`: a dedicated release-build workflow,
+  producing real native binaries on each platform's own GitHub-hosted
+  runner (`x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`,
+  `aarch64-apple-darwin`) — triggered by a `v*` tag push or manually.
+- `windows-latest` added to the CI test matrix for the first time ever.
+
+### Fixed
+
+- **`kupl native` never linked against `libm`**, so every native
+  compile failed on Linux from the day CI was first added (invisible
+  on macOS, where libm is folded into `libSystem`).
+- **A real security-relevant gap**: a manifest `entry` path like
+  `/etc/passwd` (rooted but without a Windows drive prefix) was not
+  rejected as absolute on Windows, unlike a genuinely absolute Unix
+  path — `Path::is_absolute()` alone isn't sufficient on Windows;
+  now also checks `has_root()`.
+- `cc_available()`'s test-suite gate used to report `kupl native` as
+  usable whenever `cc --version` succeeded — true even on
+  `windows-latest`, where the generated C runtime's `<sys/wait.h>`/
+  `fork`/`pipe` dependency (needed for the `exec` builtin) has no
+  MinGW equivalent. Native-codegen tests now correctly skip instead of
+  failing on every platform where the real runtime preamble can't
+  compile.
+- `cc_hash()`'s own `$PATH` search didn't handle Windows executable
+  extensions (`cc.exe`), disagreeing with `cc_available()`'s real
+  `Command::new` probe about whether the same compiler resolves at all.
+- The LSP's `file://` URI builder didn't normalize Windows path
+  separators, breaking hover/definition/rename/workspace-symbol
+  results built from a native Windows path.
+- Several tests hardcoded Unix-only assumptions (a `std::os::unix`
+  symlink call with no Windows path, an exact OS error string that
+  differs by platform for an over-length filename, `/tmp/...` literals
+  embedded directly in compiled-and-run KUPL source) — fixed to be
+  genuinely cross-platform rather than accidentally Unix-only.
+
+### Known limitations
+
+- `kupl native`/`kupl bundle` do not work on Windows yet — the
+  generated C runtime's `exec` implementation depends on POSIX-only
+  `fork`/`pipe`/`waitpid`, with no MinGW equivalent. `kupl run`,
+  `kupl run --vm`, `kupl check`, `kupl build`, and `kupl fmt` are
+  unaffected (pure Rust, no C codegen). See `docs/PRODUCTION.md`.
+
 ## [0.1.0] - 2026-09-04
 
 First tagged, tracked release — see `docs/VERSIONING.md` for what this
